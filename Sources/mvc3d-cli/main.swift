@@ -7,7 +7,8 @@
 
    options: --packing tab|sbs  --start N  --frames N  --threads N  --output FILE|-
 
- DISC is a folder holding BDMV (a rip or a mounted disc). Without
+ DISC is a folder holding BDMV (a rip or a mounted disc) or a disc image
+ (.iso), read in place without mounting. Without
  --playlist, decode picks the feature: the longest 3D playlist.
 
  decode writes packed I420 frames (rawvideo, yuv420p) for ffmpeg, e.g.
@@ -37,6 +38,7 @@ func usage() -> Never {
     usage: mvc3d info DISC
            mvc3d decode DISC [--playlist NNNNN] [options]
            mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
+           mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]
     options: --packing tab|sbs  --start N  --frames N  --threads N  --output FILE|-
 
     """.utf8))
@@ -76,14 +78,19 @@ func clockTime(_ seconds: Double) -> String {
     return String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
 }
 
-func openDisc(_ path: String) -> BlurayDisc? {
+/// A folder holding BDMV, or a disc image read in place.
+func openDisc(_ path: String) throws -> BlurayDisc? {
     var isDirectory: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { return nil }
-    return BlurayDisc(fileSystem: DirectoryFileSystem(root: URL(fileURLWithPath: path)))
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else { return nil }
+    if isDirectory.boolValue {
+        return BlurayDisc(fileSystem: DirectoryFileSystem(root: URL(fileURLWithPath: path)))
+    }
+    guard path.lowercased().hasSuffix(".iso") else { return nil }
+    return BlurayDisc(fileSystem: try UDFFileSystem(image: FileByteSource(url: URL(fileURLWithPath: path))))
 }
 
 func info(_ o: Options) throws {
-    guard o.positional.count == 1, let disc = openDisc(o.positional[0]) else { usage() }
+    guard o.positional.count == 1, let disc = try openDisc(o.positional[0]) else { usage() }
     let main = try disc.mainPlaylist()?.name
     for (name, playlist) in try disc.playlists() where playlist.duration >= 60 {
         let clips = playlist.items.map { $0.clip + ($0.dependentClip.map { "+" + $0 } ?? "") }
@@ -99,7 +106,7 @@ struct UnitSource {
 }
 
 func unitSource(_ o: Options) throws -> UnitSource {
-    if o.positional.count == 1, let disc = openDisc(o.positional[0]) {
+    if o.positional.count == 1, let disc = try openDisc(o.positional[0]) {
         let chosen: (name: String, playlist: BlurayPlaylist)?
         if let wanted = o.playlist {
             chosen = try disc.playlists().first { $0.name == wanted }
@@ -171,11 +178,27 @@ func decode(_ o: Options) throws {
                decoder.corruptNALCount, decoder.unsupportedNALCount))
 }
 
+/// mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]: a file's bytes out
+/// of a disc (mainly for checking the image reader against a mounted copy).
+func cat(_ o: Options) throws {
+    guard o.positional.count == 2, let disc = try openDisc(o.positional[0]) else { usage() }
+    let file = try disc.fileSystem.open(o.positional[1])
+    var offset = Int64(o.start)
+    let end = o.frames == Int.max ? file.size : min(file.size, offset + Int64(o.frames))
+    while offset < end {
+        let chunk = try file.read(at: offset, count: Int(min(1 << 20, end - offset)))
+        if chunk.isEmpty { break }
+        FileHandle.standardOutput.write(chunk)
+        offset += Int64(chunk.count)
+    }
+}
+
 let options = parse(Array(CommandLine.arguments.dropFirst()))
 do {
     switch options.command {
     case "info": try info(options)
     case "decode": try decode(options)
+    case "cat": try cat(options)
     default: usage()
     }
 } catch {

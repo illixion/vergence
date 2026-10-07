@@ -17,8 +17,11 @@ dependent (`0x1012`) views, decoding both with edge264, frame packing, a command
 Blu-ray (1080p23.976, CABAC): 8,486 consecutive stereo frames with no errors, output identical
 single- and multi-threaded.
 
-Planned: reading ISO images (UDF 2.50) directly, seeking (CLPI EP maps), `CVPixelBuffer`
-output on Apple platforms, encoder integration.
+Disc images (`.iso`) are read in place, without mounting, by a read-only UDF 2.50 reader
+(metadata partition included) over any `ByteSource`, so a remote image can be read the same way.
+
+Planned: an HTTP range `ByteSource`, seeking (CLPI EP maps), `CVPixelBuffer` output on Apple
+platforms, encoder integration.
 
 ## Speed
 
@@ -39,7 +42,7 @@ swift build -c release
            -c:v hevc_videotoolbox -q:v 65 -tag:v hvc1 film.3D.FTAB.mov
 ```
 
-`DISC` is a folder holding `BDMV`. `--playlist NNNNN` picks another title; a clip pair
+`DISC` is a folder holding `BDMV`, or a disc image (`.iso`). `--playlist NNNNN` picks another title; a clip pair
 (`decode 00007.m2ts 00008.m2ts`) works too. `--packing sbs` for side by side,
 `--start N --frames N` for a range, `--output FILE`.
 
