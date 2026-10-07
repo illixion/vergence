@@ -16,16 +16,22 @@ decoder doing the actual picture decoding, MVC (Stereo High) included.
 
 1. `src/edge264_internal.h`: `#include "../edge264.h"` → `#include "edge264.h"` (the header
    moved to `include/`).
-2. `src/edge264_headers.c`, `parse_slice_layer_without_partitioning`: the frame_num gap
-   process (H.264 8.2.5.2) is skipped for IDR pictures. edge264 counts `FrameNum` on across
-   IDRs, so every IDR looked like a gap and got up to `max_num_ref_frames` "non-existing"
-   frames. On the base view the IDR's marking discarded them again; on an MVC dependent view
-   (a NAL 20 slice with `non_idr_flag = 0`, which every 3D Blu-ray GOP opens with) they
-   stayed, and the next picture overflowed the DPB (`assert` in
-   `parse_slice_layer_without_partitioning`). Patch: `edge264-idr-gap.patch`. To be offered
-   upstream. Validated on a full 3D feature (163,820 stereo frames, no errors); the 27 ITU MVC
-   conformance streams decode to identical output with and without it (none of them sets a
-   `max_dec_frame_buffering` small enough for the extra frames to overflow).
+2. `src/edge264_headers.c` and `src/edge264_internal.h`: the DPB-fullness test before storing
+   a picture (C.4.5) counts the DPB *after* the current picture's reference marking. edge264
+   counted the reference the sliding window was about to drop, so in a stream whose
+   `max_num_ref_frames` equals its `max_dec_frame_buffering` (both 4 on the 3D disc tested, and
+   in x264 output with `ref=4`) the DPB always looked full, bumping found nothing to output, and
+   each new reference picture was output at once, ahead of the B-frames shown before it. Same
+   pixels, wrong order: 76 of 96 frames of an x264 test stream. Patch:
+   `edge264-dpb-after-marking.patch`; regression test `DecodeOrderTests`. To be offered upstream.
+   No change on the 27 ITU MVC conformance streams or `make check`. The same miscount made
+   edge264 assert (`dpb_frames <= max_dec_frame_buffering`) at the second GOP of the 3D disc's
+   dependent view; an earlier local patch skipping the frame_num gap process on IDR pictures
+   only hid that and has been dropped.
+3. `edge264.c` / `edge264.h`: `edge264_last_frame_id()`, the FrameId the last slice started.
+   mvc3d files each access unit's PTS under it and reads it back from the output frame's
+   `FrameId`, since edge264 carries no timestamps. mvc3d-only (upstream might prefer a per-picture
+   user value).
 
 ## Known upstream issues
 

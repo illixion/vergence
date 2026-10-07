@@ -2,10 +2,13 @@
  mvc3d - stereo H.264 (MVC) decoding through edge264
 
  Feeds stereo access units to edge264 NAL by NAL and hands back each decoded
- picture pair. Frames come out in display order; edge264 does not carry
- timestamps, so each output frame takes the smallest PTS still waiting, which
- holds for frame-coded streams (one picture pair per access unit), the only
- kind edge264 decodes and the only kind 3D Blu-ray uses.
+ picture pair. Frames come out in display order. edge264 does not carry
+ timestamps, but it numbers pictures in decode order (FrameId) and reports
+ the number with each output frame, so an access unit's PTS is filed under
+ the number its base-view picture got. (Handing each output frame the
+ smallest PTS still waiting instead goes wrong whenever edge264 outputs a
+ picture before a B-frame shown ahead of it has arrived, which it does at
+ different points depending on threading and on where decoding started.)
 
  With worker threads edge264 parses a NAL and returns before the slice is
  decoded, so the bytes must outlive the call: every access unit is copied
@@ -49,7 +52,8 @@ public final class MVCDecoder {
     }
 
     private var decoder: OpaquePointer?
-    private var pendingPTS: [Int64] = []
+    /// PTS by the FrameId of the access unit's base-view picture.
+    private var ptsByFrameID: [Int32: Int64] = [:]
     public private(set) var corruptNALCount = 0
     public private(set) var unsupportedNALCount = 0
 
@@ -67,7 +71,7 @@ public final class MVCDecoder {
     /// Decodes one access unit and calls `output` for every frame that
     /// became ready.
     public func decode(_ unit: StereoAccessUnit, output: (StereoFrame) throws -> Void) throws {
-        if let pts = unit.pts { insertPending(pts) }
+        var pts = unit.pts
         let buffer = NALBuffer(unit.data)
         let start = buffer.base
         let end = start + buffer.count
@@ -78,7 +82,14 @@ public final class MVCDecoder {
             // A 4-byte start code is a 3-byte one after a zero byte.
             var nalEnd = next
             while nalEnd > nal, nalEnd[-1] == 0 { nalEnd -= 1 }
-            if nalEnd > nal { try submit(nal, nalEnd, buffer: buffer, output: output) }
+            if nalEnd > nal, try submit(nal, nalEnd, buffer: buffer, output: output), let unitPTS = pts {
+                // The first slice of the base view started the picture.
+                let type = nal[0] & 0x1F
+                if type == 1 || type == 5 {
+                    ptsByFrameID[edge264_last_frame_id(decoder)] = unitPTS
+                    pts = nil
+                }
+            }
             nal = next
         }
         try drainFrames(output)
@@ -94,17 +105,19 @@ public final class MVCDecoder {
             // last picture is missing slices (a damaged or cut-off stream).
             if ret != ENOBUFS || drained == 0 { break }
         }
-        pendingPTS.removeAll()
+        ptsByFrameID.removeAll()
     }
 
     /// Forgets all state, for a seek. The next unit must start a GOP.
     public func reset() {
         edge264_flush(decoder)
-        pendingPTS.removeAll()
+        ptsByFrameID.removeAll()
     }
 
+    /// Whether edge264 accepted the NAL.
+    @discardableResult
     private func submit(_ nal: UnsafePointer<UInt8>, _ end: UnsafePointer<UInt8>, buffer: NALBuffer,
-                        output: (StereoFrame) throws -> Void) throws {
+                        output: (StereoFrame) throws -> Void) throws -> Bool {
         while true {
             let ref = Unmanaged.passRetained(buffer).toOpaque()
             let ret = edge264_decode_NAL(decoder, nal, end, { _, arg in
@@ -112,12 +125,12 @@ public final class MVCDecoder {
             }, ref)
             if ret != 0 { Unmanaged<NALBuffer>.fromOpaque(ref).release() }
             switch ret {
-            case 0: return
+            case 0: return true
             case ENOBUFS: try drainFrames(output) // room needed, then the same NAL again
-            case ENOTSUP: unsupportedNALCount += 1; return
-            case EBADMSG: corruptNALCount += 1; return
+            case ENOTSUP: unsupportedNALCount += 1; return false
+            case EBADMSG: corruptNALCount += 1; return false
             case ENOMEM: throw Error.allocationFailed
-            default: return
+            default: return false
             }
         }
     }
@@ -128,7 +141,12 @@ public final class MVCDecoder {
         var count = 0
         while edge264_get_frame(decoder, &frame, 0) == 0 {
             count += 1
-            let pts = pendingPTS.isEmpty ? nil : pendingPTS.removeFirst()
+            let pts = ptsByFrameID.removeValue(forKey: frame.FrameId)
+            // Pictures that are never output (dropped as damaged) leave
+            // entries behind. Output runs in display order, so a picture
+            // decoded before this one may still be waiting; but none from
+            // further back than a DPB's worth (16 frames, two views).
+            if ptsByFrameID.count > 256 { ptsByFrameID = ptsByFrameID.filter { $0.key > frame.FrameId - 128 } }
             try output(StereoFrame(pts: pts, left: Self.planes(frame.samples, frame),
                                    right: frame.samples_mvc.0 == nil ? nil : Self.planes(frame.samples_mvc, frame)))
         }
@@ -140,13 +158,6 @@ public final class MVCDecoder {
         [PlaneView(base: s.0!, width: Int(f.width_Y), height: Int(f.height_Y), stride: Int(f.stride_Y)),
          PlaneView(base: s.1!, width: Int(f.width_C), height: Int(f.height_C), stride: Int(f.stride_C)),
          PlaneView(base: s.2!, width: Int(f.width_C), height: Int(f.height_C), stride: Int(f.stride_C))]
-    }
-
-    private func insertPending(_ pts: Int64) {
-        // Decode order is nearly display order; insert from the back.
-        var i = pendingPTS.endIndex
-        while i > pendingPTS.startIndex, pendingPTS[i - 1] > pts { i -= 1 }
-        pendingPTS.insert(pts, at: i)
     }
 }
 

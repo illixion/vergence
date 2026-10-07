@@ -27,7 +27,7 @@ let package = Package(
         ),
         .target(name: "MVC3D", dependencies: ["CEdge264"]),
         .executableTarget(name: "mvc3d-cli", dependencies: ["MVC3D"]),
-        .testTarget(name: "MVC3DTests", dependencies: ["MVC3D"]),
+        .testTarget(name: "MVC3DTests", dependencies: ["MVC3D"], resources: [.copy("Fixtures")]),
     ],
     cLanguageStandard: .gnu11
 )

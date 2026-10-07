@@ -258,6 +258,13 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 
 
 
+/* mvc3d: the FrameId of the picture most recently started by a slice
+ * (edge264_get_frame reports it back), for tagging access units with their
+ * timestamps. Only the thread calling edge264_decode_NAL writes it. */
+int32_t edge264_last_frame_id(const Edge264Decoder *dec) {
+	return dec->prevFrameId;
+}
+
 void edge264_flush(Edge264Decoder *dec) {
 	if (dec == NULL)
 		return;

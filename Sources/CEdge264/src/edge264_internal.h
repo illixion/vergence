@@ -1227,6 +1227,11 @@ static always_inline unsigned ready_tasks(Edge264Decoder *dec) {
 static inline unsigned dpb_frames(Edge264Decoder *dec) {
 	return dec->prev_short_term_frames | dec->prev_long_term_frames | dec->to_get_frames & ~dec->output_frames;
 }
+// frames of the current view held in the DPB once the current picture's
+// reference marking (8.2.5) has applied, which C.4.4 removes before storing it
+static inline unsigned marked_dpb_frames(Edge264Decoder *dec, unsigned same_views) {
+	return (dec->view_short_term_frames | dec->view_long_term_frames | dec->to_get_frames & ~dec->output_frames) & same_views;
+}
 static inline unsigned unavail_frames(Edge264Decoder *dec) {
 	return dec->prev_short_term_frames | dec->prev_long_term_frames | dec->to_get_frames | dec->output_frames;
 }

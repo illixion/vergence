@@ -1,0 +1,51 @@
+From 9dc6367b626004a4f325bcb56797dd66c6db26c2 Mon Sep 17 00:00:00 2001
+From: Ixion <illixion@illixion.com>
+Date: Thu, 8 Oct 2026 00:39:03 +0300
+Subject: [PATCH] Count the DPB after the current picture's reference marking
+
+---
+ src/edge264_headers.c  | 4 ++--
+ src/edge264_internal.h | 5 +++++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/edge264_headers.c b/src/edge264_headers.c
+index 9789eef..1242c35 100644
+--- a/src/edge264_headers.c
++++ b/src/edge264_headers.c
+@@ -1236,7 +1236,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
+ 				max_bump += dec->FieldOrderCnt[0][__builtin_ctz(o)] < dec->TopFieldOrderCnt;
+ 		}
+ 		// apply bumping process until there is an empty slot
+-		while (__builtin_popcount(dpb_frames(dec) & same_views) >= sps->max_dec_frame_buffering && max_bump--)
++		while (__builtin_popcount(marked_dpb_frames(dec, same_views) & ~(1 << dec->currPic)) >= sps->max_dec_frame_buffering && max_bump--)
+ 			bump_frame(dec, non_base_view, 0);
+ 		dec->to_get_frames |= 1 << dec->currPic;
+ 		// if DPB has no outputable frame left then put current frame in output queue,
+@@ -1279,7 +1279,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
+ 	ret = print_dec(dec, dec->n_threads || dec->worker_loop != worker_loop_log ?
+ 		"  decode_NAL_result: %s\n" : t->pps.entropy_coding_mode_flag ?
+ 		"  macroblocks_cabac:\n" : "  macroblocks_cavlc:\n", 0);
+-	assert(__builtin_popcount(dpb_frames(dec) & same_views) <= sps->max_dec_frame_buffering);
++	assert(__builtin_popcount(marked_dpb_frames(dec, same_views)) <= sps->max_dec_frame_buffering);
+ 	if (dec->n_threads)
+ 		pthread_cond_signal(&dec->task_ready);
+ 	else
+diff --git a/src/edge264_internal.h b/src/edge264_internal.h
+index 9e12200..3cd24a0 100644
+--- a/src/edge264_internal.h
++++ b/src/edge264_internal.h
+@@ -1227,6 +1227,11 @@ static always_inline unsigned ready_tasks(Edge264Decoder *dec) {
+ static inline unsigned dpb_frames(Edge264Decoder *dec) {
+ 	return dec->prev_short_term_frames | dec->prev_long_term_frames | dec->to_get_frames & ~dec->output_frames;
+ }
++// frames of the current view held in the DPB once the current picture's
++// reference marking (8.2.5) has applied, which C.4.4 removes before storing it
++static inline unsigned marked_dpb_frames(Edge264Decoder *dec, unsigned same_views) {
++	return (dec->view_short_term_frames | dec->view_long_term_frames | dec->to_get_frames & ~dec->output_frames) & same_views;
++}
+ static inline unsigned unavail_frames(Edge264Decoder *dec) {
+ 	return dec->prev_short_term_frames | dec->prev_long_term_frames | dec->to_get_frames | dec->output_frames;
+ }
+-- 
+2.55.0
+

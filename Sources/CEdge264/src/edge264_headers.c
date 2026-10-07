@@ -1093,7 +1093,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	
 	// check for gaps in frame_num (8.2.5.2)
 	int gap = dec->FrameNum - dec->PrevRefFrameNum[non_base_view];
-	if (__builtin_expect(gap > 1 && !dec->IdrPicFlag, 0)) {
+	if (__builtin_expect(gap > 1, 0)) {
 		// make enough non-reference slots by dereferencing short-term and non-existing frames
 		int sref_slots = sps->max_num_ref_frames - __builtin_popcount(same_views & dec->prev_long_term_frames & ~dec->prev_short_term_frames);
 		assert(sref_slots > 0);
@@ -1236,7 +1236,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 				max_bump += dec->FieldOrderCnt[0][__builtin_ctz(o)] < dec->TopFieldOrderCnt;
 		}
 		// apply bumping process until there is an empty slot
-		while (__builtin_popcount(dpb_frames(dec) & same_views) >= sps->max_dec_frame_buffering && max_bump--)
+		while (__builtin_popcount(marked_dpb_frames(dec, same_views) & ~(1 << dec->currPic)) >= sps->max_dec_frame_buffering && max_bump--)
 			bump_frame(dec, non_base_view, 0);
 		dec->to_get_frames |= 1 << dec->currPic;
 		// if DPB has no outputable frame left then put current frame in output queue,
@@ -1279,7 +1279,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	ret = print_dec(dec, dec->n_threads || dec->worker_loop != worker_loop_log ?
 		"  decode_NAL_result: %s\n" : t->pps.entropy_coding_mode_flag ?
 		"  macroblocks_cabac:\n" : "  macroblocks_cavlc:\n", 0);
-	assert(__builtin_popcount(dpb_frames(dec) & same_views) <= sps->max_dec_frame_buffering);
+	assert(__builtin_popcount(marked_dpb_frames(dec, same_views)) <= sps->max_dec_frame_buffering);
 	if (dec->n_threads)
 		pthread_cond_signal(&dec->task_ready);
 	else

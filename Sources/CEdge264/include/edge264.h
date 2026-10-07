@@ -64,6 +64,7 @@ typedef struct Edge264Frame {
 const uint8_t *edge264_find_start_code(const uint8_t *buf, const uint8_t *end, int four_byte);
 Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg, int log_mbs, Edge264AllocCb alloc_cb, Edge264FreeCb free_cb, void *alloc_arg);
 void edge264_flush(Edge264Decoder *dec);
+int32_t edge264_last_frame_id(const Edge264Decoder *dec); // mvc3d addition
 void edge264_free(Edge264Decoder **pdec);
 int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *end, Edge264UnrefCb unref_cb, void *unref_arg);
 int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow);
