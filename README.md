@@ -11,13 +11,14 @@ or frame-packed (top-and-bottom or side by side) for an encoder.
 
 ## Status
 
-Early. Working: BDAV/TS demux, pairing the base (`0x1011`) and dependent (`0x1012`) views,
-decoding both with edge264, frame packing, a command line tool. Verified on a commercial 3D
+Early. Working: BDAV/TS demux, playlist (MPLS) parsing including the 3D extensions (the
+dependent-view SubPath and STN_table_SS), picking the feature, pairing the base (`0x1011`) and
+dependent (`0x1012`) views, decoding both with edge264, frame packing, a command line tool. Verified on a commercial 3D
 Blu-ray (1080p23.976, CABAC): 8,486 consecutive stereo frames with no errors, output identical
 single- and multi-threaded.
 
-Planned: playlist (MPLS/CLPI) parsing so a disc folder or ISO is enough, reading ISO images
-(UDF 2.50) directly, `CVPixelBuffer` output on Apple platforms, encoder integration.
+Planned: reading ISO images (UDF 2.50) directly, seeking (CLPI EP maps), `CVPixelBuffer`
+output on Apple platforms, encoder integration.
 
 ## Speed
 
@@ -32,21 +33,23 @@ Apple M-series Mac, both eyes of a 1080p Blu-ray:
 
 ```sh
 swift build -c release
-# Clips from BDMV/STREAM: base view first, then the dependent view (usually the next number).
-.build/release/mvc3d decode 00007.m2ts 00008.m2ts --threads -1 \
+.build/release/mvc3d info /Volumes/DISC          # playlists; * marks the feature
+.build/release/mvc3d decode /Volumes/DISC --threads -1 \
   | ffmpeg -f rawvideo -pix_fmt yuv420p -s 1920x2160 -r 24000/1001 -i - \
            -c:v hevc_videotoolbox -q:v 65 -tag:v hvc1 film.3D.FTAB.mov
 ```
 
-`--packing sbs` for side by side, `--start N --frames N` for a range, `--output FILE`.
+`DISC` is a folder holding `BDMV`. `--playlist NNNNN` picks another title; a clip pair
+(`decode 00007.m2ts 00008.m2ts`) works too. `--packing sbs` for side by side,
+`--start N --frames N` for a range, `--output FILE`.
 
 ## Library
 
 ```swift
 import MVC3D
 
-let reader = StereoStreamReader(base: try FileByteSource(url: base),
-                                dependent: try FileByteSource(url: dependent))
+let disc = BlurayDisc(fileSystem: DirectoryFileSystem(root: discFolder))
+let reader = disc.stereoReader(for: try disc.mainPlaylist()!.playlist)
 let decoder = try MVCDecoder(threads: -1)
 while let unit = try reader.next() {
     try decoder.decode(unit) { frame in

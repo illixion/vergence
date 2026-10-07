@@ -1,13 +1,19 @@
 /*
  mvc3d - command line
 
-   mvc3d decode BASE.m2ts DEPENDENT.m2ts [--packing tab|sbs] [--start N]
-                [--frames N] [--threads N] [--output FILE|-]
+   mvc3d info DISC
+   mvc3d decode DISC [--playlist NNNNN] [options]
+   mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
 
- Writes packed I420 frames (rawvideo, yuv420p) for ffmpeg, e.g.
+   options: --packing tab|sbs  --start N  --frames N  --threads N  --output FILE|-
 
-   mvc3d decode 00007.m2ts 00008.m2ts | ffmpeg -f rawvideo -pix_fmt yuv420p \
-     -s 1920x2160 -r 24000/1001 -i - -c:v hevc_videotoolbox out.mkv
+ DISC is a folder holding BDMV (a rip or a mounted disc). Without
+ --playlist, decode picks the feature: the longest 3D playlist.
+
+ decode writes packed I420 frames (rawvideo, yuv420p) for ffmpeg, e.g.
+
+   mvc3d decode /Volumes/DISC --threads -1 | ffmpeg -f rawvideo -pix_fmt yuv420p \
+     -s 1920x2160 -r 24000/1001 -i - -c:v hevc_videotoolbox out.mov
 
  Progress and a summary go to stderr.
  */
@@ -16,8 +22,9 @@ import Foundation
 import MVC3D
 
 struct Options {
-    var base = ""
-    var dependent: String?
+    var command = ""
+    var positional: [String] = []
+    var playlist: String?
     var packing = StereoPacking.topAndBottom
     var start = 0
     var frames = Int.max
@@ -27,8 +34,10 @@ struct Options {
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
-    usage: mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [--packing tab|sbs] [--start N] [--frames N]
-                        [--threads N] [--output FILE|-]
+    usage: mvc3d info DISC
+           mvc3d decode DISC [--playlist NNNNN] [options]
+           mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
+    options: --packing tab|sbs  --start N  --frames N  --threads N  --output FILE|-
 
     """.utf8))
     exit(64)
@@ -36,8 +45,9 @@ func usage() -> Never {
 
 func parse(_ args: [String]) -> Options {
     var o = Options()
-    var positional: [String] = []
-    var i = 0
+    guard let command = args.first else { usage() }
+    o.command = command
+    var i = 1
     func value() -> String {
         i += 1
         guard i < args.count else { usage() }
@@ -45,39 +55,78 @@ func parse(_ args: [String]) -> Options {
     }
     while i < args.count {
         switch args[i] {
+        case "--playlist": o.playlist = value()
         case "--packing": o.packing = StereoPacking(rawValue: value()) ?? { usage() }()
         case "--start": o.start = Int(value()) ?? 0
         case "--frames": o.frames = Int(value()) ?? Int.max
         case "--threads": o.threads = Int(value()) ?? 0
         case "--output", "-o": o.output = value()
         case let a where a.hasPrefix("-") && a != "-": usage()
-        default: positional.append(args[i])
+        default: o.positional.append(args[i])
         }
         i += 1
     }
-    guard (1 ... 2).contains(positional.count) else { usage() }
-    o.base = positional[0]
-    o.dependent = positional.count > 1 ? positional[1] : nil
     return o
 }
 
 func log(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
 
-let arguments = Array(CommandLine.arguments.dropFirst())
-guard arguments.first == "decode" else { usage() }
-let options = parse(Array(arguments.dropFirst()))
+func clockTime(_ seconds: Double) -> String {
+    let s = Int(seconds.rounded())
+    return String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
+}
 
-do {
+func openDisc(_ path: String) -> BlurayDisc? {
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { return nil }
+    return BlurayDisc(fileSystem: DirectoryFileSystem(root: URL(fileURLWithPath: path)))
+}
+
+func info(_ o: Options) throws {
+    guard o.positional.count == 1, let disc = openDisc(o.positional[0]) else { usage() }
+    let main = try disc.mainPlaylist()?.name
+    for (name, playlist) in try disc.playlists() where playlist.duration >= 60 {
+        let clips = playlist.items.map { $0.clip + ($0.dependentClip.map { "+" + $0 } ?? "") }
+        let shown = clips.count > 4 ? clips.prefix(4).joined(separator: " ") + " … (\(clips.count))" : clips.joined(separator: " ")
+        print("\(name == main ? "*" : " ") \(name)  \(clockTime(playlist.duration))  \(playlist.isStereo ? "3D" : "2D")  \(shown)")
+    }
+}
+
+/// Where access units come from: a disc playlist or a clip pair.
+struct UnitSource {
+    var next: () throws -> StereoAccessUnit?
+    var unpaired: () -> Int
+}
+
+func unitSource(_ o: Options) throws -> UnitSource {
+    if o.positional.count == 1, let disc = openDisc(o.positional[0]) {
+        let chosen: (name: String, playlist: BlurayPlaylist)?
+        if let wanted = o.playlist {
+            chosen = try disc.playlists().first { $0.name == wanted }
+        } else {
+            chosen = try disc.mainPlaylist()
+        }
+        guard let (name, playlist) = chosen else { throw FormatError("no such playlist") }
+        log("mvc3d: playlist \(name), \(clockTime(playlist.duration)), \(playlist.isStereo ? "3D" : "2D only"), clips \(playlist.items.map(\.clip).joined(separator: " "))")
+        let reader = disc.stereoReader(for: playlist)
+        return UnitSource(next: reader.next, unpaired: { reader.unpairedBaseCount })
+    }
+    guard (1 ... 2).contains(o.positional.count) else { usage() }
     let reader = StereoStreamReader(
-        base: try FileByteSource(url: URL(fileURLWithPath: options.base)),
-        dependent: try options.dependent.map { try FileByteSource(url: URL(fileURLWithPath: $0)) })
-    let decoder = try MVCDecoder(threads: options.threads)
+        base: try FileByteSource(url: URL(fileURLWithPath: o.positional[0])),
+        dependent: try o.positional.dropFirst().first.map { try FileByteSource(url: URL(fileURLWithPath: $0)) })
+    return UnitSource(next: reader.next, unpaired: { reader.unpairedBaseCount })
+}
+
+func decode(_ o: Options) throws {
+    let source = try unitSource(o)
+    let decoder = try MVCDecoder(threads: o.threads)
     let out: FileHandle
-    if options.output == "-" {
+    if o.output == "-" {
         out = .standardOutput
     } else {
-        FileManager.default.createFile(atPath: options.output, contents: nil)
-        out = try FileHandle(forWritingTo: URL(fileURLWithPath: options.output))
+        FileManager.default.createFile(atPath: o.output, contents: nil)
+        out = try FileHandle(forWritingTo: URL(fileURLWithPath: o.output))
     }
 
     let clock = ContinuousClock()
@@ -85,32 +134,32 @@ do {
     var index = 0, written = 0, mono = 0
     var buffer = Data()
     var announced = false
-    let last = options.frames == Int.max ? Int.max : options.start + options.frames
+    let last = o.frames == Int.max ? Int.max : o.start + o.frames
     struct Done: Error {}
 
     func emit(_ frame: StereoFrame) throws {
         defer { index += 1 }
-        guard index >= options.start else { return }
+        guard index >= o.start else { return }
         guard index < last else { throw Done() }
         if frame.right == nil { mono += 1 }
         if !announced {
-            let (w, h) = options.packing.packedSize(width: frame.width, height: frame.height)
-            log("mvc3d: \(frame.width)x\(frame.height) per eye -> \(w)x\(h) \(options.packing.rawValue), yuv420p")
+            let (w, h) = o.packing.packedSize(width: frame.width, height: frame.height)
+            log("mvc3d: \(frame.width)x\(frame.height) per eye -> \(w)x\(h) \(o.packing.rawValue), yuv420p")
             announced = true
         }
-        let count = frame.packedByteCount(options.packing)
+        let count = frame.packedByteCount(o.packing)
         if buffer.count != count { buffer = Data(count: count) }
-        buffer.withUnsafeMutableBytes { frame.pack(options.packing, into: $0) }
+        buffer.withUnsafeMutableBytes { frame.pack(o.packing, into: $0) }
         try out.write(contentsOf: buffer)
         written += 1
         if written % 240 == 0 {
             let seconds = (clock.now - began) / .seconds(1)
-            log(String(format: "mvc3d: %d frames, %.1f fps", written, Double(written) / seconds))
+            log(String(format: "mvc3d: %d frames (%@), %.1f fps", written, clockTime(Double(frame.pts ?? 0) / 90_000), Double(written) / seconds))
         }
     }
 
     do {
-        while let unit = try reader.next() {
+        while let unit = try source.next() {
             try decoder.decode(unit, output: emit)
         }
         try decoder.finish(output: emit)
@@ -118,8 +167,17 @@ do {
 
     let seconds = (clock.now - began) / .seconds(1)
     log(String(format: "mvc3d: wrote %d frames in %.1f s (%.1f fps); %d without a second view, %d unpaired AUs, %d corrupt NALs, %d unsupported NALs",
-               written, seconds, Double(written) / seconds, mono, reader.unpairedBaseCount,
+               written, seconds, Double(written) / seconds, mono, source.unpaired(),
                decoder.corruptNALCount, decoder.unsupportedNALCount))
+}
+
+let options = parse(Array(CommandLine.arguments.dropFirst()))
+do {
+    switch options.command {
+    case "info": try info(options)
+    case "decode": try decode(options)
+    default: usage()
+    }
 } catch {
     log("mvc3d: \(error)")
     exit(1)
