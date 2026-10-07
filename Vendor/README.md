@@ -23,9 +23,15 @@ decoder doing the actual picture decoding, MVC (Stereo High) included.
    (a NAL 20 slice with `non_idr_flag = 0`, which every 3D Blu-ray GOP opens with) they
    stayed, and the next picture overflowed the DPB (`assert` in
    `parse_slice_layer_without_partitioning`). Patch: `edge264-idr-gap.patch`. To be offered
-   upstream.
+   upstream. Validated on a full 3D feature (163,820 stereo frames, no errors); the 27 ITU MVC
+   conformance streams decode to identical output with and without it (none of them sets a
+   `max_dec_frame_buffering` small enough for the extra frames to overflow).
 
 ## Known upstream issues
 
-- A slice cut short by the end of the input makes the decoder loop forever (seen with
-  `edge264_test` on a truncated file). `StereoStreamReader` never passes a partial final PES.
+- When the last picture is missing slices (a stream cut inside a slice), the end-of-stream call
+  (`edge264_decode_NAL(dec, end, end, ...)`) returns `ENOBUFS` forever while `edge264_get_frame`
+  has no frame to give, so a drain loop never sees `ENODATA` (`edge264_test` hangs the same way).
+  Reproduced with `MVCDS1.264` cut at any of three offsets. `MVCDecoder.finish` stops when a
+  drain call returns `ENOBUFS` and yields nothing; `StereoStreamReader` also never passes a
+  partial final PES.

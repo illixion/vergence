@@ -89,9 +89,10 @@ public final class MVCDecoder {
         var dummy: UInt8 = 0
         while true {
             let ret = withUnsafePointer(to: &dummy) { edge264_decode_NAL(decoder, $0, $0, nil, nil) }
-            try drainFrames(output)
-            if ret == ENODATA || ret == EINVAL { break }
-            if ret != 0 && ret != ENOBUFS { break }
+            let drained = try drainFrames(output)
+            // edge264 answers ENOBUFS forever, with no frame to take, when the
+            // last picture is missing slices (a damaged or cut-off stream).
+            if ret != ENOBUFS || drained == 0 { break }
         }
         pendingPTS.removeAll()
     }
@@ -121,13 +122,17 @@ public final class MVCDecoder {
         }
     }
 
-    private func drainFrames(_ output: (StereoFrame) throws -> Void) throws {
+    @discardableResult
+    private func drainFrames(_ output: (StereoFrame) throws -> Void) throws -> Int {
         var frame = Edge264Frame()
+        var count = 0
         while edge264_get_frame(decoder, &frame, 0) == 0 {
+            count += 1
             let pts = pendingPTS.isEmpty ? nil : pendingPTS.removeFirst()
             try output(StereoFrame(pts: pts, left: Self.planes(frame.samples, frame),
                                    right: frame.samples_mvc.0 == nil ? nil : Self.planes(frame.samples_mvc, frame)))
         }
+        return count
     }
 
     private static func planes(_ s: (UnsafePointer<UInt8>?, UnsafePointer<UInt8>?, UnsafePointer<UInt8>?),

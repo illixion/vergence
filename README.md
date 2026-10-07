@@ -14,8 +14,14 @@ or frame-packed (top-and-bottom or side by side) for an encoder.
 Early. Working: BDAV/TS demux, playlist (MPLS) parsing including the 3D extensions (the
 dependent-view SubPath and STN_table_SS), picking the feature, pairing the base (`0x1011`) and
 dependent (`0x1012`) views, decoding both with edge264, frame packing, a command line tool. Verified on a commercial 3D
-Blu-ray (1080p23.976, CABAC): 8,486 consecutive stereo frames with no errors, output identical
-single- and multi-threaded.
+Blu-ray (1080p23.976, CABAC): the whole 1:53:53 feature, 163,820 stereo frames, with no errors,
+read from the disc image over SMB at 194 fps; output identical single- and multi-threaded.
+
+## Tests
+
+`swift test` runs on synthetic data only. `scripts/fetch-conformance.sh` downloads the ITU-T MVC
+conformance bitstreams (36 MB, not redistributed here);
+`MVC3D_CONFORMANCE=.build/conformance/mvc swift test` then decodes them too.
 
 Disc images (`.iso`) are read in place, without mounting, by a read-only UDF 2.50 reader
 (metadata partition included) over any `ByteSource`, so a remote image can be read the same way.
