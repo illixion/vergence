@@ -136,6 +136,17 @@ public final class StereoStreamReader {
         return ready.removeFirst()
     }
 
+    /// Restarts both clips at byte offsets, normally from the clips' EP_maps
+    /// (a base-view entry point and the dependent-view one at the same PTS).
+    public func seek(baseOffset: Int64, dependentOffset: Int64?) {
+        base.seek(to: baseOffset)
+        dependent?.seek(to: dependentOffset ?? 0)
+        pairer = StereoAccessUnitPairer()
+        ready.removeAll()
+        baseEnded = false
+        dependentEnded = dependent == nil
+    }
+
     private static func mono(_ pes: PESPacket) -> StereoAccessUnit {
         StereoAccessUnit(pts: pes.pts, dts: pes.dts, data: pes.payload, hasDependentView: false)
     }

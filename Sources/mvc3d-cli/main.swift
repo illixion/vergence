@@ -5,7 +5,11 @@
    mvc3d decode DISC [--playlist NNNNN] [options]
    mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
 
-   options: --packing tab|sbs  --start N  --frames N  --threads N  --output FILE|-
+   options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N
+            --output FILE|-
+
+ --seek starts at a time into the playlist (from the nearest entry point
+ before it, then frame-exact); --start then skips N more frames.
 
  DISC is a folder holding BDMV (a rip or a mounted disc) or a disc image
  (.iso), read in place without mounting. Without
@@ -27,6 +31,7 @@ struct Options {
     var positional: [String] = []
     var playlist: String?
     var packing = StereoPacking.topAndBottom
+    var seek: Double?
     var start = 0
     var frames = Int.max
     var threads = 0
@@ -39,7 +44,7 @@ func usage() -> Never {
            mvc3d decode DISC [--playlist NNNNN] [options]
            mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
            mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]
-    options: --packing tab|sbs  --start N  --frames N  --threads N  --output FILE|-
+    options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
 
     """.utf8))
     exit(64)
@@ -59,6 +64,7 @@ func parse(_ args: [String]) -> Options {
         switch args[i] {
         case "--playlist": o.playlist = value()
         case "--packing": o.packing = StereoPacking(rawValue: value()) ?? { usage() }()
+        case "--seek": o.seek = Double(value()) ?? { usage() }()
         case "--start": o.start = Int(value()) ?? 0
         case "--frames": o.frames = Int(value()) ?? Int.max
         case "--threads": o.threads = Int(value()) ?? 0
@@ -99,13 +105,14 @@ func info(_ o: Options) throws {
     }
 }
 
-/// Where access units come from: a disc playlist or a clip pair.
-struct UnitSource {
-    var next: () throws -> StereoAccessUnit?
-    var unpaired: () -> Int
+/// Where frames come from: a disc playlist or a clip pair.
+struct FrameSource {
+    /// Decodes, calling the closure per frame until it returns false.
+    var run: (_ output: (StereoFrame) throws -> Bool) throws -> Void
+    var summary: () -> String
 }
 
-func unitSource(_ o: Options) throws -> UnitSource {
+func frameSource(_ o: Options) throws -> FrameSource {
     if o.positional.count == 1, let disc = try openDisc(o.positional[0]) {
         let chosen: (name: String, playlist: BlurayPlaylist)?
         if let wanted = o.playlist {
@@ -115,19 +122,31 @@ func unitSource(_ o: Options) throws -> UnitSource {
         }
         guard let (name, playlist) = chosen else { throw FormatError("no such playlist") }
         log("mvc3d: playlist \(name), \(clockTime(playlist.duration)), \(playlist.isStereo ? "3D" : "2D only"), clips \(playlist.items.map(\.clip).joined(separator: " "))")
-        let reader = disc.stereoReader(for: playlist)
-        return UnitSource(next: reader.next, unpaired: { reader.unpairedBaseCount })
+        let decoder = try PlaylistDecoder(disc: disc, playlist: playlist, threads: o.threads)
+        if let seek = o.seek { try decoder.seek(to: seek) }
+        return FrameSource(run: { try decoder.decode(output: $0) }, summary: {
+            "\(decoder.unpairedBaseCount) unpaired AUs, \(decoder.corruptNALCount) corrupt NALs, \(decoder.unsupportedNALCount) unsupported NALs"
+        })
     }
-    guard (1 ... 2).contains(o.positional.count) else { usage() }
+    guard (1 ... 2).contains(o.positional.count), o.seek == nil else { usage() }
     let reader = StereoStreamReader(
         base: try FileByteSource(url: URL(fileURLWithPath: o.positional[0])),
         dependent: try o.positional.dropFirst().first.map { try FileByteSource(url: URL(fileURLWithPath: $0)) })
-    return UnitSource(next: reader.next, unpaired: { reader.unpairedBaseCount })
+    let decoder = try MVCDecoder(threads: o.threads)
+    return FrameSource(run: { output in
+        struct Stop: Error {}
+        let emit: (StereoFrame) throws -> Void = { if try !output($0) { throw Stop() } }
+        do {
+            while let unit = try reader.next() { try decoder.decode(unit, output: emit) }
+            try decoder.finish(output: emit)
+        } catch is Stop {}
+    }, summary: {
+        "\(reader.unpairedBaseCount) unpaired AUs, \(decoder.corruptNALCount) corrupt NALs, \(decoder.unsupportedNALCount) unsupported NALs"
+    })
 }
 
 func decode(_ o: Options) throws {
-    let source = try unitSource(o)
-    let decoder = try MVCDecoder(threads: o.threads)
+    let source = try frameSource(o)
     let out: FileHandle
     if o.output == "-" {
         out = .standardOutput
@@ -141,17 +160,27 @@ func decode(_ o: Options) throws {
     var index = 0, written = 0, mono = 0
     var buffer = Data()
     var announced = false
+    // Timestamps should step by one frame; a jump means frames went missing
+    // or came out of order.
+    var previousPTS: Int64?, frameTicks: Int64?, irregular = 0
     let last = o.frames == Int.max ? Int.max : o.start + o.frames
-    struct Done: Error {}
 
-    func emit(_ frame: StereoFrame) throws {
+    try source.run { frame in
         defer { index += 1 }
-        guard index >= o.start else { return }
-        guard index < last else { throw Done() }
+        guard index >= o.start else { return true }
+        guard index < last else { return false }
         if frame.right == nil { mono += 1 }
+        if let pts = frame.pts {
+            if let previousPTS {
+                let step = pts - previousPTS
+                if frameTicks == nil { frameTicks = step }
+                if let frameTicks, abs(step - frameTicks) > 2 { irregular += 1 }
+            }
+            previousPTS = pts
+        }
         if !announced {
             let (w, h) = o.packing.packedSize(width: frame.width, height: frame.height)
-            log("mvc3d: \(frame.width)x\(frame.height) per eye -> \(w)x\(h) \(o.packing.rawValue), yuv420p")
+            log("mvc3d: \(frame.width)x\(frame.height) per eye -> \(w)x\(h) \(o.packing.rawValue), yuv420p, first frame at \(String(format: "%.3f", Double(frame.pts ?? 0) / 90_000)) s")
             announced = true
         }
         let count = frame.packedByteCount(o.packing)
@@ -163,19 +192,12 @@ func decode(_ o: Options) throws {
             let seconds = (clock.now - began) / .seconds(1)
             log(String(format: "mvc3d: %d frames (%@), %.1f fps", written, clockTime(Double(frame.pts ?? 0) / 90_000), Double(written) / seconds))
         }
+        return written < last - o.start
     }
 
-    do {
-        while let unit = try source.next() {
-            try decoder.decode(unit, output: emit)
-        }
-        try decoder.finish(output: emit)
-    } catch is Done {}
-
     let seconds = (clock.now - began) / .seconds(1)
-    log(String(format: "mvc3d: wrote %d frames in %.1f s (%.1f fps); %d without a second view, %d unpaired AUs, %d corrupt NALs, %d unsupported NALs",
-               written, seconds, Double(written) / seconds, mono, source.unpaired(),
-               decoder.corruptNALCount, decoder.unsupportedNALCount))
+    log(String(format: "mvc3d: wrote %d frames in %.1f s (%.1f fps); %d without a second view, %d irregular timestamp steps, %@",
+               written, seconds, Double(written) / seconds, mono, irregular, source.summary()))
 }
 
 /// mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]: a file's bytes out

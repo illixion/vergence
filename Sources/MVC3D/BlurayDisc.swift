@@ -73,6 +73,17 @@ public final class BlurayDisc {
         try fileSystem.open("BDMV/STREAM/\(name).m2ts")
     }
 
+    /// The clip's CLPI, or nil when it is missing or unreadable (the clip
+    /// still plays from its start; it just can't seek).
+    public func clipInfo(_ name: String) -> ClipInfo? {
+        if let cached = clipInfoCache[name] { return cached }
+        let info = try? ClipInfo(data: fileSystem.readAll("BDMV/CLIPINF/\(name).clpi"))
+        clipInfoCache[name] = info
+        return info
+    }
+
+    private var clipInfoCache: [String: ClipInfo?] = [:]
+
     /// Stereo access units of a playlist, in decode order, timestamps on the
     /// playlist's own timeline (0 = start of the first PlayItem).
     public func stereoReader(for playlist: BlurayPlaylist, stereo: Bool = true) -> PlaylistStereoReader {
@@ -86,36 +97,90 @@ public final class PlaylistStereoReader {
     private let stereo: Bool
     private var itemIndex = -1
     private var current: StereoStreamReader?
-    /// Playlist time at which the current PlayItem starts, 90 kHz.
-    private var itemStart: Int64 = 0
-    public private(set) var unpairedBaseCount = 0
+    /// Playlist time at which each PlayItem starts, 90 kHz.
+    private let itemStarts: [Int64]
+    private var finishedUnpaired = 0
+
+    public var unpairedBaseCount: Int { finishedUnpaired + (current?.unpairedBaseCount ?? 0) }
 
     init(disc: BlurayDisc, playlist: BlurayPlaylist, stereo: Bool) {
         self.disc = disc
         self.playlist = playlist
         self.stereo = stereo
+        var start: Int64 = 0
+        itemStarts = playlist.items.map { item in
+            defer { start += item.outPTS - item.inPTS }
+            return start
+        }
     }
 
+    /// The next access unit. Each PlayItem starts at the entry point at or
+    /// before its IN time and ends at its OUT time, so a picture shortly
+    /// before IN (the references the first shown pictures need) comes out
+    /// with a timestamp before the item's start, for the caller to drop.
     public func next() throws -> StereoAccessUnit? {
         while true {
             if let current, var unit = try current.next() {
                 let item = playlist.items[itemIndex]
-                // PTS wraps at 2^33; a clip's timeline starts at its IN time.
-                if let pts = unit.pts { unit.pts = itemStart + Self.offset(pts, from: item.inPTS) }
-                if let dts = unit.dts { unit.dts = itemStart + Self.offset(dts, from: item.inPTS) }
+                // Every picture shown before OUT is decoded before it.
+                if let order = unit.dts ?? unit.pts, Self.offset(order, from: item.outPTS) >= 0 {
+                    endItem()
+                    continue
+                }
+                if let pts = unit.pts { unit.pts = itemStarts[itemIndex] + Self.offset(pts, from: item.inPTS) }
+                if let dts = unit.dts { unit.dts = itemStarts[itemIndex] + Self.offset(dts, from: item.inPTS) }
                 return unit
             }
-            if let current { unpairedBaseCount += current.unpairedBaseCount }
-            if itemIndex >= 0 { itemStart += playlist.items[itemIndex].outPTS - playlist.items[itemIndex].inPTS }
-            itemIndex += 1
-            guard itemIndex < playlist.items.count else { current = nil; return nil }
-            let item = playlist.items[itemIndex]
-            current = StereoStreamReader(
-                base: try disc.clip(item.clip),
-                dependent: stereo ? try item.dependentClip.map { try disc.clip($0) } : nil,
-                basePID: item.videoPID ?? TransportStreamDemuxer.blurayBaseVideoPID,
-                dependentPID: item.dependentVideoPID ?? TransportStreamDemuxer.blurayDependentVideoPID)
+            if current != nil { endItem() }
+            guard itemIndex + 1 < playlist.items.count else { itemIndex = playlist.items.count; return nil }
+            try startItem(itemIndex + 1, at: playlist.items[itemIndex + 1].inPTS)
         }
+    }
+
+    /// Moves to `seconds` into the playlist. Returns the playlist time, in
+    /// 90 kHz, of the entry point reading resumes at: the random access
+    /// picture at or before the target. Pictures between it and the target
+    /// have to be decoded and dropped.
+    @discardableResult
+    public func seek(to seconds: Double) throws -> Int64 {
+        let target = Int64((max(seconds, 0) * 90_000).rounded())
+        guard !playlist.items.isEmpty else { return 0 }
+        let index = itemStarts.lastIndex { $0 <= target } ?? 0
+        let item = playlist.items[index]
+        let clipPTS = min(item.inPTS + target - itemStarts[index], item.outPTS - 1)
+        if current != nil { endItem() }
+        let entry = try startItem(index, at: clipPTS)
+        return itemStarts[index] + Self.offset(entry, from: item.inPTS)
+    }
+
+    /// Opens a PlayItem's clips at the entry point at or before `clipPTS`,
+    /// returning that entry point's clip PTS.
+    @discardableResult
+    private func startItem(_ index: Int, at clipPTS: Int64) throws -> Int64 {
+        itemIndex = index
+        let item = playlist.items[index]
+        let basePID = item.videoPID ?? TransportStreamDemuxer.blurayBaseVideoPID
+        let dependentPID = item.dependentVideoPID ?? TransportStreamDemuxer.blurayDependentVideoPID
+        let dependentClip = stereo ? item.dependentClip : nil
+        let reader = StereoStreamReader(
+            base: try disc.clip(item.clip),
+            dependent: try dependentClip.map { try disc.clip($0) },
+            basePID: basePID, dependentPID: dependentPID)
+        current = reader
+        guard let entry = disc.clipInfo(item.clip)?.entryPoint(pid: basePID, atOrBefore: clipPTS) else {
+            return item.inPTS
+        }
+        // The dependent view's entry points sit at the base view's PTS.
+        let dependentEntry = dependentClip.flatMap { disc.clipInfo($0)?.entryPoint(pid: dependentPID, atOrBefore: entry.pts) }
+        if entry.spn > 0 || (dependentEntry?.spn ?? 0) > 0 {
+            reader.seek(baseOffset: entry.byteOffset, dependentOffset: dependentEntry?.byteOffset)
+        }
+        return entry.pts
+    }
+
+    private func endItem() {
+        finishedUnpaired += current?.unpairedBaseCount ?? 0
+        current = nil
     }
 
     /// `pts - start` on the 33-bit clock: wraps forward, and a picture just

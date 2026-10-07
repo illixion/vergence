@@ -116,20 +116,10 @@ public struct BlurayPlaylist: Sendable, Equatable {
     // MARK: ExtensionData
 
     private static func applyExtensions(_ base: BinaryReader, to items: inout [PlayItem]) throws {
-        var r = base
-        let length = Int(try r.u32())
-        guard length > 0 else { return }
-        try r.skip(4) // data_block_start_address
-        try r.skip(3)
-        let entries = Int(try r.u8())
-        for _ in 0 ..< entries {
-            let id1 = try r.u16(), id2 = try r.u16()
-            let start = Int(try r.u32()), entryLength = Int(try r.u32())
-            var block = BinaryReader(base.data, offset: base.offset + start)
-            guard block.remaining >= entryLength else { throw FormatError("extension past the end") }
-            switch (id1, id2) {
-            case (2, 1): try applySTNTableSS(&block, to: &items)
-            case (2, 2): try applySubPathExtension(&block, to: &items)
+        for var block in try ExtensionData.blocks(base) {
+            switch block.id {
+            case (2, 1): try applySTNTableSS(&block.reader, to: &items)
+            case (2, 2): try applySubPathExtension(&block.reader, to: &items)
             default: continue
             }
         }

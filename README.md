@@ -14,8 +14,9 @@ or frame-packed (top-and-bottom or side by side) for an encoder.
 Early. Working: BDAV/TS demux, playlist (MPLS) parsing including the 3D extensions (the
 dependent-view SubPath and STN_table_SS), picking the feature, pairing the base (`0x1011`) and
 dependent (`0x1012`) views, decoding both with edge264, frame packing, a command line tool. Verified on a commercial 3D
-Blu-ray (1080p23.976, CABAC): the whole 1:53:53 feature, 163,820 stereo frames, with no errors,
-read from the disc image over SMB at 194 fps; output identical single- and multi-threaded.
+Blu-ray (1080p23.976, CABAC): the whole 1:53:53 feature, 163,820 stereo frames in display order
+with every timestamp one frame after the last and no errors, read from the disc image over SMB at
+175 fps; the base view matches ffmpeg's decode frame for frame.
 
 ## Tests
 
@@ -26,8 +27,14 @@ conformance bitstreams (36 MB, not redistributed here);
 Disc images (`.iso`) are read in place, without mounting, by a read-only UDF 2.50 reader
 (metadata partition included) over any `ByteSource`, so a remote image can be read the same way.
 
-Planned: an HTTP range `ByteSource`, seeking (CLPI EP maps), `CVPixelBuffer` output on Apple
-platforms, encoder integration.
+Seeking uses the clips' entry point maps (CLPI EP_map; the dependent view's is in the CLPI's
+ExtensionData): decoding restarts at the random access picture before the target and drops the
+pictures in between, so a seek costs at most a GOP of decoding (0.4 s from an image over SMB) and
+lands on the exact frame a decode from the start would give. PlayItems start at their IN time and
+end at their OUT time.
+
+Planned: an HTTP range `ByteSource`, `CVPixelBuffer` output on Apple platforms, encoder
+integration.
 
 ## Speed
 
@@ -50,7 +57,8 @@ swift build -c release
 
 `DISC` is a folder holding `BDMV`, or a disc image (`.iso`). `--playlist NNNNN` picks another title; a clip pair
 (`decode 00007.m2ts 00008.m2ts`) works too. `--packing sbs` for side by side,
-`--start N --frames N` for a range, `--output FILE`.
+`--seek SECONDS` to start part way in, `--start N --frames N` for a range of frames,
+`--output FILE`.
 
 ## Library
 
@@ -58,15 +66,17 @@ swift build -c release
 import MVC3D
 
 let disc = BlurayDisc(fileSystem: DirectoryFileSystem(root: discFolder))
-let reader = disc.stereoReader(for: try disc.mainPlaylist()!.playlist)
-let decoder = try MVCDecoder(threads: -1)
-while let unit = try reader.next() {
-    try decoder.decode(unit) { frame in
-        // frame.left / frame.right: Y, Cb, Cr planes, valid inside this closure
-    }
+let decoder = try PlaylistDecoder(disc: disc, playlist: try disc.mainPlaylist()!.playlist, threads: -1)
+try decoder.seek(to: 600)
+try decoder.decode { frame in
+    // frame.pts: 90 kHz on the playlist's timeline
+    // frame.left / frame.right: Y, Cb, Cr planes, valid inside this closure
+    return true // false stops; calling decode again continues
 }
-try decoder.finish { frame in /* frames held for reordering */ }
 ```
+
+Lower down, `PlaylistStereoReader` gives the stereo access units and `MVCDecoder` decodes any
+stream of them.
 
 ## License
 
