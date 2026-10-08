@@ -70,6 +70,16 @@ swift build -c release
 `--seek SECONDS` to start part way in, `--start N --frames N` for a range of frames,
 `--output FILE`.
 
+`mvc3d stream DISC [--seek SECONDS]` writes the feature's main clips (base view,
+audio, subtitles) as a `.m2ts` byte stream from the entry point at or before the
+seek, for tools that can read a stream but not seek in a disc image. ffmpeg's
+`bluray:` input took 75 s to start a cut an hour into a film on a home server,
+this about 2 s:
+
+```sh
+.build/release/mvc3d stream disc.iso --seek 3600 | ffmpeg -i - -map 0:1 -c copy -f truehd audio.thd
+```
+
 ## Library
 
 ```swift

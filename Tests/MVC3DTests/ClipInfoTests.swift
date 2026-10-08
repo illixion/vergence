@@ -84,6 +84,15 @@ func entryPointsRoundTrip(inExtension: Bool) throws {
     #expect(info.entryPoint(pid: 0x1012, atOrBefore: 0) == nil)
 }
 
+@Test func entryPointLookupFindsTheFirstAfter() throws {
+    let info = try ClipInfo(data: ClipInfoBuilder(pid: 0x1011, entries: entries).build())
+    #expect(info.entryPoint(pid: 0x1011, after: 0)?.spn == 4)
+    #expect(info.entryPoint(pid: 0x1011, after: 138_752)?.spn == 130_000)
+    #expect(info.entryPoint(pid: 0x1011, after: 600_000)?.spn == 131_100)
+    #expect(info.entryPoint(pid: 0x1011, after: 614_984_192) == nil)
+    #expect(info.entryPoint(pid: 0x1012, after: 0) == nil)
+}
+
 @Test func aClipWithoutEntryPointsParses() throws {
     let info = try ClipInfo(data: ClipInfoBuilder(pid: 0x1011, entries: []).build())
     #expect(info.entryPoints[0x1011] == [])

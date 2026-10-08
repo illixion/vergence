@@ -4,6 +4,7 @@
    mvc3d info DISC
    mvc3d decode DISC [--playlist NNNNN] [options]
    mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
+   mvc3d stream DISC [--playlist NNNNN] [--seek SECONDS]
 
    options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N
             --output FILE|-
@@ -21,6 +22,15 @@
 
    mvc3d decode /Volumes/DISC --threads -1 | ffmpeg -f rawvideo -pix_fmt yuv420p \
      -s 1920x2160 -r 24000/1001 -i - -c:v hevc_videotoolbox out.mov
+
+ stream writes a playlist's base clips (base view, audio, subtitles) as
+ BDAV transport stream (.m2ts, 192-byte packets) from the entry point at or
+ before --seek, for tools that read a stream but can't seek in a disc image:
+
+   mvc3d stream disc.iso --seek 3600 | ffmpeg -i - -map 0:a:0 -c copy audio.mka
+
+ Its timestamps are the clips' own; stderr says which playlist time the
+ output starts at.
 
  Progress and a summary go to stderr.
  */
@@ -46,6 +56,7 @@ func usage() -> Never {
     usage: mvc3d info DISC
            mvc3d decode DISC [--playlist NNNNN] [options]
            mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
+           mvc3d stream DISC [--playlist NNNNN] [--seek SECONDS]
            mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]
     options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
              --header "Name: value" (for an http(s) DISC)
@@ -129,13 +140,7 @@ struct FrameSource {
 
 func frameSource(_ o: Options) throws -> FrameSource {
     if o.positional.count == 1, let disc = try openDisc(o.positional[0]) {
-        let chosen: (name: String, playlist: BlurayPlaylist)?
-        if let wanted = o.playlist {
-            chosen = try disc.playlists().first { $0.name == wanted }
-        } else {
-            chosen = try disc.mainPlaylist()
-        }
-        guard let (name, playlist) = chosen else { throw FormatError("no such playlist") }
+        let (name, playlist) = try chosenPlaylist(disc, o)
         log("mvc3d: playlist \(name), \(clockTime(playlist.duration)), \(playlist.isStereo ? "3D" : "2D only"), clips \(playlist.items.map(\.clip).joined(separator: " "))")
         let decoder = try PlaylistDecoder(disc: disc, playlist: playlist, threads: o.threads)
         if let seek = o.seek { try decoder.seek(to: seek) }
@@ -215,6 +220,35 @@ func decode(_ o: Options) throws {
                written, seconds, Double(written) / seconds, mono, irregular, source.summary()))
 }
 
+/// The playlist named by --playlist, else the feature.
+func chosenPlaylist(_ disc: BlurayDisc, _ o: Options) throws -> (name: String, playlist: BlurayPlaylist) {
+    let chosen = try o.playlist.map { wanted in try disc.playlists().first { $0.name == wanted } } ?? disc.mainPlaylist()
+    guard let chosen else { throw FormatError("no such playlist") }
+    return chosen
+}
+
+/// mvc3d stream DISC: the playlist's base clips as one .m2ts byte stream.
+func stream(_ o: Options) throws {
+    guard o.positional.count == 1, let disc = try openDisc(o.positional[0]) else { usage() }
+    let (name, playlist) = try chosenPlaylist(disc, o)
+    let spans = try disc.clipSpans(of: playlist, from: o.seek ?? 0)
+    if let first = spans.first {
+        log(String(format: "mvc3d: playlist %@, streaming from %.3f s (clip %@, byte %lld)", name, Double(first.playlistTime) / 90_000, first.clip, first.start))
+    }
+    for (i, span) in spans.enumerated() {
+        let item = playlist.items[playlist.items.count - spans.count + i]
+        log("mvc3d: clip \(span.clip) bytes \(span.start)-\(span.end), IN at PTS \(item.inPTS), playlist time \(span.playlistTime)")
+        let file = try disc.clip(span.clip)
+        var offset = span.start
+        while offset < span.end {
+            let chunk = try file.read(at: offset, count: Int(min(4 << 20, span.end - offset)))
+            if chunk.isEmpty { break }
+            try FileHandle.standardOutput.write(contentsOf: chunk)
+            offset += Int64(chunk.count)
+        }
+    }
+}
+
 /// mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]: a file's bytes out
 /// of a disc (mainly for checking the image reader against a mounted copy).
 func cat(_ o: Options) throws {
@@ -235,6 +269,7 @@ do {
     switch options.command {
     case "info": try info(options)
     case "decode": try decode(options)
+    case "stream": try stream(options)
     case "cat": try cat(options)
     default: usage()
     }

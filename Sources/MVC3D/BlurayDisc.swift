@@ -89,6 +89,47 @@ public final class BlurayDisc {
     public func stereoReader(for playlist: BlurayPlaylist, stereo: Bool = true) -> PlaylistStereoReader {
         PlaylistStereoReader(disc: self, playlist: playlist, stereo: stereo && playlist.isStereo)
     }
+
+    /// A byte range of a PlayItem's base clip, which carries the audio and
+    /// subtitles along with the base view.
+    public struct ClipSpan: Sendable, Equatable {
+        public var clip: String
+        public var start: Int64
+        /// Exclusive.
+        public var end: Int64
+        /// Playlist time of the entry point at `start` (or of the item's IN
+        /// time when the clip has no entry points), 90 kHz.
+        public var playlistTime: Int64
+    }
+
+    /// What to read, clip by clip, to get every stream of a playlist from
+    /// `seconds` on: from the entry point at or before it in the first item,
+    /// each later item from the entry point at or before its IN time, and
+    /// each item up to the first entry point after its OUT time, so the
+    /// audio of the item's last pictures is included. Timestamps inside are
+    /// the clips' own, so they jump between items.
+    public func clipSpans(of playlist: BlurayPlaylist, from seconds: Double = 0) throws -> [ClipSpan] {
+        let target = Int64((max(seconds, 0) * 90_000).rounded())
+        var spans: [ClipSpan] = []
+        var itemStart: Int64 = 0
+        for item in playlist.items {
+            defer { itemStart += item.outPTS - item.inPTS }
+            let itemEnd = itemStart + item.outPTS - item.inPTS
+            guard itemEnd > target else { continue }
+            let pid = item.videoPID ?? TransportStreamDemuxer.blurayBaseVideoPID
+            let size = try clip(item.clip).size
+            let clipPTS = item.inPTS + max(target - itemStart, 0)
+            let info = clipInfo(item.clip)
+            let entry = info?.entryPoint(pid: pid, atOrBefore: clipPTS)
+            let after = info?.entryPoint(pid: pid, after: item.outPTS)
+            spans.append(ClipSpan(
+                clip: item.clip,
+                start: entry?.byteOffset ?? 0,
+                end: min(after?.byteOffset ?? size, size),
+                playlistTime: itemStart + PlaylistStereoReader.offset(entry?.pts ?? item.inPTS, from: item.inPTS)))
+        }
+        return spans
+    }
 }
 
 public final class PlaylistStereoReader {

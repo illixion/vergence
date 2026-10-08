@@ -62,6 +62,17 @@ public struct ClipInfo: Sendable, Equatable {
         return list[max(low - 1, 0)]
     }
 
+    /// The first entry point after `pts`, or nil past the last.
+    public func entryPoint(pid: UInt16, after pts: Int64) -> EntryPoint? {
+        guard let list = entryPoints[pid] else { return nil }
+        var low = 0, high = list.count
+        while low < high {
+            let mid = (low + high) / 2
+            if list[mid].pts <= pts { low = mid + 1 } else { high = mid }
+        }
+        return low < list.count ? list[low] : nil
+    }
+
     // MARK: CPI / EP_map
 
     private static func parseCPI(_ base: BinaryReader) throws -> [UInt16: [EntryPoint]] {
