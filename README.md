@@ -27,8 +27,9 @@ conformance bitstreams (36 MB, not redistributed here);
 Disc images (`.iso`) are read in place, without mounting, by a read-only UDF 2.50 reader
 (metadata partition included) over any `ByteSource`. `HTTPByteSource` reads one from a web server
 with range requests (a media server's download URL, any static file server), through a cache of
-4 MB blocks with read-ahead; decoding from an image served over HTTP on the LAN ran at 309 fps
-(13× realtime), byte-identical to reading the file. Damaged bytes in a clip don't stop decoding:
+4 MB blocks with read-ahead. Jellyfin serves a disc image item's raw bytes with ranges at
+`/Items/{id}/Download` (authorised with `Authorization: MediaBrowser Token="…"`); decoding from it
+over HTTPS on the LAN ran at 278 fps (11× realtime), byte-identical to reading the file. Damaged bytes in a clip don't stop decoding:
 the demuxer skips to where packets resume and counts the spot.
 
 Seeking uses the clips' entry point maps (CLPI EP_map; the dependent view's is in the CLPI's
