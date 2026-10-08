@@ -18,6 +18,17 @@ public final class PlaylistDecoder {
     private var lastShown: Int64 = .min
     private var stoppedEarly = false
 
+    /// PIDs of the base clips to hand to `onSidePackets` as the video is
+    /// read: audio and subtitles, from the same bytes. Takes effect at the
+    /// next seek.
+    public var sidePIDs: Set<UInt16> {
+        get { reader.sidePIDs }
+        set { reader.sidePIDs = newValue }
+    }
+    /// Called during `decode` with the side PIDs' PES (playlist timestamps)
+    /// as they are read, a little ahead of the pictures they go with.
+    public var onSidePackets: (([PESPacket]) -> Void)?
+
     public var unpairedBaseCount: Int { reader.unpairedBaseCount }
     public var resyncCount: Int { reader.resyncCount }
     public var corruptNALCount: Int { decoder.corruptNALCount }
@@ -63,7 +74,15 @@ public final class PlaylistDecoder {
         }
         do {
             while let unit = try reader.next() {
+                if let onSidePackets {
+                    let side = reader.takeSidePackets()
+                    if !side.isEmpty { onSidePackets(side) }
+                }
                 try decoder.decode(unit, output: show)
+            }
+            if let onSidePackets {
+                let side = reader.takeSidePackets()
+                if !side.isEmpty { onSidePackets(side) }
             }
             try decoder.finish(output: show)
         } catch is Stop {

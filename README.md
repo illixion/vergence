@@ -80,6 +80,17 @@ this about 2 s:
 .build/release/mvc3d stream disc.iso --seek 3600 | ffmpeg -i - -map 0:1 -c copy -f truehd audio.thd
 ```
 
+`mvc3d subtitles DISC --pid 0x1203 [--output DIR]` decodes a PGS subtitle track
+(PIDs as `mvc3d streams` lists them) without the video: a line per caption with
+its time and place in the frame, and with `--output` each caption as a PNG.
+
+`mvc3d audio DISC --pid 0x1101 --seek 600 --frames 20 -o out.wav` decodes an AC-3
+or E-AC-3 track, or the AC-3 core of a TrueHD track, through Apple's decoder to a
+5.1 WAV (L R C LFE Ls Rs). It reads in windows of a few seconds, the way a player
+does. Against ffmpeg's decode of the same core it lines up within 32 samples, and
+the channels correlate at 0.996 or better. ffmpeg comes out about 2 dB quieter
+because it applies the stream's dynamic range compression.
+
 ## Library
 
 ```swift
@@ -98,6 +109,13 @@ try decoder.decode { frame in
 `StereoPixelBufferMaker(layout: .packed(.topAndBottom)).makeBuffers(frame)` turns a frame into
 `CVPixelBuffer`s inside that closure. Lower down, `PlaylistStereoReader` gives the stereo access units and `MVCDecoder` decodes any
 stream of them.
+
+The other streams of a clip come from the same reads: set `PlaylistDecoder.sidePIDs`
+and `onSidePackets` hands over their PES, on the playlist timeline, as the video is
+read. `PGSDecoder` turns subtitle PES (or a `.sup` file, through `SupFile`) into
+captions. They keep their bitmaps compressed until `renderRGBA()`.
+`PlaylistAudioReader` reads any window of an audio track as 5.1 PCM. It uses its
+own reads, so sound can be ready ahead of the picture.
 
 ## License
 

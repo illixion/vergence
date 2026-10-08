@@ -48,22 +48,33 @@ public final class FileByteSource: ByteSource {
     }
 }
 
-/// Sequential PES from one PID of one source.
+/// Sequential PES from one PID of one source, collecting the PES of
+/// `sidePIDs` (audio, subtitles) from the same bytes as they go by.
 final class PESStream {
     private let source: ByteSource
     private var demuxer: TransportStreamDemuxer
+    private let pid: UInt16
     private var offset: Int64 = 0
     private var queue: [PESPacket] = []
+    /// Side PES read so far and not yet taken, in stream order.
+    var side: [PESPacket] = []
     private var ended = false
     private let chunkSize: Int
 
     /// Times the clip's bytes were damaged and sync had to be found again.
     var resyncCount: Int { demuxer.resyncCount }
 
-    init(source: ByteSource, pid: UInt16, chunkSize: Int = 1 << 20) {
+    init(source: ByteSource, pid: UInt16, sidePIDs: Set<UInt16> = [], chunkSize: Int = 1 << 20) {
         self.source = source
+        self.pid = pid
         self.chunkSize = chunkSize
-        demuxer = TransportStreamDemuxer(pids: [pid])
+        demuxer = TransportStreamDemuxer(pids: sidePIDs.union([pid]))
+    }
+
+    private func sort(_ packets: [PESPacket]) {
+        for packet in packets {
+            if packet.pid == pid { queue.append(packet) } else { side.append(packet) }
+        }
     }
 
     /// The next PES, or nil at the end of the source.
@@ -73,13 +84,14 @@ final class PESStream {
             let chunk = try source.read(at: offset, count: chunkSize)
             if chunk.isEmpty {
                 ended = true
-                // A final PES cut short by the end of the file is dropped:
-                // a truncated slice is worse than none.
-                _ = demuxer.flush()
+                // A final video PES cut short by the end of the file is
+                // dropped: a truncated slice is worse than none. Side PES
+                // end there anyway (nothing follows them to close them).
+                side += demuxer.flush().filter { $0.pid != pid }
                 return nil
             }
             offset += Int64(chunk.count)
-            queue = try demuxer.feed(chunk)
+            sort(try demuxer.feed(chunk))
         }
         return queue.removeFirst()
     }
@@ -89,6 +101,7 @@ final class PESStream {
     func seek(to byteOffset: Int64) {
         offset = byteOffset
         queue.removeAll()
+        side.removeAll()
         ended = false
         demuxer.reset()
     }
@@ -110,10 +123,13 @@ public final class StereoStreamReader {
     ///   - base: the clip carrying PID 0x1011.
     ///   - dependent: the clip carrying PID 0x1012, or nil to decode the
     ///     base view alone.
+    ///   - sidePIDs: other PIDs of the base clip (audio, subtitles) whose
+    ///     PES to collect for `takeSidePackets()` as the video is read.
     public init(base: ByteSource, dependent: ByteSource?,
                 basePID: UInt16 = TransportStreamDemuxer.blurayBaseVideoPID,
-                dependentPID: UInt16 = TransportStreamDemuxer.blurayDependentVideoPID) {
-        self.base = PESStream(source: base, pid: basePID)
+                dependentPID: UInt16 = TransportStreamDemuxer.blurayDependentVideoPID,
+                sidePIDs: Set<UInt16> = []) {
+        self.base = PESStream(source: base, pid: basePID, sidePIDs: sidePIDs)
         self.dependent = dependent.map { PESStream(source: $0, pid: dependentPID) }
         dependentEnded = dependent == nil
     }
@@ -139,6 +155,14 @@ public final class StereoStreamReader {
             }
         }
         return ready.removeFirst()
+    }
+
+    /// The side PIDs' PES read since the last call, in stream order: muxed
+    /// a little ahead of the pictures they go with, so a caller taking them
+    /// after each access unit has them in time.
+    public func takeSidePackets() -> [PESPacket] {
+        defer { base.side.removeAll() }
+        return base.side
     }
 
     /// Restarts both clips at byte offsets, normally from the clips' EP_maps

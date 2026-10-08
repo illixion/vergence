@@ -7,8 +7,11 @@ struct StreamBuilder {
     var bytes = Data()
     private var continuity: [UInt16: UInt8] = [:]
 
-    mutating func pes(pid: UInt16, pts: Int64, payload: Data) {
-        var pes = Data([0, 0, 1, 0xE0, 0, 0, 0x80, 0x80, 5])
+    /// `declaresLength` fills PES_packet_length the way audio and subtitle
+    /// PES do; video leaves it 0.
+    mutating func pes(pid: UInt16, pts: Int64, payload: Data, declaresLength: Bool = false) {
+        let length = declaresLength ? 3 + 5 + payload.count : 0
+        var pes = Data([0, 0, 1, 0xE0, UInt8(length >> 8), UInt8(length & 0xFF), 0x80, 0x80, 5])
         pes.append(contentsOf: Self.timestamp(pts, marker: 0x2))
         pes.append(payload)
         var first = true

@@ -146,6 +146,29 @@ public final class PlaylistStereoReader {
     public var unpairedBaseCount: Int { finishedUnpaired + (current?.unpairedBaseCount ?? 0) }
     public var resyncCount: Int { finishedResyncs + (current?.resyncCount ?? 0) }
 
+    /// PIDs of the base clips (audio, subtitles) to collect alongside the
+    /// video, from the next item or seek on.
+    public var sidePIDs: Set<UInt16> = []
+    private var side: [PESPacket] = []
+
+    /// The side PIDs' PES read so far, timestamps on the playlist timeline
+    /// like the video's. Muxed somewhat ahead of the pictures they go with.
+    public func takeSidePackets() -> [PESPacket] {
+        collectSide()
+        defer { side.removeAll() }
+        return side
+    }
+
+    private func collectSide() {
+        guard let current, itemIndex >= 0, itemIndex < playlist.items.count else { return }
+        let item = playlist.items[itemIndex]
+        for var packet in current.takeSidePackets() {
+            if let pts = packet.pts { packet.pts = itemStarts[itemIndex] + Self.offset(pts, from: item.inPTS) }
+            if let dts = packet.dts { packet.dts = itemStarts[itemIndex] + Self.offset(dts, from: item.inPTS) }
+            side.append(packet)
+        }
+    }
+
     init(disc: BlurayDisc, playlist: BlurayPlaylist, stereo: Bool) {
         self.disc = disc
         self.playlist = playlist
@@ -192,6 +215,7 @@ public final class PlaylistStereoReader {
         let item = playlist.items[index]
         let clipPTS = min(item.inPTS + target - itemStarts[index], item.outPTS - 1)
         if current != nil { endItem() }
+        side.removeAll()
         let entry = try startItem(index, at: clipPTS)
         return itemStarts[index] + Self.offset(entry, from: item.inPTS)
     }
@@ -208,7 +232,7 @@ public final class PlaylistStereoReader {
         let reader = StereoStreamReader(
             base: try disc.clip(item.clip),
             dependent: try dependentClip.map { try disc.clip($0) },
-            basePID: basePID, dependentPID: dependentPID)
+            basePID: basePID, dependentPID: dependentPID, sidePIDs: sidePIDs)
         current = reader
         guard let entry = disc.clipInfo(item.clip)?.entryPoint(pid: basePID, atOrBefore: clipPTS) else {
             return item.inPTS
@@ -222,6 +246,7 @@ public final class PlaylistStereoReader {
     }
 
     private func endItem() {
+        collectSide()
         finishedUnpaired += current?.unpairedBaseCount ?? 0
         finishedResyncs += current?.resyncCount ?? 0
         current = nil
@@ -229,7 +254,7 @@ public final class PlaylistStereoReader {
 
     /// `pts - start` on the 33-bit clock: wraps forward, and a picture just
     /// before IN (a reference decoded ahead of it) comes out slightly negative.
-    static func offset(_ pts: Int64, from start: Int64) -> Int64 {
+    public static func offset(_ pts: Int64, from start: Int64) -> Int64 {
         let wrapped = (pts - start) & ((1 << 33) - 1)
         return wrapped >= 1 << 32 ? wrapped - (1 << 33) : wrapped
     }

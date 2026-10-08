@@ -43,6 +43,8 @@ public struct TransportStreamDemuxer {
     private struct PESAssembly {
         var header: (pts: Int64?, dts: Int64?)
         var payload: Data
+        /// Payload bytes the header declares, or nil for video's open length.
+        var expected: Int?
     }
 
     public init(pids: Set<UInt16>) {
@@ -88,7 +90,7 @@ public struct TransportStreamDemuxer {
                     continue
                 }
                 synced = true
-                if let pes = handle(packet) { output.append(pes) }
+                handle(packet, into: &output)
                 offset += size
             }
             remainder = Data(bytes[offset...])
@@ -115,30 +117,39 @@ public struct TransportStreamDemuxer {
 
     // MARK: Packets
 
-    private mutating func handle(_ p: UnsafeBufferPointer<UInt8>) -> PESPacket? {
+    /// A PES is complete when the next one on its PID starts or, for one
+    /// that declares its length (audio, subtitles), as soon as it has it:
+    /// a subtitle's last PES would otherwise wait for the next subtitle.
+    private mutating func handle(_ p: UnsafeBufferPointer<UInt8>, into output: inout [PESPacket]) {
         let pid = UInt16(p[1] & 0x1F) << 8 | UInt16(p[2])
-        guard pids.contains(pid) else { return nil }
+        guard pids.contains(pid) else { return }
         let payloadUnitStart = p[1] & 0x40 != 0
         let adaptation = (p[3] >> 4) & 0x3
         var start = 4
         if adaptation & 0x2 != 0 { start += 1 + Int(p[4]) }
-        guard adaptation & 0x1 != 0, start < 188 else { return nil }
+        guard adaptation & 0x1 != 0, start < 188 else { return }
         let body = UnsafeBufferPointer(rebasing: p[start...])
 
-        var finished: PESPacket?
         if payloadUnitStart {
             if let previous = assembling.removeValue(forKey: pid) {
-                finished = PESPacket(pid: pid, pts: previous.header.pts, dts: previous.header.dts, payload: previous.payload)
+                output.append(PESPacket(pid: pid, pts: previous.header.pts, dts: previous.header.dts, payload: previous.payload))
             }
-            guard let (header, headerLength) = Self.parsePESHeader(body) else { return finished }
+            guard let (header, headerLength) = Self.parsePESHeader(body) else { return }
+            // Video PES leave their length open; audio and subtitles state it.
+            let declared = body.count >= 6 ? Int(body[4]) << 8 | Int(body[5]) : 0
+            let expected = declared == 0 ? nil : max(6 + declared - headerLength, 0)
             var payload = Data()
-            payload.reserveCapacity(256 * 1024)
+            payload.reserveCapacity(expected ?? 256 * 1024)
             payload.append(contentsOf: UnsafeBufferPointer(rebasing: body[headerLength...]))
-            assembling[pid] = PESAssembly(header: header, payload: payload)
+            assembling[pid] = PESAssembly(header: header, payload: payload, expected: expected)
         } else {
             assembling[pid]?.payload.append(contentsOf: body)
         }
-        return finished
+        if let assembly = assembling[pid], let expected = assembly.expected, assembly.payload.count >= expected {
+            assembling[pid] = nil
+            output.append(PESPacket(pid: pid, pts: assembly.header.pts, dts: assembly.header.dts,
+                                    payload: assembly.payload.prefix(expected)))
+        }
     }
 
     /// The PES header's timestamps and total length, or nil if this is not

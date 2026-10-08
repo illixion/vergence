@@ -6,6 +6,8 @@
    mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
    mvc3d stream DISC [--playlist NNNNN] [--seek SECONDS]
    mvc3d streams DISC [--playlist NNNNN]
+   mvc3d subtitles DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames N] [--output DIR]
+   mvc3d audio DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames SECONDS] --output FILE.wav
 
    options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N
             --output FILE|-
@@ -36,11 +38,24 @@
  streams lists the feature's audio and subtitle streams as the disc labels
  them, one per line: kind, PID, codec, language ("audio 0x1100 truehd eng").
 
+ subtitles decodes a PGS subtitle stream (PID as `streams` lists it, e.g.
+ 0x1203) without decoding the video: one line per caption (playlist time,
+ position and size in the frame), at most --frames captions, and with
+ --output each caption as a PNG in that folder.
+
+ audio decodes an AC-3 or E-AC-3 track (or a TrueHD track's AC-3 core) the
+ way a player on the device does, in windows of a few seconds, to a 5.1
+ WAV (L R C LFE Ls Rs) starting exactly at --seek, --frames seconds long.
+
  Progress and a summary go to stderr.
  */
 
 import Foundation
 import MVC3D
+#if canImport(ImageIO)
+import CoreGraphics
+import ImageIO
+#endif
 
 struct Options {
     var command = ""
@@ -52,6 +67,7 @@ struct Options {
     var frames = Int.max
     var threads = 0
     var output = "-"
+    var pid: UInt16?
     var headers: [String: String] = [:]
 }
 
@@ -62,6 +78,8 @@ func usage() -> Never {
            mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
            mvc3d stream DISC [--playlist NNNNN] [--seek SECONDS]
            mvc3d streams DISC [--playlist NNNNN]
+           mvc3d subtitles DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames N] [--output DIR]
+           mvc3d audio DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames SECONDS] --output FILE.wav
            mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]
     options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
              --header "Name: value" (for an http(s) DISC)
@@ -89,6 +107,7 @@ func parse(_ args: [String]) -> Options {
         case "--frames": o.frames = Int(value()) ?? Int.max
         case "--threads": o.threads = Int(value()) ?? 0
         case "--output", "-o": o.output = value()
+        case "--pid": o.pid = UInt16(value().replacingOccurrences(of: "0x", with: ""), radix: 16) ?? { usage() }()
         case "--header", "-H": addHeader(value(), to: &o)
         case let a where a.hasPrefix("-") && a != "-": usage()
         default: o.positional.append(args[i])
@@ -266,6 +285,105 @@ func streams(_ o: Options) throws {
     }
 }
 
+/// mvc3d subtitles DISC --pid PID: a PGS stream's captions, read straight
+/// from the base clips.
+func subtitles(_ o: Options) throws {
+    guard o.positional.count == 1, let pid = o.pid, let disc = try openDisc(o.positional[0]) else { usage() }
+    let (_, playlist) = try chosenPlaylist(disc, o)
+    let spans = try disc.clipSpans(of: playlist, from: o.seek ?? 0)
+    let directory = o.output == "-" ? nil : URL(fileURLWithPath: o.output)
+    if let directory { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+    var itemStart: Int64 = 0
+    var starts: [String: (start: Int64, inPTS: Int64)] = [:]
+    for item in playlist.items {
+        starts[item.clip] = starts[item.clip] ?? (itemStart, item.inPTS)
+        itemStart += item.outPTS - item.inPTS
+    }
+    var count = 0
+    var decoder = PGSDecoder()
+    for span in spans {
+        guard let item = starts[span.clip] else { continue }
+        var demuxer = TransportStreamDemuxer(pids: [pid])
+        let file = try disc.clip(span.clip)
+        var offset = span.start
+        func handle(_ packets: [PESPacket]) throws -> Bool {
+            for packet in packets {
+                for caption in decoder.feed(pes: packet.payload, pts: packet.pts) {
+                    let time = Double(item.start + PlaylistStereoReader.offset(caption.pts, from: item.inPTS)) / 90_000
+                    let place = caption.bounds.map { "\($0.width)x\($0.height) at \($0.x),\($0.y)" } ?? "clear"
+                    print(String(format: "%@ %.3f %@ in %dx%d%@", clockTime(time), time, place, caption.videoWidth,
+                                 caption.videoHeight, caption.isRefresh ? " (refresh)" : ""))
+                    if let directory, let image = caption.renderRGBA() {
+                        try writePNG(image.pixels, width: image.width, height: image.height,
+                                     to: directory.appendingPathComponent(String(format: "%06d-%.3f.png", count, time)))
+                    }
+                    count += 1
+                    if count >= o.frames { return false }
+                }
+            }
+            return true
+        }
+        while offset < span.end {
+            let chunk = try file.read(at: offset, count: Int(min(4 << 20, span.end - offset)))
+            if chunk.isEmpty { break }
+            offset += Int64(chunk.count)
+            guard try handle(demuxer.feed(chunk)) else { return }
+        }
+        guard try handle(demuxer.flush()) else { return }
+    }
+    log("mvc3d: \(count) captions")
+}
+
+func writePNG(_ pixels: [UInt32], width: Int, height: Int, to url: URL) throws {
+    #if canImport(ImageIO)
+    var pixels = pixels
+    let image = pixels.withUnsafeMutableBytes { raw -> CGImage? in
+        guard let context = CGContext(data: raw.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        return context.makeImage()
+    }
+    guard let image, let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil)
+    else { throw FormatError("can't write \(url.path)") }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else { throw FormatError("can't write \(url.path)") }
+    #endif
+}
+
+/// mvc3d audio DISC --pid PID: decoded 5.1 PCM to a WAV file.
+func audio(_ o: Options) throws {
+    guard o.positional.count == 1, let pid = o.pid, o.output != "-", let disc = try openDisc(o.positional[0]) else { usage() }
+    let (_, playlist) = try chosenPlaylist(disc, o)
+    let reader = PlaylistAudioReader(disc: disc, playlist: playlist, pid: pid)
+    let rate = PlaylistAudioReader.sampleRate
+    let total = (o.frames == Int.max ? 30 : o.frames) * rate
+    let window = 4 * rate
+    var start = Int64(((o.seek ?? 0) * 90_000).rounded())
+    var pcm = Data()
+    let began = Date()
+    var written = 0
+    while written < total {
+        let count = min(window, total - written)
+        let planes = try reader.read(fromPTS: start, frames: count)
+        for i in 0 ..< count {
+            for channel in 0 ..< planes.count {
+                let v = Int16(max(-1, min(1, planes[channel][i])) * 32767)
+                withUnsafeBytes(of: v.littleEndian) { pcm.append(contentsOf: $0) }
+            }
+        }
+        written += count
+        start += Int64(count) * 90_000 / Int64(rate)
+    }
+    var header = Data()
+    func u32(_ v: Int) { withUnsafeBytes(of: UInt32(v).littleEndian) { header.append(contentsOf: $0) } }
+    func u16(_ v: Int) { withUnsafeBytes(of: UInt16(v).littleEndian) { header.append(contentsOf: $0) } }
+    header.append(contentsOf: Array("RIFF".utf8)); u32(36 + pcm.count)
+    header.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(1); u16(6); u32(rate); u32(rate * 12); u16(12); u16(16)
+    header.append(contentsOf: Array("data".utf8)); u32(pcm.count)
+    try (header + pcm).write(to: URL(fileURLWithPath: o.output))
+    log(String(format: "mvc3d: %.1f s of audio in %.1f s", Double(total) / Double(rate), Date().timeIntervalSince(began)))
+}
+
 /// mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]: a file's bytes out
 /// of a disc (mainly for checking the image reader against a mounted copy).
 func cat(_ o: Options) throws {
@@ -288,6 +406,8 @@ do {
     case "decode": try decode(options)
     case "stream": try stream(options)
     case "streams": try streams(options)
+    case "subtitles": try subtitles(options)
+    case "audio": try audio(options)
     case "cat": try cat(options)
     default: usage()
     }
