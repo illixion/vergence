@@ -37,7 +37,12 @@ pictures in between, so a seek costs at most a GOP of decoding (0.4 s from an im
 lands on the exact frame a decode from the start would give. PlayItems start at their IN time and
 end at their OUT time.
 
-Planned: `CVPixelBuffer` output on Apple platforms, encoder integration.
+On Apple platforms `StereoPixelBufferMaker` copies each frame into pooled, IOSurface-backed
+`CVPixelBuffer`s ('420v', tagged BT.709): one per eye, or both eyes packed top and bottom or side
+by side, for players that already crop eyes from frame-packed video. About 0.25 ms per 1080p
+stereo frame.
+
+Planned: encoder integration.
 
 ## Speed
 
@@ -79,7 +84,8 @@ try decoder.decode { frame in
 }
 ```
 
-Lower down, `PlaylistStereoReader` gives the stereo access units and `MVCDecoder` decodes any
+`StereoPixelBufferMaker(layout: .packed(.topAndBottom)).makeBuffers(frame)` turns a frame into
+`CVPixelBuffer`s inside that closure. Lower down, `PlaylistStereoReader` gives the stereo access units and `MVCDecoder` decodes any
 stream of them.
 
 ## License
