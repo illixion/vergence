@@ -3,11 +3,14 @@
 
  Lets a disc image be read in place from a media server (Jellyfin's
  `/Items/{id}/Download`, any static file server). Reads are served from a
- cache of fixed-size blocks; reading a block also fetches the block after it
- in the background, so a sequential reader rarely waits on the network. A
- Blu-ray clip pair is two such readers (base and dependent view) at different
- offsets, and the UDF reader adds small scattered reads, so the cache holds
- several blocks.
+ cache of fixed-size blocks; reading a block also fetches the next
+ `readAhead` blocks in the background, so a sequential reader rides out a
+ slow request (Wi-Fi, a server busy with another reader of the same file)
+ rather than waiting on it. One block ahead, under a second of a 3D
+ Blu-ray, showed as the picture freezing for a beat. A Blu-ray clip pair is
+ two such readers (base and dependent view) at different offsets, and the
+ UDF reader adds small scattered reads, so the cache holds several blocks
+ per reader.
 
  `read` blocks the calling thread until the bytes arrive: call it off the
  main thread, as the decoder does.
@@ -29,6 +32,7 @@ public final class HTTPByteSource: ByteSource, @unchecked Sendable {
     private let session: URLSession
     private let blockSize: Int
     private let capacity: Int
+    private let readAhead: Int
     private let timeout: TimeInterval
 
     private let lock = NSLock()
@@ -43,13 +47,17 @@ public final class HTTPByteSource: ByteSource, @unchecked Sendable {
     ///   - headers: sent with every request (an `Authorization` header, say).
     ///   - blockSize: bytes per request.
     ///   - cacheBlocks: blocks kept in memory.
+    ///   - readAhead: blocks fetched ahead of a read.
     public init(url: URL, headers: [String: String] = [:], session: URLSession = .shared,
-                blockSize: Int = 4 << 20, cacheBlocks: Int = 8, timeout: TimeInterval = 30) throws {
+                blockSize: Int = 4 << 20, cacheBlocks: Int = 16, readAhead: Int = 3,
+                timeout: TimeInterval = 30) throws {
         self.url = url
         self.headers = headers
         self.session = session
         self.blockSize = blockSize
-        capacity = max(cacheBlocks, 2)
+        self.readAhead = max(readAhead, 1)
+        // Room for two sequential readers' read-ahead plus scattered reads.
+        capacity = max(cacheBlocks, 2 * (self.readAhead + 1) + 2)
         self.timeout = timeout
         let (_, response) = try fetch(range: 0 ... 0)
         guard let total = Self.totalSize(response) else { throw Error.missingSize }
@@ -70,8 +78,9 @@ public final class HTTPByteSource: ByteSource, @unchecked Sendable {
             result.append(block[block.startIndex + start ..< block.startIndex + start + take])
             position += Int64(take)
         }
-        // A reader moving forward wants the next block soon.
-        prefetch((end - 1) / Int64(blockSize) + 1)
+        // A reader moving forward wants the next blocks soon.
+        let last = (end - 1) / Int64(blockSize)
+        for ahead in 1 ... Int64(readAhead) { prefetch(last + ahead) }
         return result
     }
 
