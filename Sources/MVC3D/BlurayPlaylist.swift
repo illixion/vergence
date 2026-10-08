@@ -26,11 +26,46 @@ public struct BlurayPlaylist: Sendable, Equatable {
         public var outTime: UInt32
         public var videoPID: UInt16?
         public var dependentVideoPID: UInt16?
+        /// Primary audio streams, in the disc's order (the player's track numbers).
+        public var audioStreams: [Stream] = []
+        /// Presentation graphics (PGS bitmap subtitles) and text subtitle streams.
+        public var subtitleStreams: [Stream] = []
 
         /// 90 kHz, the PES clock.
         public var inPTS: Int64 { Int64(inTime) * 2 }
         public var outPTS: Int64 { Int64(outTime) * 2 }
         public var duration: Double { Double(outTime &- inTime) / 45_000 }
+    }
+
+    /// An elementary stream an STN_table lists.
+    public struct Stream: Sendable, Equatable {
+        public var pid: UInt16
+        /// The stream_coding_type: 0x80 LPCM, 0x81 AC-3, 0x82 DTS, 0x83 TrueHD,
+        /// 0x84 E-AC-3, 0x85/0x86 DTS-HD, 0x90 PGS, 0x92 text subtitles.
+        public var codingType: UInt8
+        /// ISO 639-2 ("eng"), as the disc labels it.
+        public var language: String?
+
+        public init(pid: UInt16, codingType: UInt8, language: String?) {
+            self.pid = pid
+            self.codingType = codingType
+            self.language = language
+        }
+
+        public var codecName: String {
+            switch codingType {
+            case 0x80: "lpcm"
+            case 0x81: "ac3"
+            case 0x82: "dts"
+            case 0x83: "truehd"
+            case 0x84, 0xA1: "eac3"
+            case 0x85, 0x86, 0xA2: "dtshd"
+            case 0x90: "pgs"
+            case 0x91: "igs"
+            case 0x92: "text"
+            default: String(format: "0x%02x", codingType)
+            }
+        }
     }
 
     public var items: [PlayItem]
@@ -88,17 +123,58 @@ public struct BlurayPlaylist: Sendable, Equatable {
         var item = PlayItem(clip: clip, inTime: inTime, outTime: outTime)
         let stnLength = Int(try r.u16())
         var stn = try r.sub(stnLength)
-        item.videoPID = try parseSTNPrimaryVideo(&stn)
+        try parseSTN(&stn, into: &item)
         return item
     }
 
-    /// The first primary video stream's PID from an STN_table.
-    private static func parseSTNPrimaryVideo(_ r: inout BinaryReader) throws -> UInt16? {
+    /// An STN_table: counts of each stream kind, then each stream's entry
+    /// (where its PID is) and attributes (codec, language), video first,
+    /// then primary audio, then presentation graphics.
+    private static func parseSTN(_ r: inout BinaryReader, into item: inout PlayItem) throws {
         try r.skip(2)
-        let videoCount = try r.u8()
-        try r.skip(11) // six other stream counts, 5 reserved
-        guard videoCount > 0 else { return nil }
-        return try parseStreamEntryPID(&r)
+        let videoCount = Int(try r.u8())
+        let audioCount = Int(try r.u8())
+        let graphicsCount = Int(try r.u8())
+        try r.skip(9) // IG, secondary audio and video, PiP PG counts; 5 reserved
+        for i in 0 ..< videoCount {
+            let pid = try parseStreamEntryPID(&r)
+            _ = try parseStreamAttributes(&r)
+            if i == 0 { item.videoPID = pid }
+        }
+        // A table cut short (some authoring tools) still gives its video.
+        do {
+            for _ in 0 ..< audioCount {
+                let pid = try parseStreamEntryPID(&r)
+                let (type, language) = try parseStreamAttributes(&r)
+                if let pid { item.audioStreams.append(Stream(pid: pid, codingType: type, language: language)) }
+            }
+            for _ in 0 ..< graphicsCount {
+                let pid = try parseStreamEntryPID(&r)
+                let (type, language) = try parseStreamAttributes(&r)
+                if let pid { item.subtitleStreams.append(Stream(pid: pid, codingType: type, language: language)) }
+            }
+        } catch is FormatError {}
+    }
+
+    /// stream_attributes(): the coding type, and the language for audio and subtitles.
+    private static func parseStreamAttributes(_ r: inout BinaryReader) throws -> (UInt8, String?) {
+        let length = Int(try r.u8())
+        var a = try r.sub(length)
+        let type = try a.u8()
+        let language: String?
+        switch type {
+        case 0x80 ... 0x86, 0xA1, 0xA2:
+            try a.skip(1) // presentation type, sampling frequency
+            language = try a.ascii(3)
+        case 0x90, 0x91:
+            language = try a.ascii(3)
+        case 0x92:
+            try a.skip(1) // character code
+            language = try a.ascii(3)
+        default:
+            language = nil
+        }
+        return (type, language?.trimmingCharacters(in: .whitespaces).lowercased())
     }
 
     /// stream_entry(): length, type, then the PID where the type puts it.

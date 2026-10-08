@@ -5,6 +5,7 @@
    mvc3d decode DISC [--playlist NNNNN] [options]
    mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
    mvc3d stream DISC [--playlist NNNNN] [--seek SECONDS]
+   mvc3d streams DISC [--playlist NNNNN]
 
    options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N
             --output FILE|-
@@ -32,6 +33,9 @@
  Its timestamps are the clips' own; stderr says which playlist time the
  output starts at.
 
+ streams lists the feature's audio and subtitle streams as the disc labels
+ them, one per line: kind, PID, codec, language ("audio 0x1100 truehd eng").
+
  Progress and a summary go to stderr.
  */
 
@@ -57,6 +61,7 @@ func usage() -> Never {
            mvc3d decode DISC [--playlist NNNNN] [options]
            mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
            mvc3d stream DISC [--playlist NNNNN] [--seek SECONDS]
+           mvc3d streams DISC [--playlist NNNNN]
            mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]
     options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
              --header "Name: value" (for an http(s) DISC)
@@ -249,6 +254,18 @@ func stream(_ o: Options) throws {
     }
 }
 
+/// mvc3d streams DISC: the first PlayItem's audio and subtitle streams.
+func streams(_ o: Options) throws {
+    guard o.positional.count == 1, let disc = try openDisc(o.positional[0]) else { usage() }
+    let (_, playlist) = try chosenPlaylist(disc, o)
+    guard let item = playlist.items.first else { return }
+    for (kind, list) in [("audio", item.audioStreams), ("subtitle", item.subtitleStreams)] {
+        for stream in list {
+            print(String(format: "%@ 0x%04x %@ %@", kind, stream.pid, stream.codecName, stream.language ?? "und"))
+        }
+    }
+}
+
 /// mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]: a file's bytes out
 /// of a disc (mainly for checking the image reader against a mounted copy).
 func cat(_ o: Options) throws {
@@ -270,6 +287,7 @@ do {
     case "info": try info(options)
     case "decode": try decode(options)
     case "stream": try stream(options)
+    case "streams": try streams(options)
     case "cat": try cat(options)
     default: usage()
     }

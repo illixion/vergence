@@ -7,6 +7,9 @@ struct PlaylistBuilder {
     struct Item { var clip: String; var dependent: String?; var inTime: UInt32; var outTime: UInt32 }
     var items: [Item]
     var multiAngleFirstItem = false
+    /// Primary audio and PGS streams on every item: PID, coding type, language.
+    var audio: [(UInt16, UInt8, String)] = []
+    var subtitles: [(UInt16, String)] = []
 
     func build() -> Data {
         var playList = Data()
@@ -19,9 +22,15 @@ struct PlaylistBuilder {
             if multiAngle {
                 body += Data([2, 0]) + Data("00099".utf8) + Data("M2TS".utf8) + Data([0])
             }
-            // STN_table: one primary video stream, PID 0x1011.
-            var stn = u16(0) + Data([1, 0, 0, 0, 0, 0, 0]) + Data(count: 5)
+            // STN_table: one primary video stream, PID 0x1011, then audio and PGS.
+            var stn = u16(0) + Data([1, UInt8(audio.count), UInt8(subtitles.count), 0, 0, 0, 0]) + Data(count: 5)
             stn += Data([9, 1]) + u16(0x1011) + Data(count: 6) + Data([5, 0x1B, 0x61, 0, 0, 0])
+            for (pid, type, language) in audio {
+                stn += Data([9, 1]) + u16(pid) + Data(count: 6) + Data([5, type, 0x31]) + Data(language.utf8)
+            }
+            for (pid, language) in subtitles {
+                stn += Data([9, 1]) + u16(pid) + Data(count: 6) + Data([5, 0x90]) + Data(language.utf8) + Data([0])
+            }
             body += u16(UInt16(stn.count)) + stn
             playList += u16(UInt16(body.count)) + body
         }
@@ -83,6 +92,23 @@ struct PlaylistBuilder {
     #expect(item.inPTS == 48_754)
     #expect(playlist.isStereo)
     #expect(abs(playlist.duration - 6832.70) < 0.01)
+}
+
+@Test func listsTheAudioAndSubtitleStreamsWithTheirLanguages() throws {
+    var builder = PlaylistBuilder(items: [.init(clip: "00007", dependent: "00008", inTime: 0, outTime: 45_000)])
+    builder.audio = [(0x1100, 0x83, "deu"), (0x1101, 0x83, "eng"), (0x1102, 0x81, "fra")]
+    builder.subtitles = [(0x1200, "deu"), (0x1201, "eng")]
+    let item = try #require(try BlurayPlaylist(data: builder.build()).items.first)
+    #expect(item.videoPID == 0x1011)
+    #expect(item.audioStreams == [
+        .init(pid: 0x1100, codingType: 0x83, language: "deu"),
+        .init(pid: 0x1101, codingType: 0x83, language: "eng"),
+        .init(pid: 0x1102, codingType: 0x81, language: "fra"),
+    ])
+    #expect(item.audioStreams.map(\.codecName) == ["truehd", "truehd", "ac3"])
+    #expect(item.subtitleStreams.map(\.pid) == [0x1200, 0x1201])
+    #expect(item.subtitleStreams.map(\.language) == ["deu", "eng"])
+    #expect(item.dependentVideoPID == 0x1012)
 }
 
 @Test func parsesMultipleItemsAndAMultiAngleItem() throws {
