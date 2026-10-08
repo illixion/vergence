@@ -100,8 +100,10 @@ public final class PlaylistStereoReader {
     /// Playlist time at which each PlayItem starts, 90 kHz.
     private let itemStarts: [Int64]
     private var finishedUnpaired = 0
+    private var finishedResyncs = 0
 
     public var unpairedBaseCount: Int { finishedUnpaired + (current?.unpairedBaseCount ?? 0) }
+    public var resyncCount: Int { finishedResyncs + (current?.resyncCount ?? 0) }
 
     init(disc: BlurayDisc, playlist: BlurayPlaylist, stereo: Bool) {
         self.disc = disc
@@ -180,6 +182,7 @@ public final class PlaylistStereoReader {
 
     private func endItem() {
         finishedUnpaired += current?.unpairedBaseCount ?? 0
+        finishedResyncs += current?.resyncCount ?? 0
         current = nil
     }
 

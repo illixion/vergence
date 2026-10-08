@@ -25,7 +25,11 @@ conformance bitstreams (36 MB, not redistributed here);
 `MVC3D_CONFORMANCE=.build/conformance/mvc swift test` then decodes them too.
 
 Disc images (`.iso`) are read in place, without mounting, by a read-only UDF 2.50 reader
-(metadata partition included) over any `ByteSource`, so a remote image can be read the same way.
+(metadata partition included) over any `ByteSource`. `HTTPByteSource` reads one from a web server
+with range requests (a media server's download URL, any static file server), through a cache of
+4 MB blocks with read-ahead; decoding from an image served over HTTP on the LAN ran at 309 fps
+(13× realtime), byte-identical to reading the file. Damaged bytes in a clip don't stop decoding:
+the demuxer skips to where packets resume and counts the spot.
 
 Seeking uses the clips' entry point maps (CLPI EP_map; the dependent view's is in the CLPI's
 ExtensionData): decoding restarts at the random access picture before the target and drops the
@@ -33,8 +37,7 @@ pictures in between, so a seek costs at most a GOP of decoding (0.4 s from an im
 lands on the exact frame a decode from the start would give. PlayItems start at their IN time and
 end at their OUT time.
 
-Planned: an HTTP range `ByteSource`, `CVPixelBuffer` output on Apple platforms, encoder
-integration.
+Planned: `CVPixelBuffer` output on Apple platforms, encoder integration.
 
 ## Speed
 
@@ -55,7 +58,8 @@ swift build -c release
            -c:v hevc_videotoolbox -q:v 65 -tag:v hvc1 film.3D.FTAB.mov
 ```
 
-`DISC` is a folder holding `BDMV`, or a disc image (`.iso`). `--playlist NNNNN` picks another title; a clip pair
+`DISC` is a folder holding `BDMV`, a disc image (`.iso`), or the `http(s)` URL of one
+(`--header "Name: value"` or `MVC3D_HTTP_HEADER` for authentication). `--playlist NNNNN` picks another title; a clip pair
 (`decode 00007.m2ts 00008.m2ts`) works too. `--packing sbs` for side by side,
 `--seek SECONDS` to start part way in, `--start N --frames N` for a range of frames,
 `--output FILE`.

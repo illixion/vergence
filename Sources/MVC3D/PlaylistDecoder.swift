@@ -19,6 +19,7 @@ public final class PlaylistDecoder {
     private var stoppedEarly = false
 
     public var unpairedBaseCount: Int { reader.unpairedBaseCount }
+    public var resyncCount: Int { reader.resyncCount }
     public var corruptNALCount: Int { decoder.corruptNALCount }
     public var unsupportedNALCount: Int { decoder.unsupportedNALCount }
 

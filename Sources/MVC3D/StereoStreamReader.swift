@@ -57,6 +57,9 @@ final class PESStream {
     private var ended = false
     private let chunkSize: Int
 
+    /// Times the clip's bytes were damaged and sync had to be found again.
+    var resyncCount: Int { demuxer.resyncCount }
+
     init(source: ByteSource, pid: UInt16, chunkSize: Int = 1 << 20) {
         self.source = source
         self.chunkSize = chunkSize
@@ -100,6 +103,8 @@ public final class StereoStreamReader {
     private var dependentEnded = false
 
     public var unpairedBaseCount: Int { pairer.unpairedBaseCount }
+    /// Places where damaged bytes were skipped, in either clip.
+    public var resyncCount: Int { base.resyncCount + (dependent?.resyncCount ?? 0) }
 
     /// - Parameters:
     ///   - base: the clip carrying PID 0x1011.

@@ -10,6 +10,9 @@
  Only what video needs is parsed: no PSI tables (the caller names the PIDs,
  which Blu-ray fixes: 0x1011 base view, 0x1012 dependent view), no scrambling,
  no PCR. A PES is emitted when the next one on its PID starts, or on `flush`.
+
+ Damaged bytes (a sync byte missing) don't stop it: the PES being assembled
+ is dropped and reading resumes where sync bytes recur at packet intervals.
  */
 
 import Foundation
@@ -25,10 +28,6 @@ public struct PESPacket: Sendable {
 }
 
 public struct TransportStreamDemuxer {
-    public enum Error: Swift.Error, Equatable {
-        case lostSync(offset: Int)
-    }
-
     public static let blurayBaseVideoPID: UInt16 = 0x1011
     public static let blurayDependentVideoPID: UInt16 = 0x1012
 
@@ -37,7 +36,9 @@ public struct TransportStreamDemuxer {
     /// Bytes carried between `feed` calls when a packet straddles two chunks.
     private var remainder = Data()
     private var packetSize: Int?
-    private var consumed = 0
+    /// Times sync was lost and found again.
+    public private(set) var resyncCount = 0
+    private var synced = true
 
     private struct PESAssembly {
         var header: (pts: Int64?, dts: Int64?)
@@ -66,11 +67,30 @@ public struct TransportStreamDemuxer {
             var offset = 0
             while offset + size <= bytes.count {
                 let packet = UnsafeBufferPointer(rebasing: bytes[(offset + lead) ..< (offset + size)])
-                guard packet[0] == 0x47 else { throw Error.lostSync(offset: consumed + offset) }
+                if packet[0] != 0x47 {
+                    if synced {
+                        resyncCount += 1
+                        synced = false
+                        assembling.removeAll()
+                    }
+                    // The next spot with a sync byte where two packets in a row put one.
+                    var probe = offset + 1
+                    while probe + lead + size < bytes.count,
+                          bytes[probe + lead] != 0x47 || bytes[probe + lead + size] != 0x47 {
+                        probe += 1
+                    }
+                    if probe + lead + size >= bytes.count {
+                        // Not in this chunk: keep its last packet's worth for the next.
+                        offset = max(offset + 1, bytes.count - size)
+                        break
+                    }
+                    offset = probe
+                    continue
+                }
+                synced = true
                 if let pes = handle(packet) { output.append(pes) }
                 offset += size
             }
-            consumed += offset
             remainder = Data(bytes[offset...])
         }
         if packetSize == nil { remainder = buffer }

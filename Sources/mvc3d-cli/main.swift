@@ -11,8 +11,10 @@
  --seek starts at a time into the playlist (from the nearest entry point
  before it, then frame-exact); --start then skips N more frames.
 
- DISC is a folder holding BDMV (a rip or a mounted disc) or a disc image
- (.iso), read in place without mounting. Without
+ DISC is a folder holding BDMV (a rip or a mounted disc), a disc image (.iso)
+ read in place without mounting, or an http(s) URL of a disc image (read with
+ range requests; --header "Name: value" adds a header, as does
+ MVC3D_HTTP_HEADER, which keeps a token out of the process list). Without
  --playlist, decode picks the feature: the longest 3D playlist.
 
  decode writes packed I420 frames (rawvideo, yuv420p) for ffmpeg, e.g.
@@ -36,6 +38,7 @@ struct Options {
     var frames = Int.max
     var threads = 0
     var output = "-"
+    var headers: [String: String] = [:]
 }
 
 func usage() -> Never {
@@ -45,6 +48,7 @@ func usage() -> Never {
            mvc3d decode BASE.m2ts [DEPENDENT.m2ts] [options]
            mvc3d cat DISC PATH [--start BYTE] [--frames BYTES]
     options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
+             --header "Name: value" (for an http(s) DISC)
 
     """.utf8))
     exit(64)
@@ -69,12 +73,20 @@ func parse(_ args: [String]) -> Options {
         case "--frames": o.frames = Int(value()) ?? Int.max
         case "--threads": o.threads = Int(value()) ?? 0
         case "--output", "-o": o.output = value()
+        case "--header", "-H": addHeader(value(), to: &o)
         case let a where a.hasPrefix("-") && a != "-": usage()
         default: o.positional.append(args[i])
         }
         i += 1
     }
+    if let header = ProcessInfo.processInfo.environment["MVC3D_HTTP_HEADER"] { addHeader(header, to: &o) }
     return o
+}
+
+func addHeader(_ line: String, to o: inout Options) {
+    guard let colon = line.firstIndex(of: ":") else { usage() }
+    o.headers[String(line[..<colon]).trimmingCharacters(in: .whitespaces)] =
+        String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
 }
 
 func log(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
@@ -84,8 +96,11 @@ func clockTime(_ seconds: Double) -> String {
     return String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
 }
 
-/// A folder holding BDMV, or a disc image read in place.
+/// A folder holding BDMV, or a disc image read in place, local or remote.
 func openDisc(_ path: String) throws -> BlurayDisc? {
+    if let url = URL(string: path), ["http", "https"].contains(url.scheme?.lowercased()) {
+        return BlurayDisc(fileSystem: try UDFFileSystem(image: HTTPByteSource(url: url, headers: options.headers)))
+    }
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else { return nil }
     if isDirectory.boolValue {
@@ -125,7 +140,7 @@ func frameSource(_ o: Options) throws -> FrameSource {
         let decoder = try PlaylistDecoder(disc: disc, playlist: playlist, threads: o.threads)
         if let seek = o.seek { try decoder.seek(to: seek) }
         return FrameSource(run: { try decoder.decode(output: $0) }, summary: {
-            "\(decoder.unpairedBaseCount) unpaired AUs, \(decoder.corruptNALCount) corrupt NALs, \(decoder.unsupportedNALCount) unsupported NALs"
+            "\(decoder.unpairedBaseCount) unpaired AUs, \(decoder.resyncCount) damaged spots skipped, \(decoder.corruptNALCount) corrupt NALs, \(decoder.unsupportedNALCount) unsupported NALs"
         })
     }
     guard (1 ... 2).contains(o.positional.count), o.seek == nil else { usage() }
@@ -141,7 +156,7 @@ func frameSource(_ o: Options) throws -> FrameSource {
             try decoder.finish(output: emit)
         } catch is Stop {}
     }, summary: {
-        "\(reader.unpairedBaseCount) unpaired AUs, \(decoder.corruptNALCount) corrupt NALs, \(decoder.unsupportedNALCount) unsupported NALs"
+        "\(reader.unpairedBaseCount) unpaired AUs, \(reader.resyncCount) damaged spots skipped, \(decoder.corruptNALCount) corrupt NALs, \(decoder.unsupportedNALCount) unsupported NALs"
     })
 }
 

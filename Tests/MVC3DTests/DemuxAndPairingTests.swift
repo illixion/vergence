@@ -138,3 +138,26 @@ func nal(_ type: UInt8, _ body: [UInt8] = [0xAA, 0xBB], startCode: [UInt8] = [0,
     #expect(!out[0].hasDependentView)
     #expect(pairer.unpairedBaseCount == 1)
 }
+
+@Test(arguments: [7, 192, 1000, 100_000])
+func demuxerSkipsDamagedBytesAndCarriesOn(chunk: Int) throws {
+    var builder = StreamBuilder()
+    let payload = Data(repeating: 0x88, count: 600) // four packets per PES
+    for i in 0 ..< 10 { builder.pes(pid: 0x1011, pts: Int64(i) * 3754, payload: payload) }
+    var bytes = builder.bytes
+    // Wreck the middle of the fourth PES: a packet's sync byte and the bytes after it,
+    // as a bad read would.
+    let damage = 3 * 4 * 192 + 2 * 192 + 4
+    bytes.replaceSubrange(damage ..< damage + 300, with: Data(repeating: 0x00, count: 300))
+
+    var demuxer = TransportStreamDemuxer(pids: [0x1011])
+    var out: [PESPacket] = []
+    for start in stride(from: 0, to: bytes.count, by: chunk) {
+        out += try demuxer.feed(bytes[start ..< min(start + chunk, bytes.count)])
+    }
+    out += demuxer.flush()
+    #expect(demuxer.resyncCount == 1)
+    // The damaged PES is gone; every other one arrives whole.
+    #expect(out.compactMap(\.pts) == [0, 1, 2, 4, 5, 6, 7, 8, 9].map { Int64($0) * 3754 })
+    #expect(out.allSatisfy { $0.payload == payload })
+}
