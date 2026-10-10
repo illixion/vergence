@@ -19,6 +19,20 @@ public struct PumpFrame {
     }
 }
 
+/// Dolby Vision frames only the system's renderer can show. A profile 5
+/// picture is IPT-PQ-c2: without its RPU applied it decodes to purple and
+/// green, and AVFoundation hands decoded frames over with the RPU attached,
+/// not applied. Its frames carry `DolbyVisionRPUData` and no colour primaries
+/// (8.1 states BT.2020, and shows correctly as its HDR10 base). Nothing here
+/// applies an RPU; a host that wants such a picture in 3D gets it converted
+/// to HDR10 elsewhere (a server).
+public enum DolbyVisionFrames {
+    public static func needsSystemRenderer(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        CVBufferCopyAttachment(pixelBuffer, "DolbyVisionRPUData" as CFString, nil) != nil
+            && CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil) == nil
+    }
+}
+
 /// Where `StereoPump` gets frames. Called only on the pump queue (including
 /// `invalidate`, from the stop-drain block), at the pump's tick rate.
 ///

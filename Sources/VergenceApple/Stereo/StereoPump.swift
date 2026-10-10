@@ -206,6 +206,14 @@ public final class StereoPump: @unchecked Sendable {
     private let performanceInterval: Double = 2
     /// Any thread may read; set before `start()`. Called on the pump queue.
     public var onPerformance: (@Sendable (RAVEStereoPerformance) -> Void)?
+    /// Any thread may read; set before `start()`. Called once, on the pump
+    /// queue, when the first frame is one no warp can show right (Dolby
+    /// Vision profile 5, `DolbyVisionFrames`); nothing is rendered from then
+    /// on, and the host should go back to 2D.
+    public var onUnshowablePicture: (@Sendable () -> Void)?
+    /// Pump-queue only.
+    private var checkedPicture = false
+    private var pictureUnshowable = false
 
     private struct DeliveryWindow {
         var frames = 0
@@ -383,6 +391,14 @@ public final class StereoPump: @unchecked Sendable {
 
         let hostTime = CACurrentMediaTime()
         guard let frame = frameSource.nextFrame(hostTime: hostTime) else { return }
+        if !checkedPicture {
+            checkedPicture = true
+            if DolbyVisionFrames.needsSystemRenderer(frame.pixelBuffer) {
+                pictureUnshowable = true
+                onUnshowablePicture?()
+            }
+        }
+        if pictureUnshowable { return }
         lastFrame = frame
         reportSizeIfNeeded(frame.pixelBuffer)
 
