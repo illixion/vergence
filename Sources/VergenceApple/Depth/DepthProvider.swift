@@ -29,6 +29,7 @@ import CoreVideo
 import Metal
 import os
 import Vision
+import VideoToolbox
 import VergenceCore
 
 public protocol DepthProvider: AnyObject {
@@ -228,6 +229,21 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
 
     private let signposter = VergenceLog.signposter
 
+    // The model's input, prepared on the GPU. Vision would otherwise scale
+    // every full-size frame down itself and, for an HDR frame (PQ or HLG,
+    // BT.2020), colour-convert it for the model on the CPU first: on a
+    // Vision Pro that put depth at 40-46 ms a frame for a 1080p HDR film
+    // against 32-34 ms for SDR, past the 41.7 ms a 24 fps frame has (device,
+    // 2026-10-10). A pixel transfer scales the frame to fit the model's input
+    // (same aspect, so Vision's letterbox and `letterboxUVTransform` are
+    // unchanged) and converts it to BT.709, so Vision gets a small SDR image.
+    /// The model's input image size, if it declares one.
+    private let modelInputSize: (width: Int, height: Int)?
+    private var inputTransfer: VTPixelTransferSession?
+    private var inputPool: CVPixelBufferPool?
+    private var inputPoolSize = (width: 0, height: 0)
+    private var loggedInputPreparation = false
+
     /// Studio refinement chain (anchoring, locked scale/shift, edge-aware
     /// filtering), built on first use. See `RealtimeDepthRefiner`.
     private lazy var refiner: RealtimeDepthRefiner? = textureCache.flatMap {
@@ -259,6 +275,9 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
         guard let mlModel = try? MLModel(contentsOf: compiledURL, configuration: config),
               let vnModel = try? VNCoreMLModel(for: mlModel) else { return nil }
 
+        modelInputSize = mlModel.modelDescription.inputDescriptionsByName.values
+            .compactMap(\.imageConstraint).first
+            .map { (width: $0.pixelsWide, height: $0.pixelsHigh) }
         let request = VNCoreMLRequest(model: vnModel)
         // The model fixes its own (square) input size; Vision letterboxes the
         // frame into it, preserving aspect. `.scaleFill` stretched non-square
@@ -382,9 +401,66 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
     /// instance per provider — callers must not run concurrently (the realtime
     /// pump and the offline converter each own their own provider).
     private func performInference(on pixelBuffer: CVPixelBuffer) -> VNObservation? {
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        let input = preparedInput(pixelBuffer) ?? pixelBuffer
+        let handler = VNImageRequestHandler(cvPixelBuffer: input, orientation: .up, options: [:])
         try? handler.perform([request])
         return request.results?.first
+    }
+
+    /// `pixelBuffer` scaled on the GPU to fit the model's input and
+    /// converted to BT.709; nil (use the frame as is) when it is already no
+    /// larger than the input or the transfer isn't available.
+    private func preparedInput(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        guard let modelInputSize else { return nil }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0 else { return nil }
+        let scale = min(Double(modelInputSize.width) / Double(width), Double(modelInputSize.height) / Double(height))
+        let transfer = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil) as? String
+        let isHDR = transfer == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+            || transfer == (kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
+        guard scale < 1 || isHDR else { return nil }
+        // Even sizes, the frame's aspect.
+        let target = (width: max(2, Int((Double(width) * min(scale, 1) / 2).rounded()) * 2),
+                      height: max(2, Int((Double(height) * min(scale, 1) / 2).rounded()) * 2))
+        if inputTransfer == nil {
+            var session: VTPixelTransferSession?
+            guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &session) == noErr,
+                  let session else { return nil }
+            VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_DestinationColorPrimaries,
+                                 value: kCVImageBufferColorPrimaries_ITU_R_709_2)
+            VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_DestinationTransferFunction,
+                                 value: kCVImageBufferTransferFunction_ITU_R_709_2)
+            VTSessionSetProperty(session, key: kVTPixelTransferPropertyKey_DestinationYCbCrMatrix,
+                                 value: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+            inputTransfer = session
+        }
+        if inputPool == nil || inputPoolSize != target {
+            let attributes: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: target.width,
+                kCVPixelBufferHeightKey as String: target.height,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            var pool: CVPixelBufferPool?
+            CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
+            inputPool = pool
+            inputPoolSize = target
+        }
+        guard let inputTransfer, let inputPool else { return nil }
+        var output: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, inputPool, &output) == kCVReturnSuccess, let output,
+              VTPixelTransferSessionTransferImage(inputTransfer, from: pixelBuffer, to: output) == noErr else { return nil }
+        // Said outright, so Vision converts nothing.
+        CVBufferSetAttachment(output, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(output, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(output, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+        if !loggedInputPreparation {
+            loggedInputPreparation = true
+            VergenceLog.pipeline.info("Depth input prepared on the GPU: \(width)×\(height)\(isHDR ? " HDR" : "", privacy: .public) → \(target.width)×\(target.height) BT.709 for a \(modelInputSize.width)×\(modelInputSize.height) model")
+        }
+        return output
     }
 
     /// Raw model output for one frame: unstabilized and unnormalized (values in
