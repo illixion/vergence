@@ -6,141 +6,18 @@ import Testing
 import VideoToolbox
 @testable import VergenceApple
 @testable import VergenceCore
+import VergenceTestSupport
 
 /// End to end: a synthetic side-by-side clip in, a spatial video out that
 /// `inspect` calls complete, with each eye holding its own half.
 @Suite struct SpatialVideoMakerTests {
-    static let eye = (width: 256, height: 144)
-    static let disparity = 8
-    static let frames = 12
+    typealias Clip = SyntheticClip
+    static let eye = Clip.eye
+    static let disparity = Clip.disparity
+    static let frames = Clip.frames
 
-    /// A noise scene seen by two eyes `disparity` pixels apart, side by side,
-    /// with the left eye's top-left pixel marked bright and the right's dark.
-    /// `audio` adds a stereo AAC track (48 kHz) as long as the video; `hdr`
-    /// encodes 10-bit HEVC tagged BT.2020 PQ instead of 8-bit H.264.
     static func writeSideBySideClip(to url: URL, frames: Int = frames, audio: Bool = false, hdr: Bool = false) async throws {
-        let width = eye.width * 2, height = eye.height
-        let writer = try AVAssetWriter(outputURL: url, fileType: hdr ? .mov : .mp4)
-        var settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 8_000_000],
-        ]
-        if hdr {
-            settings[AVVideoCodecKey] = AVVideoCodecType.hevc
-            settings[AVVideoCompressionPropertiesKey] = [
-                AVVideoAverageBitRateKey: 8_000_000,
-                AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
-            ]
-            settings[AVVideoColorPropertiesKey] = [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_SMPTE_ST_2084_PQ,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020,
-            ]
-        }
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-        input.expectsMediaDataInRealTime = false
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
-        ])
-        writer.add(input)
-        var audioInput: AVAssetWriterInput?
-        if audio {
-            let made = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-                AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: audioRate, AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 128_000,
-            ])
-            made.expectsMediaDataInRealTime = false
-            writer.add(made)
-            audioInput = made
-        }
-        #expect(writer.startWriting())
-        writer.startSession(atSourceTime: .zero)
-        let sceneWidth = eye.width + disparity
-        func picture(_ frame: Int) throws -> CVPixelBuffer {
-            var state = UInt64(frame + 1) &* 0x9E37_79B9_7F4A_7C15 | 1
-            let scene = (0 ..< sceneWidth * height).map { _ -> UInt8 in
-                state ^= state << 13; state ^= state >> 7; state ^= state << 17
-                return UInt8(truncatingIfNeeded: state >> 24)
-            }
-            let pool = try #require(adaptor.pixelBufferPool)
-            var buffer: CVPixelBuffer?
-            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
-            let picture = try #require(buffer)
-            CVPixelBufferLockBaseAddress(picture, [])
-            let base = try #require(CVPixelBufferGetBaseAddress(picture)).assumingMemoryBound(to: UInt8.self)
-            let stride = CVPixelBufferGetBytesPerRow(picture)
-            for y in 0 ..< height {
-                for x in 0 ..< width {
-                    let isRight = x >= eye.width
-                    let v = scene[y * sceneWidth + (isRight ? x - eye.width + disparity : x)]
-                    let p = base + y * stride + x * 4
-                    p[0] = v; p[1] = v; p[2] = v; p[3] = 255
-                }
-            }
-            // A bright left eye band and a dark right eye band at the top.
-            for y in 0 ..< 16 {
-                for x in 0 ..< width {
-                    let p = base + y * stride + x * 4
-                    let v: UInt8 = x < eye.width ? 235 : 16
-                    p[0] = v; p[1] = v; p[2] = v
-                }
-            }
-            CVPixelBufferUnlockBaseAddress(picture, [])
-            return picture
-        }
-        // As long as the video, in tenth-of-a-second chunks of a 440 Hz tone.
-        let audioSamples = audio ? frames * audioRate / 24 : 0
-        var frame = 0, written = 0
-        while frame < frames || written < audioSamples {
-            var moved = false
-            if frame < frames, input.isReadyForMoreMediaData {
-                #expect(adaptor.append(try picture(frame), withPresentationTime: CMTime(value: CMTimeValue(frame), timescale: 24)))
-                frame += 1
-                if frame == frames { input.markAsFinished() }
-                moved = true
-            }
-            if written < audioSamples, let audioInput, audioInput.isReadyForMoreMediaData {
-                let count = min(audioRate / 10, audioSamples - written)
-                #expect(audioInput.append(try Self.tone(at: written, count: count)))
-                written += count
-                if written == audioSamples { audioInput.markAsFinished() }
-                moved = true
-            }
-            if !moved { try await Task.sleep(for: .milliseconds(2)) }
-        }
-        await writer.finishWriting()
-        #expect(writer.status == .completed, "\(String(describing: writer.error))")
-    }
-
-    static let audioRate = 48_000
-
-    /// `count` frames of a stereo 16-bit 440 Hz tone starting at frame `start`.
-    static func tone(at start: Int, count: Int) throws -> CMSampleBuffer {
-        var description = AudioStreamBasicDescription(
-            mSampleRate: Double(audioRate), mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked, mBytesPerPacket: 4, mFramesPerPacket: 1,
-            mBytesPerFrame: 4, mChannelsPerFrame: 2, mBitsPerChannel: 16, mReserved: 0)
-        var format: CMAudioFormatDescription?
-        CMAudioFormatDescriptionCreate(allocator: nil, asbd: &description, layoutSize: 0, layout: nil, magicCookieSize: 0,
-                                       magicCookie: nil, extensions: nil, formatDescriptionOut: &format)
-        var samples = [Int16](repeating: 0, count: count * 2)
-        for i in 0 ..< count {
-            let v = Int16(8000 * sin(2 * Double.pi * 440 * Double(start + i) / Double(audioRate)))
-            samples[2 * i] = v; samples[2 * i + 1] = v
-        }
-        var block: CMBlockBuffer?
-        CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil, blockLength: count * 4, blockAllocator: nil,
-                                           customBlockSource: nil, offsetToData: 0, dataLength: count * 4, flags: 0,
-                                           blockBufferOut: &block)
-        let data = try #require(block)
-        samples.withUnsafeBytes { _ = CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: data, offsetIntoDestination: 0, dataLength: $0.count) }
-        var sample: CMSampleBuffer?
-        CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: nil, dataBuffer: data, formatDescription: try #require(format),
-                                                             sampleCount: count,
-                                                             presentationTimeStamp: CMTime(value: CMTimeValue(start), timescale: CMTimeScale(audioRate)),
-                                                             packetDescriptions: nil, sampleBufferOut: &sample)
-        return try #require(sample)
+        try await Clip.writeSideBySide(to: url, frames: frames, audio: audio, hdr: hdr)
     }
 
     @Test func makesCompleteSpatialVideoFromAnUntaggedSideBySideClip() async throws {

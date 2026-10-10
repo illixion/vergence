@@ -50,10 +50,17 @@ let package = Package(
         .target(name: "VergenceCore"),
         .target(name: "VergenceDisc", dependencies: ["CEdge264"]),
         .target(name: "VergenceApple", dependencies: ["VergenceCore", "VergenceDisc"]),
-        .executableTarget(name: "VergenceCLI", dependencies: ["VergenceDisc", "VergenceApple"]),
+        // The command line's option parsing and output names, apart from the
+        // executable so its tests can import them. Foundation only.
+        .target(name: "VergenceCommandLine", dependencies: ["VergenceCore", "VergenceDisc"]),
+        .executableTarget(name: "VergenceCLI", dependencies: ["VergenceDisc", "VergenceApple", "VergenceCommandLine"]),
         .testTarget(name: "VergenceCoreTests", dependencies: ["VergenceCore"]),
         .testTarget(name: "VergenceDiscTests", dependencies: ["VergenceDisc"] + testCrypto, resources: [.copy("Fixtures")]),
-        .testTarget(name: "VergenceAppleTests", dependencies: ["VergenceApple"], resources: [.copy("Fixtures")]),
+        // Synthetic clips shared by the Apple and command line tests (macOS only).
+        .target(name: "VergenceTestSupport", dependencies: ["VergenceApple"], path: "Tests/VergenceTestSupport"),
+        .testTarget(name: "VergenceAppleTests", dependencies: ["VergenceApple", "VergenceTestSupport"], resources: [.copy("Fixtures")]),
+        // Depends on the executable so `swift test` builds the binary it runs.
+        .testTarget(name: "VergenceCLITests", dependencies: ["VergenceCommandLine", "VergenceCLI", "VergenceTestSupport"]),
     ],
     cLanguageStandard: .gnu11
 )

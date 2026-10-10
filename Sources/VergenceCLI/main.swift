@@ -102,49 +102,12 @@
 
 import Foundation
 import VergenceApple
+import VergenceCommandLine
 import VergenceDisc
 #if canImport(ImageIO)
 import CoreGraphics
 import ImageIO
 #endif
-
-struct Options {
-    var command = ""
-    var positional: [String] = []
-    var playlist: String?
-    var packing = StereoPacking.topAndBottom
-    var seek: Double?
-    var start = 0
-    var frames = Int.max
-    var threads = 0
-    var output = "-"
-    var pid: UInt16?
-    var headers: [String: String] = [:]
-    // make
-    var layout: String = "auto"
-    var swapEyes = false
-    var preset = SpatialPreset.generic
-    var baseline: Double?
-    var hfov: Double?
-    var adjust: Double?
-    var quality = SpatialQuality.standard
-    var bitrate: Int?
-    var bitrateText: String?
-    var track: Int?
-    // sbs
-    var half = false
-    var maxEye: Int?
-    var ambisonics = true
-    var includeAudio = true
-    var dryRun = false
-    var force = false
-    // sbs as stream segments
-    var segments: String?
-    var segmentSeconds = 4.0
-    var firstSegment = 0
-    var lastSegment: Int?
-    var info = false
-}
 
 func usage(_ problem: String? = nil) -> Never {
     if let problem { FileHandle.standardError.write(Data("vergence: \(problem)\n".utf8)) }
@@ -170,95 +133,6 @@ func usage(_ problem: String? = nil) -> Never {
 
     """.utf8))
     exit(64)
-}
-
-func parse(_ args: [String]) -> Options {
-    var o = Options()
-    guard let command = args.first else { usage() }
-    o.command = command
-    var i = 1
-    while i < args.count {
-        let arg = args[i]
-        i += 1
-        guard arg.hasPrefix("-"), arg != "-", Double(arg) == nil else {
-            o.positional.append(arg)
-            continue
-        }
-        // --name=value, or --name followed by its value (which may itself
-        // start with "-", like a negative number).
-        var name = arg, inline: String?
-        if let equals = arg.firstIndex(of: "="), arg.hasPrefix("--") {
-            name = String(arg[..<equals])
-            inline = String(arg[arg.index(after: equals)...])
-        }
-        func value() -> String {
-            if let inline { return inline }
-            guard i < args.count else { usage("\(name) needs a value") }
-            defer { i += 1 }
-            return args[i]
-        }
-        func number(_ text: String) -> Double {
-            guard let v = Double(text), v.isFinite else { usage("\(name) takes a number, not \"\(text)\"") }
-            return v
-        }
-        func flag() {
-            if inline != nil { usage("\(name) takes no value") }
-        }
-        switch name {
-        case "--playlist": o.playlist = value()
-        case "--packing": let v = value(); o.packing = StereoPacking(rawValue: v) ?? { usage("unknown --packing \(v)") }()
-        case "--seek": o.seek = number(value())
-        case "--start": o.start = Int(number(value()))
-        case "--frames": o.frames = Int(number(value()))
-        case "--threads": o.threads = Int(number(value()))
-        case "--output", "-o": o.output = value()
-        case "--pid": let v = value(); o.pid = UInt16(v.replacingOccurrences(of: "0x", with: ""), radix: 16) ?? { usage("bad --pid \(v)") }()
-        case "--header", "-H": addHeader(value(), to: &o)
-        case "--layout", "-f", "--format":
-            let v = value().lowercased()
-            guard ["auto", "sbs", "hsbs", "ou", "hou", "tab", "htab"].contains(v) else { usage("unknown --layout \(v)") }
-            o.layout = v
-        case "--swap-eyes", "--reverse", "-r": flag(); o.swapEyes = true
-        case "--preset": let v = value().lowercased(); o.preset = SpatialPreset(rawValue: v) ?? { usage("unknown --preset \(v) (\(SpatialPreset.allCases.map(\.rawValue).joined(separator: ", ")))") }()
-        case "--baseline", "--cdist": o.baseline = number(value())
-        case "--hfov", "--fov": o.hfov = number(value())
-        case "--adjust", "--hadjust", "--disparity": o.adjust = number(value())
-        case "--quality", "-q": let v = value().lowercased(); o.quality = SpatialQuality(rawValue: v) ?? { usage("unknown --quality \(v)") }()
-        case "--bitrate", "-b":
-            let v = value()
-            o.bitrateText = v
-            o.bitrate = parseBitrate(v) ?? { usage("bad --bitrate (try 20, 20M or 750K)") }()
-        case "--track": o.track = Int(number(value()))
-        case "--half": flag(); o.half = true
-        case "--max-eye": o.maxEye = Int(number(value()))
-        case "--no-ambisonics": flag(); o.ambisonics = false
-        case "--no-audio": flag(); o.includeAudio = false
-        case "--dry-run", "-n": flag(); o.dryRun = true
-        case "--force", "-y": flag(); o.force = true
-        case "--segments": o.segments = value()
-        case "--segment-seconds": o.segmentSeconds = number(value())
-        case "--first": o.firstSegment = Int(number(value()))
-        case "--last": o.lastSegment = Int(number(value()))
-        case "--info": flag(); o.info = true
-        default: usage("unknown option \(name)")
-        }
-    }
-    if let header = ProcessInfo.processInfo.environment["VERGENCE_HTTP_HEADER"] { addHeader(header, to: &o) }
-    return o
-}
-
-/// "20" and "20M" are megabits per second, "750K" kilobits, "20000000" bits.
-func parseBitrate(_ text: String) -> Int? {
-    let t = text.uppercased()
-    let (digits, scale): (Substring, Double) = t.hasSuffix("M") ? (t.dropLast(), 1e6) : t.hasSuffix("K") ? (t.dropLast(), 1e3) : (Substring(t), 0)
-    guard let v = Double(digits), v > 0 else { return nil }
-    return Int(v * (scale > 0 ? scale : v < 10_000 ? 1e6 : 1))
-}
-
-func addHeader(_ line: String, to o: inout Options) {
-    guard let colon = line.firstIndex(of: ":") else { usage() }
-    o.headers[String(line[..<colon]).trimmingCharacters(in: .whitespaces)] =
-        String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
 }
 
 func log(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
@@ -545,7 +419,12 @@ func cat(_ o: Options) throws {
     }
 }
 
-let options = parse(Array(CommandLine.arguments.dropFirst()))
+let options: Options
+do {
+    options = try parse(Array(CommandLine.arguments.dropFirst()), environment: ProcessInfo.processInfo.environment)
+} catch {
+    usage(error.problem)
+}
 do {
     switch options.command {
     case "info": try info(options)
@@ -558,7 +437,7 @@ do {
     case "make": try await make(options)
     case "inspect": try await inspect(options)
     case "sbs", "quest": try await sideBySide(options)
-    default: usage()
+    default: usage("unknown command \(options.command)")
     }
 } catch let error as LocalizedError where error.errorDescription != nil {
     log("vergence: \(error.errorDescription!)")

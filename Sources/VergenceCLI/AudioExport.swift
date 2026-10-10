@@ -11,6 +11,7 @@
 
 import Foundation
 import VergenceApple
+import VergenceCommandLine
 import VergenceDisc
 
 func exportAudio(_ o: Options) async throws {

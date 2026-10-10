@@ -4,6 +4,7 @@
 
 import Foundation
 import VergenceApple
+import VergenceCommandLine
 import VergenceDisc
 
 /// The files `make` would convert: each argument, or every video in a
@@ -37,17 +38,6 @@ func videoInputs(_ paths: [String], forSideBySide: Bool = false) -> [URL] {
     return found.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
 }
 
-/// Where `input`'s spatial video goes.
-func outputURL(for input: URL, _ o: Options, single: Bool) -> URL {
-    let name = input.deletingPathExtension().lastPathComponent + ".spatial.mov"
-    guard o.output != "-" else { return input.deletingLastPathComponent().appendingPathComponent(name) }
-    let target = URL(fileURLWithPath: o.output)
-    var isDirectory: ObjCBool = false
-    let exists = FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
-    if single, !(exists && isDirectory.boolValue), !o.output.hasSuffix("/") { return target }
-    return target.appendingPathComponent(name)
-}
-
 func make(_ o: Options) async throws {
     #if !canImport(AVFoundation) || os(tvOS)
     throw FormatError("making spatial video needs Apple's encoder (macOS)")
@@ -59,7 +49,7 @@ func make(_ o: Options) async throws {
     }
     var made = 0, skipped = 0, failed = 0
     for input in inputs {
-        let output = outputURL(for: input, o, single: inputs.count == 1)
+        let output = OutputNames.spatialVideo(for: input, o, single: inputs.count == 1)
         do {
             switch try await makeOne(input, output, o) {
             case true: made += 1
@@ -318,7 +308,6 @@ func sideBySide(_ o: Options) async throws {
     guard !inputs.isEmpty else { usage("sbs needs a spatial video (.mov) or a folder of them") }
     if o.info || o.segments != nil {
         guard inputs.count == 1 else { usage("--info and --segments take one video") }
-        guard o.segmentSeconds >= 0.5, o.segmentSeconds <= 60 else { usage("--segment-seconds must be 0.5...60") }
         try await sideBySideSegments(inputs[0], o)
         return
     }
@@ -327,14 +316,7 @@ func sideBySide(_ o: Options) async throws {
     }
     var made = 0, skipped = 0, failed = 0
     for input in inputs {
-        let name = input.deletingPathExtension().lastPathComponent + (o.half ? ".3D.HSBS.mp4" : ".3D.FSBS.mp4")
-        let output: URL = {
-            guard o.output != "-" else { return input.deletingLastPathComponent().appendingPathComponent(name) }
-            let target = URL(fileURLWithPath: o.output)
-            var isDirectory: ObjCBool = false
-            let exists = FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
-            return inputs.count == 1 && !(exists && isDirectory.boolValue) && !o.output.hasSuffix("/") ? target : target.appendingPathComponent(name)
-        }()
+        let output = OutputNames.sideBySide(for: input, o, single: inputs.count == 1)
         do {
             if FileManager.default.fileExists(atPath: output.path), !o.force {
                 log("vergence: \(input.lastPathComponent): \(output.lastPathComponent) is already made (--force to redo)")
@@ -383,7 +365,7 @@ func sideBySideSegments(_ input: URL, _ o: Options) async throws {
     let source = try await SpatialVideoSource.open(input)
     let job = SideBySideJob(source: source, output: input, halfWidth: o.half, maxEyeSide: o.maxEye,
                             quality: o.quality, bitsPerSecond: o.bitrate, includeAmbisonics: false)
-    let request = SideBySideSegments(job: job, directory: URL(fileURLWithPath: o.segments ?? "."),
+    let request = SideBySideSegments(job: job, directory: OutputNames.segmentDirectory(o),
                                      segmentSeconds: o.segmentSeconds, first: o.firstSegment, last: o.lastSegment,
                                      includeAudio: o.includeAudio)
     let grid = request.grid
@@ -406,7 +388,7 @@ func sideBySideSegments(_ input: URL, _ o: Options) async throws {
     guard source.isMultiviewStereo else { throw FormatError("\(input.lastPathComponent) is not spatial video (one view)") }
     let directory = request.directory
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    let playlist = directory.appendingPathComponent("index.m3u8")
+    let playlist = directory.appendingPathComponent(OutputNames.segmentPlaylist)
     if !FileManager.default.fileExists(atPath: playlist.path) {
         try grid.mediaPlaylist(initURI: SideBySideSegments.initName, uri: SideBySideSegments.segmentName)
             .write(to: playlist, atomically: true, encoding: .utf8)
