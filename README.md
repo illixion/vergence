@@ -1,9 +1,14 @@
 # Vergence
 
-Stereo 3D video tools in Swift. Today: decode 3D Blu-ray video (H.264 MVC, "Stereo High") into
-ordinary left/right pictures, on any platform Swift runs on, Apple's included. Planned: making
-Apple spatial and immersive video (MV-HEVC, Apple Projected Media Profile) from any stereo source
-without typing camera parameters by hand, and 2D-to-3D conversion from estimated depth.
+Stereo 3D video tools in Swift:
+- **Spatial video** for Apple Vision Pro from side-by-side and over-under files, with no flags:
+  `vergence make` works out the layout and writes the complete metadata Photos and Files need.
+- **3D Blu-ray**: decodes H.264 MVC ("Stereo High") into ordinary left/right pictures, on any
+  platform Swift runs on, Apple's included.
+- **2D to 3D** from estimated depth (the library; the command line comes later).
+
+Planned: immersive video (Apple Projected Media Profile: 180°/360°, fisheye), spatial audio, and
+spatial video straight from a disc.
 
 Vergence works with decrypted discs only: a disc folder or image you have already made readable.
 It contains no AACS or BD+ code.
@@ -12,10 +17,10 @@ It contains no AACS or BD+ code.
 
 | Module | What | Builds on |
 | --- | --- | --- |
-| `VergenceCore` | Stereo layouts (`PackedStereoLayout`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
+| `VergenceCore` | Stereo layouts (`PackedStereoLayout`) and telling them from a file name or picture (`StereoLayoutDetector`), spatial-video camera metadata and presets (`SpatialCameraMetadata`, `SpatialPreset`), bitrates (`SpatialBitrate`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
 | `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
-| `VergenceApple` | The Apple-framework half: realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox. Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
-| `vergence` | The command line tool. | macOS, Linux (no PNG or audio output there) |
+| `VergenceApple` | The Apple-framework half: spatial video making and inspection (`SpatialVideoMaker`, `SpatialVideoInspector`), realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox. Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
+| `vergence` | The command line tool. | macOS, Linux (disc commands only, without PNG or audio output) |
 
 No consumer platform ships an MVC decoder: Apple's VideoToolbox, Android's MediaCodec and FFmpeg
 all decode only the base view of a 3D Blu-ray and silently drop the second eye. Vergence reads both
@@ -68,7 +73,6 @@ On Apple platforms `StereoPixelBufferMaker` copies each frame into pooled, IOSur
 by side, for players that already crop eyes from frame-packed video. About 0.25 ms per 1080p
 stereo frame.
 
-Planned: encoder integration.
 
 ## Speed
 
@@ -80,6 +84,45 @@ Apple M-series Mac, both eyes of a 1080p Blu-ray:
 | all cores | ~426 | 17.8× |
 
 ## Command line
+
+### Spatial video
+
+```sh
+swift build -c release
+.build/release/vergence make "Film.3D.HSBS.mp4"     # writes Film.3D.HSBS.spatial.mov beside it
+.build/release/vergence make ~/Videos/3D --output ~/Videos/Spatial   # a whole folder
+.build/release/vergence inspect Film.3D.HSBS.spatial.mov
+```
+
+`make` needs no options. For each file it:
+- **finds the layout** from the file's stereo metadata, else from words in its name (`SBS`,
+  `HSBS`, `OU`, `TAB`, `Half-OU`, ...), else from the picture itself: the two halves of a
+  stereo frame show the same scene a few pixels apart, which ordinary video doesn't. Full or
+  half resolution per eye comes from the frame's shape (a 1920×1080 side-by-side frame can
+  only be two squeezed eyes). It says what it found and how sure it is, and skips files that
+  look 2D;
+- **writes complete metadata** from a preset (`--preset generic`, the default; `iphone`;
+  `film`): camera baseline, field of view, disparity adjustment, projection and eyes.
+  `--baseline MM`, `--hfov DEG` and `--adjust -1...1` change single values;
+- **stretches half-resolution eyes** back to their display size;
+- **picks the bitrate** from the eye size and frame rate (`--quality low|standard|high|max`,
+  about 10 Mbps for two 1080p24 eyes at `standard`), never far above the source's own;
+  `--bitrate 20` sets it;
+- **keeps 10-bit and HDR** (PQ, HLG) sources 10-bit with their colour tags, keeps the source's
+  timestamps, and copies the audio as it is (`--no-audio` leaves it out).
+
+A folder is converted file by file. A finished output is skipped, so running it again carries
+on where it stopped; `--force` redoes it. `--dry-run` only reports what it would do,
+`--swap-eyes` fixes a file with its eyes the wrong way round, and `--layout sbs|hsbs|ou|hou`
+overrides the detection. Option values can follow an `=` or the option itself, so negative
+numbers work either way (`--adjust -0.02`, `--adjust=-0.02`).
+
+`inspect` lists a file's video, colour and audio, and for spatial video its stereo metadata
+and anything a player would miss. For a frame-packed file it says which layout it looks like.
+Both need macOS (Apple's MV-HEVC encoder); the input has to be a file AVFoundation reads
+(`.mov`, `.mp4`, `.m4v`).
+
+### 3D Blu-ray
 
 ```sh
 swift build -c release

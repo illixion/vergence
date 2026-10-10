@@ -1,6 +1,10 @@
 /*
  Vergence - command line
 
+   vergence make VIDEO|FOLDER... [--output FILE|DIR] [--layout auto|sbs|hsbs|ou|hou] [--swap-eyes]
+                 [--preset generic|iphone|film] [--baseline MM] [--hfov DEG] [--adjust -1...1]
+                 [--quality low|standard|high|max] [--bitrate MBPS] [--no-audio] [--dry-run] [--force]
+   vergence inspect VIDEO|DISC
    vergence info DISC
    vergence decode DISC [--playlist NNNNN] [options]
    vergence decode BASE.m2ts [DEPENDENT.m2ts] [options]
@@ -47,6 +51,23 @@
  way a player on the device does, in windows of a few seconds, to a 5.1
  WAV (L R C LFE Ls Rs) starting exactly at --seek, --frames seconds long.
 
+ make turns frame-packed stereo video (side by side or over-under, full or
+ half resolution per eye) into MV-HEVC spatial video with complete metadata,
+ without being told anything: the layout comes from the file's metadata, its
+ name, or the picture itself, and the camera values from --preset (generic
+ unless given). --baseline, --hfov and --adjust override single values.
+ The bitrate follows the picture size and frame rate (--quality), 10-bit and
+ HDR sources stay 10-bit, audio is copied. Each VIDEO.ext becomes
+ VIDEO.spatial.mov beside it or in --output; a finished output is skipped
+ unless --force, so rerunning a folder resumes it. --dry-run only says what
+ it would do.
+
+ inspect says what a file is and, for spatial video, what a player would
+ miss; for a frame-packed file, which layout it looks like.
+
+ Options take their value as the next argument or after "=":
+ --adjust -0.02 and --adjust=-0.02 are the same.
+
  Progress and a summary go to stderr.
  */
 
@@ -70,11 +91,28 @@ struct Options {
     var output = "-"
     var pid: UInt16?
     var headers: [String: String] = [:]
+    // make
+    var layout: String = "auto"
+    var swapEyes = false
+    var preset = SpatialPreset.generic
+    var baseline: Double?
+    var hfov: Double?
+    var adjust: Double?
+    var quality = SpatialQuality.standard
+    var bitrate: Int?
+    var includeAudio = true
+    var dryRun = false
+    var force = false
 }
 
-func usage() -> Never {
+func usage(_ problem: String? = nil) -> Never {
+    if let problem { FileHandle.standardError.write(Data("vergence: \(problem)\n".utf8)) }
     FileHandle.standardError.write(Data("""
-    usage: vergence info DISC
+    usage: vergence make VIDEO|FOLDER... [--output FILE|DIR] [--layout auto|sbs|hsbs|ou|hou] [--swap-eyes]
+                         [--preset generic|iphone|film] [--baseline MM] [--hfov DEG] [--adjust -1...1]
+                         [--quality low|standard|high|max] [--bitrate MBPS] [--no-audio] [--dry-run] [--force]
+           vergence inspect VIDEO|DISC
+           vergence info DISC
            vergence decode DISC [--playlist NNNNN] [options]
            vergence decode BASE.m2ts [DEPENDENT.m2ts] [options]
            vergence stream DISC [--playlist NNNNN] [--seek SECONDS]
@@ -84,6 +122,7 @@ func usage() -> Never {
            vergence cat DISC PATH [--start BYTE] [--frames BYTES]
     options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
              --header "Name: value" (for an http(s) DISC)
+             a value follows its option or an "=": --adjust -0.02, --adjust=-0.02
 
     """.utf8))
     exit(64)
@@ -94,29 +133,70 @@ func parse(_ args: [String]) -> Options {
     guard let command = args.first else { usage() }
     o.command = command
     var i = 1
-    func value() -> String {
-        i += 1
-        guard i < args.count else { usage() }
-        return args[i]
-    }
     while i < args.count {
-        switch args[i] {
-        case "--playlist": o.playlist = value()
-        case "--packing": o.packing = StereoPacking(rawValue: value()) ?? { usage() }()
-        case "--seek": o.seek = Double(value()) ?? { usage() }()
-        case "--start": o.start = Int(value()) ?? 0
-        case "--frames": o.frames = Int(value()) ?? Int.max
-        case "--threads": o.threads = Int(value()) ?? 0
-        case "--output", "-o": o.output = value()
-        case "--pid": o.pid = UInt16(value().replacingOccurrences(of: "0x", with: ""), radix: 16) ?? { usage() }()
-        case "--header", "-H": addHeader(value(), to: &o)
-        case let a where a.hasPrefix("-") && a != "-": usage()
-        default: o.positional.append(args[i])
-        }
+        let arg = args[i]
         i += 1
+        guard arg.hasPrefix("-"), arg != "-", Double(arg) == nil else {
+            o.positional.append(arg)
+            continue
+        }
+        // --name=value, or --name followed by its value (which may itself
+        // start with "-", like a negative number).
+        var name = arg, inline: String?
+        if let equals = arg.firstIndex(of: "="), arg.hasPrefix("--") {
+            name = String(arg[..<equals])
+            inline = String(arg[arg.index(after: equals)...])
+        }
+        func value() -> String {
+            if let inline { return inline }
+            guard i < args.count else { usage("\(name) needs a value") }
+            defer { i += 1 }
+            return args[i]
+        }
+        func number(_ text: String) -> Double {
+            guard let v = Double(text), v.isFinite else { usage("\(name) takes a number, not \"\(text)\"") }
+            return v
+        }
+        func flag() {
+            if inline != nil { usage("\(name) takes no value") }
+        }
+        switch name {
+        case "--playlist": o.playlist = value()
+        case "--packing": let v = value(); o.packing = StereoPacking(rawValue: v) ?? { usage("unknown --packing \(v)") }()
+        case "--seek": o.seek = number(value())
+        case "--start": o.start = Int(number(value()))
+        case "--frames": o.frames = Int(number(value()))
+        case "--threads": o.threads = Int(number(value()))
+        case "--output", "-o": o.output = value()
+        case "--pid": let v = value(); o.pid = UInt16(v.replacingOccurrences(of: "0x", with: ""), radix: 16) ?? { usage("bad --pid \(v)") }()
+        case "--header", "-H": addHeader(value(), to: &o)
+        case "--layout", "-f", "--format":
+            let v = value().lowercased()
+            guard ["auto", "sbs", "hsbs", "ou", "hou", "tab", "htab"].contains(v) else { usage("unknown --layout \(v)") }
+            o.layout = v
+        case "--swap-eyes", "--reverse", "-r": flag(); o.swapEyes = true
+        case "--preset": let v = value().lowercased(); o.preset = SpatialPreset(rawValue: v) ?? { usage("unknown --preset \(v) (\(SpatialPreset.allCases.map(\.rawValue).joined(separator: ", ")))") }()
+        case "--baseline", "--cdist": o.baseline = number(value())
+        case "--hfov", "--fov": o.hfov = number(value())
+        case "--adjust", "--hadjust", "--disparity": o.adjust = number(value())
+        case "--quality", "-q": let v = value().lowercased(); o.quality = SpatialQuality(rawValue: v) ?? { usage("unknown --quality \(v)") }()
+        case "--bitrate", "-b": o.bitrate = parseBitrate(value()) ?? { usage("bad --bitrate (try 20, 20M or 750K)") }()
+        case "--no-audio": flag(); o.includeAudio = false
+        case "--dry-run", "-n": flag(); o.dryRun = true
+        case "--force", "-y": flag(); o.force = true
+        default: usage("unknown option \(name)")
+        }
     }
     if let header = ProcessInfo.processInfo.environment["VERGENCE_HTTP_HEADER"] { addHeader(header, to: &o) }
     return o
+}
+
+/// "20" and "20M" are megabits per second, "750K" kilobits, "20000000" bits.
+func parseBitrate(_ text: String) -> Int? {
+    let t = text.uppercased()
+    let (digits, scale): (Substring, Double) = t.hasSuffix("M") ? (t.dropLast(), 1e6) : t.hasSuffix("K") ? (t.dropLast(), 1e3) : (Substring(t), 0)
+    guard let v = Double(digits), v > 0 else { return nil }
+    return Int(v * (scale > 0 ? scale : v < 10_000 ? 1e6 : 1))
 }
 
 func addHeader(_ line: String, to o: inout Options) {
@@ -416,6 +496,8 @@ do {
     case "subtitles": try subtitles(options)
     case "audio": try audio(options)
     case "cat": try cat(options)
+    case "make": try await make(options)
+    case "inspect": try await inspect(options)
     default: usage()
     }
 } catch {
