@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 // Layers (see README → Layout):
@@ -22,7 +22,7 @@ testCrypto.append(.product(name: "Crypto", package: "swift-crypto"))
 
 let package = Package(
     name: "Vergence",
-    platforms: [.macOS(.v14), .iOS(.v17), .visionOS(.v1), .tvOS(.v17)],
+    platforms: [.macOS(.v14), .iOS(.v26), .visionOS(.v26), .tvOS(.v26)],
     products: [
         .library(name: "VergenceCore", targets: ["VergenceCore"]),
         .library(name: "VergenceDisc", targets: ["VergenceDisc"]),
@@ -53,7 +53,7 @@ let package = Package(
         .executableTarget(name: "VergenceCLI", dependencies: ["VergenceDisc", "VergenceApple"]),
         .testTarget(name: "VergenceCoreTests", dependencies: ["VergenceCore"]),
         .testTarget(name: "VergenceDiscTests", dependencies: ["VergenceDisc"] + testCrypto, resources: [.copy("Fixtures")]),
-        .testTarget(name: "VergenceAppleTests", dependencies: ["VergenceApple"]),
+        .testTarget(name: "VergenceAppleTests", dependencies: ["VergenceApple"], resources: [.copy("Fixtures")]),
     ],
     cLanguageStandard: .gnu11
 )

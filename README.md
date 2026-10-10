@@ -14,7 +14,7 @@ It contains no AACS or BD+ code.
 | --- | --- | --- |
 | `VergenceCore` | Stereo layouts (`PackedStereoLayout`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
 | `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
-| `VergenceApple` | The Apple-framework half: `CVPixelBuffer` output, AC-3 decoding through AudioToolbox. Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms |
+| `VergenceApple` | The Apple-framework half: realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox. Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
 | `vergence` | The command line tool. | macOS, Linux (no PNG or audio output there) |
 
 No consumer platform ships an MVC decoder: Apple's VideoToolbox, Android's MediaCodec and FFmpeg
@@ -31,6 +31,13 @@ dependent (`0x1012`) views, decoding both with edge264, frame packing, a command
 Blu-ray (1080p23.976, CABAC): the whole 1:53:53 feature, 163,820 stereo frames in display order
 with every timestamp one frame after the last and no errors, read from the disc image over SMB at
 175 fps; the base view matches ffmpeg's decode frame for frame.
+
+## Logging
+
+Everything logs through `VergenceLog`, written like `os.Logger` with privacy labels
+(`"\(path)"` is private, `"\(count, privacy: .public)"` public). With nothing attached,
+lines go to the unified log; a host can set `VergenceLog.sink` to receive each message with
+its values and their privacy kept apart, to apply its own redaction.
 
 ## Tests
 
