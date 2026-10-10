@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Cross-compiles Vergence's portable layer for Android arm64 (Quest, phones).
 #
-#   SWIFT_ANDROID_BIN=/path/to/swift-6.3.3/usr/bin/swift \
-#   SWIFT_ANDROID_BUNDLE=/path/to/swift-6.3.3-RELEASE_android.artifactbundle \
 #   scripts/build-android.sh [debug|release]
+#
+# SWIFT_ANDROID_BIN and SWIFT_ANDROID_BUNDLE default to where the swift.org
+# .pkg (installed for this user) and `swift sdk install` put them:
+#   ~/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain/usr/bin/swift
+#   ~/Library/org.swift.swiftpm/swift-sdks/swift-6.3.3-RELEASE_android.artifactbundle
 #
 # SWIFT_ANDROID_BIN is the open-source toolchain matching the Android SDK
 # bundle (Xcode's swift can't use it); the bundle needs its NDK sysroot set
@@ -12,8 +15,8 @@
 # so this describes exactly one in a bundle of its own under .build and
 # leaves the installed one untouched.
 set -euo pipefail
-: "${SWIFT_ANDROID_BIN:?Set SWIFT_ANDROID_BIN to the open-source swift matching the Android SDK}"
-: "${SWIFT_ANDROID_BUNDLE:?Set SWIFT_ANDROID_BUNDLE to the Android artifactbundle directory}"
+: "${SWIFT_ANDROID_BIN:=$HOME/Library/Developer/Toolchains/swift-6.3.3-RELEASE.xctoolchain/usr/bin/swift}"
+: "${SWIFT_ANDROID_BUNDLE:=$HOME/Library/org.swift.swiftpm/swift-sdks/swift-6.3.3-RELEASE_android.artifactbundle}"
 configuration="${1:-debug}"
 package="$(cd "$(dirname "$0")/.." && pwd)"
 triple=aarch64-unknown-linux-android29
