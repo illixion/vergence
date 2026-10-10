@@ -190,6 +190,8 @@ final class RealtimeDepthRefiner {
     private var tracker = DepthScaleShiftTracker()
     private var background = DepthAnchorCeiling.none
     private var cuts = DepthCutDetector()
+    /// Per-shot depth composition, measurement only (`StereoDepthMetrics`).
+    private var shots = DepthShotTracker()
 
     /// Last frame's numbers, for diagnostics and tests.
     private(set) var lastMapping = DepthAffine.identity
@@ -325,6 +327,8 @@ final class RealtimeDepthRefiner {
         background = DepthAnchorCeiling(mapping: mapping)
         lastAnchored = relative != nil
         lastCut = cut
+        recordComposition(counts: counts, lo: stats.min, hi: stats.max, mapping: mapping,
+                          seconds: frameSeconds, cut: cut || !usePrev)
 
         // 3. Shot-space depth + temporal EMA (restarted at a cut).
         guard let applyCmd = commandQueue.makeCommandBuffer(),
@@ -381,6 +385,18 @@ final class RealtimeDepthRefiner {
         hasPrev = true
         current = prev
         return hiOutputs[cur]
+    }
+
+    /// How this frame's depth is spread once shown, and the strength its shot
+    /// would get (`StereoStrengthPolicy`, not applied yet). The histogram is of
+    /// the refined map before the temporal EMA, close enough for a shot average.
+    private func recordComposition(counts: [UInt32], lo: Float, hi: Float, mapping: DepthAffine, seconds: Double, cut: Bool) {
+        guard let composition = DepthComposition.measure(bins: counts, lo: lo, hi: hi, mapping: mapping, budget: .studio) else { return }
+        let finished = shots.add(composition, seconds: seconds, cut: cut)
+        StereoDepthMetrics.record(composition, current: shots.current, finished: finished)
+        guard let shot = finished, shot.end - shot.start >= 1 else { return }
+        let c = shot.composition
+        VergenceLog.pipeline.info("Depth shot \(shot.start, format: .fixed(precision: 1), privacy: .public)–\(shot.end, format: .fixed(precision: 1), privacy: .public) s: mean \(c.mean, format: .fixed(precision: 2), privacy: .public), p05/p50/p95 \(c.p05, format: .fixed(precision: 2), privacy: .public)/\(c.p50, format: .fixed(precision: 2), privacy: .public)/\(c.p95, format: .fixed(precision: 2), privacy: .public), far \(c.farShare, format: .fixed(precision: 2), privacy: .public), proposed strength \(shot.proposedScale, format: .fixed(precision: 2), privacy: .public)x")
     }
 
     private func ensureTextures(width: Int, height: Int) -> Bool {
