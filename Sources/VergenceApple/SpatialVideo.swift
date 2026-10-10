@@ -106,12 +106,7 @@ public struct SpatialVideoSource: Sendable {
             }
         }
 
-        var audio: [String] = []
-        for audioTrack in try await asset.loadTracks(withMediaType: .audio) {
-            guard let format = try await audioTrack.load(.formatDescriptions).first,
-                  let basic = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee else { continue }
-            audio.append("\(fourCharacterCode(basic.mFormatID)) \(basic.mChannelsPerFrame) ch \(Int(basic.mSampleRate)) Hz")
-        }
+        let audio = try await AudioTrackReader.tracks(url).map(\.summary)
 
         return SpatialVideoSource(
             url: url, frameSize: pixels, frameRate: Double(rate), duration: duration,
@@ -179,9 +174,12 @@ public struct SpatialVideoJob: Sendable {
     /// Overrides the computed rate.
     public var bitsPerSecond: Int?
     public var includeAudio: Bool
+    /// Encode 10-bit. Nil follows the source; a caller that remuxed an 8-bit
+    /// file through a 10-bit intermediate (ProRes) says false.
+    public var tenBit: Bool?
 
     public init(source: SpatialVideoSource, output: URL, layout: PackedStereoLayout, camera: SpatialCameraMetadata,
-                quality: SpatialQuality = .standard, bitsPerSecond: Int? = nil, includeAudio: Bool = true) {
+                quality: SpatialQuality = .standard, bitsPerSecond: Int? = nil, includeAudio: Bool = true, tenBit: Bool? = nil) {
         self.source = source
         self.output = output
         self.layout = layout
@@ -189,7 +187,10 @@ public struct SpatialVideoJob: Sendable {
         self.quality = quality
         self.bitsPerSecond = bitsPerSecond
         self.includeAudio = includeAudio
+        self.tenBit = tenBit
     }
+
+    public var encodesTenBit: Bool { tenBit ?? source.needsTenBit }
 
     /// One eye's output size, even in both directions.
     public var eyeSize: (width: Int, height: Int) {
@@ -230,7 +231,7 @@ public enum SpatialVideoMaker {
         let partial = job.output.deletingPathExtension().appendingPathExtension("partial.mov")
         try? FileManager.default.removeItem(at: partial)
 
-        let tenBit = job.source.needsTenBit
+        let tenBit = job.encodesTenBit
         let pixelFormat = tenBit ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         let (eyeWidth, eyeHeight) = job.eyeSize
         let bitsPerSecond = job.resolvedBitsPerSecond

@@ -5,6 +5,7 @@
                  [--preset generic|iphone|avp|film] [--baseline MM] [--hfov DEG] [--adjust -1...1]
                  [--quality low|standard|high|max] [--bitrate MBPS] [--no-audio] [--dry-run] [--force]
    vergence inspect VIDEO|DISC
+   vergence audio VIDEO [--track N] [--bitrate KBPS] --output FILE.opus|.ogg|.mka|.webm|.mp4|.wav
    vergence info DISC
    vergence decode DISC [--playlist NNNNN] [options]
    vergence decode BASE.m2ts [DEPENDENT.m2ts] [options]
@@ -62,6 +63,13 @@
  unless --force, so rerunning a folder resumes it. --dry-run only says what
  it would do.
 
+ audio VIDEO exports one audio track, by default the spatial one: a Vision
+ Pro's or iPhone's APAC track, which only Apple's frameworks decode, comes
+ out as first-order ambisonics (AmbiX: ACN order, SN3D), as Opus with
+ ambisonic channel mapping (what YouTube's VR players and most non-Apple
+ headsets take; needs ffmpeg) or as a float WAV. --bitrate in kbps
+ (ambisonics default to 64 per channel).
+
  inspect says what a file is and, for spatial video, what a player would
  miss; for a frame-packed file, which layout it looks like.
 
@@ -100,6 +108,8 @@ struct Options {
     var adjust: Double?
     var quality = SpatialQuality.standard
     var bitrate: Int?
+    var bitrateText: String?
+    var track: Int?
     var includeAudio = true
     var dryRun = false
     var force = false
@@ -119,6 +129,7 @@ func usage(_ problem: String? = nil) -> Never {
            vergence streams DISC [--playlist NNNNN]
            vergence subtitles DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames N] [--output DIR]
            vergence audio DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames SECONDS] --output FILE.wav
+           vergence audio VIDEO [--track N] [--bitrate KBPS] --output FILE.opus|.ogg|.mka|.webm|.mp4|.wav
            vergence cat DISC PATH [--start BYTE] [--frames BYTES]
     options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
              --header "Name: value" (for an http(s) DISC)
@@ -180,7 +191,11 @@ func parse(_ args: [String]) -> Options {
         case "--hfov", "--fov": o.hfov = number(value())
         case "--adjust", "--hadjust", "--disparity": o.adjust = number(value())
         case "--quality", "-q": let v = value().lowercased(); o.quality = SpatialQuality(rawValue: v) ?? { usage("unknown --quality \(v)") }()
-        case "--bitrate", "-b": o.bitrate = parseBitrate(value()) ?? { usage("bad --bitrate (try 20, 20M or 750K)") }()
+        case "--bitrate", "-b":
+            let v = value()
+            o.bitrateText = v
+            o.bitrate = parseBitrate(v) ?? { usage("bad --bitrate (try 20, 20M or 750K)") }()
+        case "--track": o.track = Int(number(value()))
         case "--no-audio": flag(); o.includeAudio = false
         case "--dry-run", "-n": flag(); o.dryRun = true
         case "--force", "-y": flag(); o.force = true
@@ -434,7 +449,10 @@ func writePNG(_ pixels: [UInt32], width: Int, height: Int, to url: URL) throws {
 }
 
 /// vergence audio DISC --pid PID: decoded 5.1 PCM to a WAV file.
-func audio(_ o: Options) throws {
+func audio(_ o: Options) async throws {
+    if o.positional.count == 1, (try? openDisc(o.positional[0])) == nil {
+        return try await exportAudio(o)
+    }
     #if !canImport(AVFoundation)
     throw FormatError("decoding AC-3 needs Apple's decoder (Apple platforms only)")
     #else
@@ -494,7 +512,7 @@ do {
     case "stream": try stream(options)
     case "streams": try streams(options)
     case "subtitles": try subtitles(options)
-    case "audio": try audio(options)
+    case "audio": try await audio(options)
     case "cat": try cat(options)
     case "make": try await make(options)
     case "inspect": try await inspect(options)

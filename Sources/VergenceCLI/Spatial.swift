@@ -9,10 +9,10 @@ import VergenceDisc
 /// The files `make` would convert: each argument, or every video in a
 /// folder argument (recursively), leaving out its own outputs.
 func videoInputs(_ paths: [String]) -> [URL] {
-    let extensions: Set<String> = ["mov", "mp4", "m4v"]
+    let extensions: Set<String> = ["mov", "mp4", "m4v", "mkv", "webm", "avi", "ts", "m2ts", "mts", "mpg", "mpeg", "wmv"]
     func isInput(_ url: URL) -> Bool {
         let name = url.lastPathComponent.lowercased()
-        return extensions.contains(url.pathExtension.lowercased())
+        return !name.hasPrefix(".") && extensions.contains(url.pathExtension.lowercased())
             && !name.hasSuffix(".spatial.mov") && !name.hasSuffix(".partial.mov")
     }
     var found: [URL] = []
@@ -82,10 +82,35 @@ func makeOne(_ input: URL, _ output: URL, _ o: Options) async throws -> Bool {
         log("vergence: \(name): \(output.lastPathComponent) is already made (--force to redo)")
         return false
     }
-    let source = try await SpatialVideoSource.open(input)
-    if source.isMultiviewStereo {
-        log("vergence: \(name): already MV-HEVC stereo (vergence inspect shows its metadata)")
-        return false
+    // AVFoundation reads QuickTime and MP4; everything else goes through
+    // ffmpeg, but only once the file is known to be stereo.
+    let native = FFmpeg.isNative(input)
+    var nativeSource: SpatialVideoSource?
+    var ffmpeg: FFmpeg?
+    var probe: FFmpeg.Probe?
+    let frameSize: CGSize
+    let declared: PackedStereoLayout?
+    if native {
+        let source = try await SpatialVideoSource.open(input)
+        if source.isMultiviewStereo {
+            log("vergence: \(name): already MV-HEVC stereo (vergence inspect shows its metadata)")
+            return false
+        }
+        nativeSource = source
+        frameSize = source.frameSize
+        declared = source.declaredLayout
+    } else {
+        let tool = try FFmpeg.required(for: "reading .\(input.pathExtension)")
+        let probed = try tool.probe(input)
+        guard let video = probed.video, let w = video.width, let h = video.height else { throw FormatError("no video stream") }
+        ffmpeg = tool
+        probe = probed
+        frameSize = CGSize(width: w, height: h)
+        declared = video.declaredLayout.map {
+            var corrected = $0.correctingResolution(forPacked: frameSize)
+            corrected.eyesReversed = $0.eyesReversed
+            return corrected
+        }
     }
 
     var layout: PackedStereoLayout
@@ -93,15 +118,15 @@ func makeOne(_ input: URL, _ output: URL, _ o: Options) async throws -> Bool {
     if o.layout != "auto" {
         let arrangement: PackedStereoLayout.Arrangement = o.layout.contains("sbs") ? .sideBySide : .overUnder
         layout = PackedStereoLayout(arrangement: arrangement, isHalfResolution: o.layout.hasPrefix("h"))
-        let shaped = layout.correctingResolution(forPacked: source.frameSize)
+        let shaped = layout.correctingResolution(forPacked: frameSize)
         if shaped.isHalfResolution != layout.isHalfResolution {
-            notes.append("--layout \(o.layout) gives each eye an odd shape for a \(Int(source.frameSize.width))×\(Int(source.frameSize.height)) frame; did you mean \(shaped.isHalfResolution ? "h" + o.layout : String(o.layout.dropFirst()))?")
+            notes.append("--layout \(o.layout) gives each eye an odd shape for a \(Int(frameSize.width))×\(Int(frameSize.height)) frame; did you mean \(shaped.isHalfResolution ? "h" + o.layout : String(o.layout.dropFirst()))?")
         }
         notes.append("layout \(o.layout) as given")
     } else {
-        let pictures = try await source.samplePictures()
-        let detection = StereoLayoutDetector.detect(declared: source.declaredLayout, fileName: name,
-                                                    frameSize: source.frameSize, pictures: pictures)
+        let pictures: [LumaPlane]
+        if let nativeSource { pictures = try await nativeSource.samplePictures() } else { pictures = try ffmpeg!.pictures(input, probe: probe!) }
+        let detection = StereoLayoutDetector.detect(declared: declared, fileName: name, frameSize: frameSize, pictures: pictures)
         guard let found = detection.layout, let format = detection.format else {
             log("vergence: \(name): looks like 2D video (\(detection.reasons.joined(separator: "; "))); --layout converts it anyway")
             return false
@@ -111,21 +136,49 @@ func makeOne(_ input: URL, _ output: URL, _ o: Options) async throws -> Bool {
                             detection.confidence * 100, detection.reasons.joined(separator: "; ")))
         if detection.confidence < 0.6 { notes.append("unsure: check the result, or pass --layout") }
     }
-    layout.eyesReversed = o.swapEyes
+    // A container's "eyes inverted" and --swap-eyes cancel out.
+    layout.eyesReversed = layout.eyesReversed != o.swapEyes
 
     var camera = o.preset.metadata
     if let v = o.baseline { camera.baselineMillimeters = v }
     if let v = o.hfov { camera.horizontalFieldOfViewDegrees = v }
     if let v = o.adjust { camera.horizontalDisparityAdjustment = v }
     guard camera.problems.isEmpty else { throw SpatialVideoError.invalidMetadata(camera.problems) }
+
+    // Remux what AVFoundation can't read into a QuickTime file beside the
+    // output, gone again when this returns.
+    var remuxed: URL?
+    defer { if let remuxed { try? FileManager.default.removeItem(at: remuxed) } }
+    if let ffmpeg, let probe {
+        let temporary = output.deletingLastPathComponent()
+            .appendingPathComponent("." + input.deletingPathExtension().lastPathComponent + ".remux.mov")
+        let plan = try ffmpeg.remuxPlan(probe, to: temporary, input: input)
+        if o.dryRun {
+            log("vergence: \(name) -> \(output.path)")
+            for note in notes { log("  \(note)") }
+            log("  remux with ffmpeg first: \(plan.notes.joined(separator: ", "))")
+            return false
+        }
+        log("vergence: \(name): remuxing with ffmpeg (\(plan.notes.joined(separator: ", ")))")
+        remuxed = temporary
+        try ffmpeg.remux(plan)
+    }
+    let source: SpatialVideoSource
+    if let nativeSource { source = nativeSource } else { source = try await SpatialVideoSource.open(remuxed!) }
+    // A ProRes intermediate is 10-bit whatever the source was.
+    let sourceTenBit = probe?.video.map { video in
+        let format = video.pix_fmt ?? ""
+        return format.contains("10") || format.contains("12") || format.contains("16")
+            || ["smpte2084", "arib-std-b67"].contains(video.color_transfer ?? "")
+    }
     let job = SpatialVideoJob(source: source, output: output, layout: layout, camera: camera,
-                              quality: o.quality, bitsPerSecond: o.bitrate, includeAudio: o.includeAudio)
+                              quality: o.quality, bitsPerSecond: o.bitrate, includeAudio: o.includeAudio, tenBit: sourceTenBit)
 
     let eye = job.eyeSize
     log("vergence: \(name) -> \(output.path)")
     for note in notes { log("  \(note)") }
     log(String(format: "  eyes %d×%d%@%@, %.1f Mbps, %@", eye.width, eye.height, layout.eyesReversed ? " (swapped)" : "",
-               source.needsTenBit ? ", 10-bit" + (source.isHDR ? " HDR" : "") : "",
+               job.encodesTenBit ? ", 10-bit" + (source.isHDR ? " HDR" : "") : "",
                Double(job.resolvedBitsPerSecond) / 1_000_000,
                o.includeAudio ? (source.audioTracks.isEmpty ? "no audio" : "audio copied") : "audio left out"))
     log(String(format: "  camera (%@ preset%@): baseline %.2f mm, field of view %.1f°, disparity adjustment %.3f, %@",
@@ -156,10 +209,12 @@ func inspect(_ o: Options) async throws {
         try info(o)
         return
     }
-    #if !canImport(AVFoundation) || os(tvOS)
-    throw FormatError("inspecting video files needs AVFoundation (macOS)")
-    #else
     let url = URL(fileURLWithPath: path)
+    #if !canImport(AVFoundation) || os(tvOS)
+    // Without AVFoundation, ffmpeg reads everything.
+    return try inspectWithFFmpeg(url, shown: path)
+    #else
+    if !FFmpeg.isNative(url) { return try inspectWithFFmpeg(url, shown: path) }
     let report = try await SpatialVideoInspector.inspect(url)
     let width = report.fields.map(\.name.count).max() ?? 0
     for field in report.fields {
@@ -190,4 +245,44 @@ func inspect(_ o: Options) async throws {
 
 func shellQuoted(_ s: String) -> String {
     s.allSatisfy { $0.isLetter || $0.isNumber || "/._-+".contains($0) } ? s : "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+/// inspect for what AVFoundation can't open: ffprobe's view of it, and the
+/// layout it looks like.
+func inspectWithFFmpeg(_ url: URL, shown: String) throws {
+    let ffmpeg = try FFmpeg.required(for: "reading .\(url.pathExtension)")
+    let probe = try ffmpeg.probe(url)
+    guard let video = probe.video, let w = video.width, let h = video.height else { throw FormatError("no video stream") }
+    var fields: [(String, String)] = []
+    fields.append(("container", probe.format?.format_name ?? "?"))
+    fields.append(("video", "\(video.codec_name ?? "?") \(w)×\(h), " + String(format: "%.3f fps", video.frameRate) + ", \(video.pix_fmt ?? "?")"
+        + (Double(video.bit_rate ?? "").map { String(format: ", %.1f Mbps", $0 / 1_000_000) } ?? "")))
+    fields.append(("colour", "\(video.color_primaries ?? "untagged") / \(video.color_transfer ?? "untagged")"))
+    fields.append(("duration", String(format: "%.1f s", probe.duration)))
+    fields.append(("audio", probe.audio.isEmpty ? "none" : probe.audio.map {
+        "\($0.codec_name ?? "?") \($0.channel_layout ?? "\($0.channels ?? 0) ch")" + ($0.tags?.language.map { " \($0)" } ?? "")
+    }.joined(separator: "; ")))
+    let frameSize = CGSize(width: w, height: h)
+    let declared = video.declaredLayout.map {
+        var corrected = $0.correctingResolution(forPacked: frameSize)
+        corrected.eyesReversed = $0.eyesReversed
+        return corrected
+    }
+    if let declared {
+        fields.append(("stereo", "\(declared.arrangement == .sideBySide ? "side by side" : "over-under") (container metadata)"
+            + (declared.eyesReversed ? ", eyes swapped" : "")))
+    }
+    let width = fields.map(\.0.count).max() ?? 0
+    for (name, value) in fields { print(name.padding(toLength: width, withPad: " ", startingAt: 0) + "  " + value) }
+    print("")
+    let detection = StereoLayoutDetector.detect(declared: declared, fileName: url.lastPathComponent, frameSize: frameSize,
+                                                pictures: try ffmpeg.pictures(url, probe: probe))
+    if let format = detection.format {
+        print(String(format: "Frame-packed stereo, %@ (%.0f%% sure):", format.displayName, detection.confidence * 100))
+        for reason in detection.reasons { print("  - \(reason)") }
+        print("vergence make \(shellQuoted(shown)) turns it into spatial video (remuxing it with ffmpeg first).")
+    } else {
+        print("2D video:")
+        for reason in detection.reasons { print("  - \(reason)") }
+    }
 }

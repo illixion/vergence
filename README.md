@@ -119,8 +119,35 @@ numbers work either way (`--adjust -0.02`, `--adjust=-0.02`).
 
 `inspect` lists a file's video, colour and audio, and for spatial video its stereo metadata
 and anything a player would miss. For a frame-packed file it says which layout it looks like.
-Both need macOS (Apple's MV-HEVC encoder); the input has to be a file AVFoundation reads
-(`.mov`, `.mp4`, `.m4v`).
+Making needs macOS (Apple's MV-HEVC encoder). QuickTime and MP4 files are read directly; anything
+else (`.mkv`, `.webm`, `.avi`, `.ts`, `.m2ts`, ...) needs [ffmpeg](https://ffmpeg.org) on `PATH`
+(`brew install ffmpeg`, or `VERGENCE_FFMPEG=/path/to/ffmpeg`). Such a file is checked for 3D first,
+reading Matroska's StereoMode and a few frames, so 2D files are skipped without copying anything.
+A stereo one is remuxed into a temporary QuickTime file beside the output:
+- H.264 and HEVC video copied as it is, anything else (VP9, AV1, ...) to ProRes 422 HQ;
+- AAC, AC-3, E-AC-3, ALAC and MP3 audio copied, lossless audio (TrueHD, DTS-HD MA, FLAC, PCM)
+  to ALAC, other lossy audio (DTS, Opus, Vorbis) to AAC;
+- subtitles left out.
+
+`inspect` reads those through ffmpeg too, on Linux included.
+
+### Spatial audio
+
+```sh
+vergence audio IMG_0664.MOV -o room.opus     # Vision Pro or iPhone recording -> ambisonic Opus
+vergence audio IMG_0664.MOV -o room.wav      # or 32-bit float AmbiX WAV
+vergence audio IMG_0664.MOV --track 1 -o stereo.mka
+```
+
+A Vision Pro (and an iPhone recording spatial audio) stores two audio tracks: stereo AAC and
+APAC, Apple's spatial audio codec, which nothing outside Apple's frameworks decodes. The APAC
+track holds first-order ambisonics (four channels, ACN order, SN3D: AmbiX). `vergence audio`
+decodes it and writes Opus with ambisonic channel mapping (RFC 8486, the format YouTube's VR
+players use; needs ffmpeg) in `.opus`, `.ogg`, `.mka`, `.webm` or `.mp4`, or a float WAV. N3D
+ambisonics are converted to SN3D. `--bitrate` is in kbps, 64 per channel by default (256 for
+first order). Decoding a 7 s Vision Pro clip and re-encoding it to Opus kept every channel at 0.99
+correlation with the decoded APAC. MP4 output carries no `SA3D` box (ffmpeg doesn't write one);
+players that need it should get `.mka`, `.webm` or `.ogg`.
 
 ### 3D Blu-ray
 
