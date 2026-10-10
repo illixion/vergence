@@ -76,16 +76,24 @@ public struct PackedStereoLayout: Hashable, Sendable, Codable {
             let eye = layout.eyeSize(packed: packed)
             return eye.width / max(eye.height, 1)
         }
-        let halfFits = Self.plausibleEyeAspect.contains(aspect(half: true))
-        let fullFits = Self.plausibleEyeAspect.contains(aspect(half: false))
+        let halfFits = Self.isPlausibleEye(aspect(half: true))
+        let fullFits = Self.isPlausibleEye(aspect(half: false))
         guard halfFits != fullFits else { return self }
         var corrected = self
         corrected.isHalfResolution = halfFits
         return corrected
     }
 
-    /// Eye shapes real pictures have: 4:3 up to Ultra Panavision's 2.76:1.
+    /// Eye shapes real pictures have: 4:3 up to Ultra Panavision's 2.76:1,
+    /// and square (Apple Vision Pro records 2200×2200 eyes, 180° video is
+    /// square per eye). Not everything between: a half side-by-side scope
+    /// film read as full has 1.2:1 eyes, and that reading must lose.
     static let plausibleEyeAspect: ClosedRange<CGFloat> = 1.25...2.8
+    static let squareEyeAspect: ClosedRange<CGFloat> = 0.97...1.03
+
+    static func isPlausibleEye(_ aspect: CGFloat) -> Bool {
+        plausibleEyeAspect.contains(aspect) || squareEyeAspect.contains(aspect)
+    }
 
     /// The display size of one eye for a packed frame of `packed` pixels.
     public func eyeSize(packed: CGSize) -> CGSize {

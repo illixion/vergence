@@ -33,11 +33,13 @@ public enum SpatialBitrate {
 
     /// Bits per second for two eyes of `eyeWidth`×`eyeHeight` at `frameRate`.
     /// `sourceBitsPerSecond` (the packed source's video rate, when known)
-    /// caps it.
+    /// caps it. With `secondEye` false, the size is one ordinary picture
+    /// (both eyes packed into it) and nothing is added for a predicted view.
     public static func bitsPerSecond(eyeWidth: Int, eyeHeight: Int, frameRate: Double,
-                                     quality: SpatialQuality = .standard, sourceBitsPerSecond: Double? = nil) -> Int {
+                                     quality: SpatialQuality = .standard, sourceBitsPerSecond: Double? = nil,
+                                     secondEye: Bool = true) -> Int {
         let rate = frameRate > 0 ? frameRate : 30
-        var bits = Double(eyeWidth * eyeHeight) * rate * quality.bitsPerPixel * (1 + secondEyeShare)
+        var bits = Double(eyeWidth * eyeHeight) * rate * quality.bitsPerPixel * (secondEye ? 1 + secondEyeShare : 1)
         if let source = sourceBitsPerSecond, source > 0, quality != .max {
             bits = min(bits, source * sourceMargin)
         }

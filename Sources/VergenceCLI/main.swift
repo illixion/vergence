@@ -5,6 +5,7 @@
                  [--preset generic|iphone|avp|film] [--baseline MM] [--hfov DEG] [--adjust -1...1]
                  [--quality low|standard|high|max] [--bitrate MBPS] [--no-audio] [--dry-run] [--force]
    vergence inspect VIDEO|DISC
+   vergence sbs SPATIAL-VIDEO|FOLDER... [--output FILE|DIR] [--half] [--max-eye PIXELS] [--no-ambisonics]
    vergence audio VIDEO [--track N] [--bitrate KBPS] --output FILE.opus|.ogg|.mka|.webm|.mp4|.wav
    vergence info DISC
    vergence decode DISC [--playlist NNNNN] [options]
@@ -63,6 +64,14 @@
  unless --force, so rerunning a folder resumes it. --dry-run only says what
  it would do.
 
+ sbs (also: quest) goes the other way: a spatial video (a Vision Pro or
+ iPhone recording) becomes side-by-side HEVC in MP4 for players that can't
+ decode MV-HEVC's second view (Quest, Android, YouTube), full resolution per
+ eye unless --half or --max-eye, colour converted to BT.709, the stereo
+ audio copied and the ambisonic track as 4-channel AAC. It carries Google's
+ st3d and SA3D boxes and a name players recognise: VIDEO.3D.FSBS.mp4
+ (.3D.HSBS.mp4 with --half).
+
  audio VIDEO exports one audio track, by default the spatial one: a Vision
  Pro's or iPhone's APAC track, which only Apple's frameworks decode, comes
  out as first-order ambisonics (AmbiX: ACN order, SN3D), as Opus with
@@ -110,6 +119,10 @@ struct Options {
     var bitrate: Int?
     var bitrateText: String?
     var track: Int?
+    // sbs
+    var half = false
+    var maxEye: Int?
+    var ambisonics = true
     var includeAudio = true
     var dryRun = false
     var force = false
@@ -122,6 +135,8 @@ func usage(_ problem: String? = nil) -> Never {
                          [--preset generic|iphone|avp|film] [--baseline MM] [--hfov DEG] [--adjust -1...1]
                          [--quality low|standard|high|max] [--bitrate MBPS] [--no-audio] [--dry-run] [--force]
            vergence inspect VIDEO|DISC
+           vergence sbs SPATIAL-VIDEO|FOLDER... [--output FILE|DIR] [--half] [--max-eye PIXELS] [--no-ambisonics]
+                        [--quality low|standard|high|max] [--bitrate MBPS] [--dry-run] [--force]
            vergence info DISC
            vergence decode DISC [--playlist NNNNN] [options]
            vergence decode BASE.m2ts [DEPENDENT.m2ts] [options]
@@ -196,6 +211,9 @@ func parse(_ args: [String]) -> Options {
             o.bitrateText = v
             o.bitrate = parseBitrate(v) ?? { usage("bad --bitrate (try 20, 20M or 750K)") }()
         case "--track": o.track = Int(number(value()))
+        case "--half": flag(); o.half = true
+        case "--max-eye": o.maxEye = Int(number(value()))
+        case "--no-ambisonics": flag(); o.ambisonics = false
         case "--no-audio": flag(); o.includeAudio = false
         case "--dry-run", "-n": flag(); o.dryRun = true
         case "--force", "-y": flag(); o.force = true
@@ -516,8 +534,12 @@ do {
     case "cat": try cat(options)
     case "make": try await make(options)
     case "inspect": try await inspect(options)
+    case "sbs", "quest": try await sideBySide(options)
     default: usage()
     }
+} catch let error as LocalizedError where error.errorDescription != nil {
+    log("vergence: \(error.errorDescription!)")
+    exit(1)
 } catch {
     log("vergence: \(error)")
     exit(1)

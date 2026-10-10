@@ -78,6 +78,7 @@ public struct SpatialVideoSource: Sendable {
     public var needsTenBit: Bool { bitsPerComponent > 8 || isHDR }
 
     public static func open(_ url: URL) async throws -> SpatialVideoSource {
+        guard FileManager.default.fileExists(atPath: url.path) else { throw SpatialVideoError.unreadable("no such file: \(url.path)") }
         let asset = AVURLAsset(url: url)
         let track: AVAssetTrack
         do {

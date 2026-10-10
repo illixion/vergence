@@ -58,6 +58,9 @@ struct PackedStereoLayoutTests {
         // Full-SBS 4:3 vs half-SBS 2.67:1: both plausible, the tag stands.
         #expect(full.correctingResolution(forPacked: CGSize(width: 2560, height: 960)).isHalfResolution == false)
         #expect(half.correctingResolution(forPacked: CGSize(width: 2560, height: 960)).isHalfResolution == true)
+        // A Vision Pro recording packed side by side: square eyes, and the
+        // half reading's 2:1 eye is plausible too, so the tag stands.
+        #expect(full.correctingResolution(forPacked: CGSize(width: 4400, height: 2200)).isHalfResolution == false)
         let ou = PackedStereoLayout(arrangement: .overUnder, isHalfResolution: true)
         #expect(ou.correctingResolution(forPacked: CGSize(width: 1920, height: 2160)).isHalfResolution == false)
         #expect(ou.correctingResolution(forPacked: CGSize(width: 1920, height: 1080)).isHalfResolution == true)

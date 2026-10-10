@@ -8,12 +8,13 @@ import VergenceDisc
 
 /// The files `make` would convert: each argument, or every video in a
 /// folder argument (recursively), leaving out its own outputs.
-func videoInputs(_ paths: [String]) -> [URL] {
+func videoInputs(_ paths: [String], forSideBySide: Bool = false) -> [URL] {
     let extensions: Set<String> = ["mov", "mp4", "m4v", "mkv", "webm", "avi", "ts", "m2ts", "mts", "mpg", "mpeg", "wmv"]
     func isInput(_ url: URL) -> Bool {
         let name = url.lastPathComponent.lowercased()
-        return !name.hasPrefix(".") && extensions.contains(url.pathExtension.lowercased())
-            && !name.hasSuffix(".spatial.mov") && !name.hasSuffix(".partial.mov")
+        guard !name.hasPrefix("."), extensions.contains(url.pathExtension.lowercased()), !name.contains(".partial.") else { return false }
+        // Each command leaves out its own outputs.
+        return forSideBySide ? !name.contains(".3d.fsbs.") && !name.contains(".3d.hsbs.") : !name.hasSuffix(".spatial.mov")
     }
     var found: [URL] = []
     for path in paths {
@@ -98,7 +99,12 @@ func makeOne(_ input: URL, _ output: URL, _ o: Options) async throws -> Bool {
         }
         nativeSource = source
         frameSize = source.frameSize
-        declared = source.declaredLayout
+        let st3d = (try? SphericalMetadata.read(input))?.stereoMode
+        declared = source.declaredLayout ?? st3d.flatMap { mode -> PackedStereoLayout? in
+            guard mode != .mono else { return nil }
+            return PackedStereoLayout(arrangement: mode == .leftRight ? .sideBySide : .overUnder, isHalfResolution: false)
+                .correctingResolution(forPacked: source.frameSize)
+        }
     } else {
         let tool = try FFmpeg.required(for: "reading .\(input.pathExtension)")
         let probed = try tool.probe(input)
@@ -216,20 +222,36 @@ func inspect(_ o: Options) async throws {
     #else
     if !FFmpeg.isNative(url) { return try inspectWithFFmpeg(url, shown: path) }
     let report = try await SpatialVideoInspector.inspect(url)
-    let width = report.fields.map(\.name.count).max() ?? 0
-    for field in report.fields {
-        print(field.name.padding(toLength: width, withPad: " ", startingAt: 0) + "  " + field.value)
+    var fields = report.fields.map { ($0.name, $0.value) }
+    if let spherical = try? SphericalMetadata.read(url) {
+        if let mode = spherical.stereoMode {
+            fields.append(("st3d", mode == .leftRight ? "left-right" : mode == .topBottom ? "top-bottom" : "mono"))
+        }
+        if !spherical.ambisonicOrders.isEmpty {
+            fields.append(("SA3D", spherical.ambisonicOrders.map { "ambisonics order \($0)" }.joined(separator: "; ")))
+        }
+    }
+    let width = fields.map(\.0.count).max() ?? 0
+    for (name, value) in fields {
+        print(name.padding(toLength: width, withPad: " ", startingAt: 0) + "  " + value)
     }
     print("")
     if report.isCompleteSpatialVideo {
         print("Spatial video: Photos and Files show it as spatial.")
+        print("vergence sbs \(shellQuoted(path)) makes a side-by-side copy for Quest and other players.")
     } else if report.source.isMultiviewStereo {
         print("Stereo, but players will miss:")
         for line in report.missing { print("  - \(line)") }
         print("vergence make can't re-tag MV-HEVC yet; re-export it from its source with vergence make.")
     } else {
         let pictures = try await report.source.samplePictures()
-        let detection = StereoLayoutDetector.detect(declared: report.source.declaredLayout, fileName: url.lastPathComponent,
+        let st3d = (try? SphericalMetadata.read(url))?.stereoMode
+        let declared = report.source.declaredLayout ?? st3d.flatMap { mode -> PackedStereoLayout? in
+            guard mode != .mono else { return nil }
+            return PackedStereoLayout(arrangement: mode == .leftRight ? .sideBySide : .overUnder, isHalfResolution: false)
+                .correctingResolution(forPacked: report.source.frameSize)
+        }
+        let detection = StereoLayoutDetector.detect(declared: declared, fileName: url.lastPathComponent,
                                                     frameSize: report.source.frameSize, pictures: pictures)
         if let format = detection.format {
             print(String(format: "Frame-packed stereo, %@ (%.0f%% sure):", format.displayName, detection.confidence * 100))
@@ -285,4 +307,66 @@ func inspectWithFFmpeg(_ url: URL, shown: String) throws {
         print("2D video:")
         for reason in detection.reasons { print("  - \(reason)") }
     }
+}
+
+/// vergence sbs: spatial video to side-by-side MP4 for non-Apple players.
+func sideBySide(_ o: Options) async throws {
+    #if !canImport(AVFoundation) || os(tvOS)
+    throw FormatError("decoding MV-HEVC needs Apple's decoder (macOS)")
+    #else
+    let inputs = videoInputs(o.positional, forSideBySide: true).filter { FFmpeg.isNative($0) }
+    guard !inputs.isEmpty else { usage("sbs needs a spatial video (.mov) or a folder of them") }
+    if inputs.count > 1, o.output != "-" {
+        try FileManager.default.createDirectory(at: URL(fileURLWithPath: o.output), withIntermediateDirectories: true)
+    }
+    var made = 0, skipped = 0, failed = 0
+    for input in inputs {
+        let name = input.deletingPathExtension().lastPathComponent + (o.half ? ".3D.HSBS.mp4" : ".3D.FSBS.mp4")
+        let output: URL = {
+            guard o.output != "-" else { return input.deletingLastPathComponent().appendingPathComponent(name) }
+            let target = URL(fileURLWithPath: o.output)
+            var isDirectory: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
+            return inputs.count == 1 && !(exists && isDirectory.boolValue) && !o.output.hasSuffix("/") ? target : target.appendingPathComponent(name)
+        }()
+        do {
+            if FileManager.default.fileExists(atPath: output.path), !o.force {
+                log("vergence: \(input.lastPathComponent): \(output.lastPathComponent) is already made (--force to redo)")
+                skipped += 1
+                continue
+            }
+            let source = try await SpatialVideoSource.open(input)
+            guard source.isMultiviewStereo else {
+                log("vergence: \(input.lastPathComponent): not spatial video (one view), skipped")
+                skipped += 1
+                continue
+            }
+            let job = SideBySideJob(source: source, output: output, halfWidth: o.half, maxEyeSide: o.maxEye,
+                                    quality: o.quality, bitsPerSecond: o.bitrate, includeAmbisonics: o.ambisonics)
+            let picture = job.pictureSize
+            log("vergence: \(input.lastPathComponent) -> \(output.path)")
+            log(String(format: "  %d×%d side by side (%@ eyes), HEVC %.1f Mbps, %@", picture.width, picture.height,
+                       o.half ? "half-width" : "full", Double(job.resolvedBitsPerSecond) / 1_000_000,
+                       source.isHDR ? "HDR kept" : "BT.709"))
+            if o.dryRun { skipped += 1; continue }
+            let began = Date()
+            let interactive = isatty(STDERR_FILENO) != 0
+            let result = try await SideBySideExporter.export(job) { fraction in
+                guard interactive else { return }
+                FileHandle.standardError.write(Data(String(format: "\r  %3.0f%%", fraction * 100).utf8))
+            }
+            if interactive { FileHandle.standardError.write(Data("\r".utf8)) }
+            let seconds = Date().timeIntervalSince(began)
+            log(String(format: "  done: %d frames in %.1f s (%.1f fps); %d audio track(s) copied%@", result.frames, seconds,
+                       Double(result.frames) / max(seconds, 0.001), result.audioTracksCopied,
+                       result.ambisonicOrder.map { ", ambisonics (order \($0)) as 4-channel AAC" } ?? ""))
+            made += 1
+        } catch {
+            log("vergence: \(input.lastPathComponent): \(error.localizedDescription)")
+            failed += 1
+        }
+    }
+    if inputs.count > 1 { log("vergence: \(made) made, \(skipped) skipped, \(failed) failed") }
+    if failed > 0 { exit(1) }
+    #endif
 }

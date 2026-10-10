@@ -102,12 +102,47 @@ import Testing
         let means = try await Self.markerMeans(output)
         #expect(means.left > 200 && means.right < 50, "left \(means.left), right \(means.right)")
 
+        // And back to side by side for players without MV-HEVC.
+        let sbs = directory.appendingPathComponent("clip.3D.FSBS.mp4")
+        let exported = try await SideBySideExporter.export(SideBySideJob(source: try await SpatialVideoSource.open(output), output: sbs))
+        #expect(exported.frames == Self.frames)
+        let flat = try await SpatialVideoSource.open(sbs)
+        #expect(!flat.isMultiviewStereo)
+        #expect(flat.frameSize == CGSize(width: Self.eye.width * 2, height: Self.eye.height))
+        #expect(try SphericalMetadata.read(sbs).stereoMode == .leftRight)
+        let halves = try await Self.markerMeansSideBySide(sbs)
+        #expect(halves.left > 200 && halves.right < 50, "left \(halves.left), right \(halves.right)")
+
         // Already spatial: refused rather than re-encoded.
         let again = try await SpatialVideoSource.open(output)
         await #expect(throws: SpatialVideoError.self) {
             try await SpatialVideoMaker.make(SpatialVideoJob(source: again, output: directory.appendingPathComponent("x.mov"),
                                                              layout: layout, camera: SpatialPreset.generic.metadata))
         }
+    }
+
+    /// The mean luma of the marker band in each half of a packed picture.
+    static func markerMeansSideBySide(_ url: URL) async throws -> (left: Double, right: Double) {
+        let asset = AVURLAsset(url: url)
+        let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        ])
+        reader.add(output)
+        #expect(reader.startReading())
+        let picture = try #require(output.copyNextSampleBuffer().flatMap(CMSampleBufferGetImageBuffer))
+        CVPixelBufferLockBaseAddress(picture, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(picture, .readOnly) }
+        let base = try #require(CVPixelBufferGetBaseAddressOfPlane(picture, 0)).assumingMemoryBound(to: UInt8.self)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(picture, 0)
+        func mean(_ x0: Int) -> Double {
+            var sum = 0.0
+            for y in 2 ..< 12 { for x in x0 + 8 ..< x0 + 248 { sum += Double(base[y * stride + x]) } }
+            return sum / Double(10 * 240)
+        }
+        reader.cancelReading()
+        return (mean(0), mean(eye.width))
     }
 
     /// The mean luma of the marker band in each eye's first frame.

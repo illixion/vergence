@@ -3,6 +3,8 @@
 Stereo 3D video tools in Swift:
 - **Spatial video** for Apple Vision Pro from side-by-side and over-under files, with no flags:
   `vergence make` works out the layout and writes the complete metadata Photos and Files need.
+- **And back:** `vergence sbs` turns a Vision Pro or iPhone recording into side-by-side video
+  for a Quest, Android or YouTube, with its spatial audio.
 - **3D Blu-ray**: decodes H.264 MVC ("Stereo High") into ordinary left/right pictures, on any
   platform Swift runs on, Apple's included.
 - **2D to 3D** from estimated depth (the library; the command line comes later).
@@ -129,7 +131,30 @@ A stereo one is remuxed into a temporary QuickTime file beside the output:
   to ALAC, other lossy audio (DTS, Opus, Vorbis) to AAC;
 - subtitles left out.
 
-`inspect` reads those through ffmpeg too, on Linux included.
+`inspect` reads those through ffmpeg too, on Linux included, and shows an MP4's `st3d` and
+`SA3D` boxes.
+
+### Vision Pro and iPhone recordings on a Quest
+
+```sh
+vergence sbs IMG_0664.MOV                 # writes IMG_0664.3D.FSBS.mp4 beside it
+vergence sbs ~/Downloads --output ~/Quest # every spatial video in a folder
+```
+
+Players outside Apple's can't decode MV-HEVC's second view; a Quest, an Android phone or
+YouTube play one picture with both eyes in it. `sbs` decodes both views and writes HEVC in MP4,
+the left eye on the left:
+- each eye at full resolution (a Vision Pro's 2200×2200 eyes make a 4400×2200 picture, which a
+  Quest 3 decodes); `--half` squeezes each eye to half width, `--max-eye 1920` caps their size
+  for older decoders;
+- colour converted from Display P3 to BT.709, which Android players assume (HDR stays as it is);
+- the stereo AAC track copied, and the ambisonic track (a Vision Pro's APAC, which only Apple
+  decodes) re-encoded as 4-channel AAC, the form YouTube's spatial audio takes;
+- Google's Spherical Video V2 `st3d` box (left-right) and Spatial Audio `SA3D` box, which
+  non-Apple players read, and a name most players and media servers recognise
+  (`.3D.FSBS.mp4`, `.3D.HSBS.mp4` with `--half`).
+
+`vergence make` turns such a file back into spatial video, reading the layout from its `st3d`.
 
 ### Spatial audio
 
