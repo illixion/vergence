@@ -211,6 +211,7 @@ public final class StereoPump: @unchecked Sendable {
         var frames = 0
         var itemSpan = 0.0
         var lastItemSeconds: Double?
+        var sourceHeight = 0
         /// The shortest gap between consecutive frames seen this pump: the
         /// source's own frame spacing. Lifetime, so a window of drops can't
         /// redefine it.
@@ -392,15 +393,16 @@ public final class StereoPump: @unchecked Sendable {
         // timeline governs audio and seeking, and stays with the source.
         let pts = CMTime(seconds: hostTime - startHostTime, preferredTimescale: 90_000)
         renderAndEnqueue(from: frame.pixelBuffer, itemTime: frame.itemTime, cache: textureCache, pts: pts)
-        noteDelivered(itemSeconds: frame.itemTime.seconds, at: CACurrentMediaTime())
+        noteDelivered(itemSeconds: frame.itemTime.seconds, height: CVPixelBufferGetHeight(frame.pixelBuffer), at: CACurrentMediaTime())
     }
 
     /// Counts a frame that reached the eyes against the source time it
     /// covers. A pump that can't keep up takes only the newest decoded
     /// frame, so the source frames between are never shown: the gaps between
     /// shown frames grow past the source's own spacing.
-    private func noteDelivered(itemSeconds: Double, at now: CFTimeInterval) {
+    private func noteDelivered(itemSeconds: Double, height: Int, at now: CFTimeInterval) {
         guard itemSeconds.isFinite else { return }
+        delivery.sourceHeight = height
         if let last = delivery.lastItemSeconds {
             let gap = itemSeconds - last
             // A seek, a loop or a pause/resume isn't a run of dropped frames.
@@ -425,7 +427,8 @@ public final class StereoPump: @unchecked Sendable {
             shownFramesPerSecond: Double(delivery.frames) / window,
             sourceFramesPerSecond: 1 / delivery.sourceSpacing,
             deliveredFraction: min(1, Double(delivery.frames) / expected),
-            playbackRate: delivery.itemSpan / window
+            playbackRate: delivery.itemSpan / window,
+            sourceHeight: delivery.sourceHeight
         ))
     }
 
@@ -868,13 +871,18 @@ public struct RAVEStereoPerformance: Sendable, Equatable {
     /// Source seconds per wall second; well under 1 means the player itself
     /// is starving (decode or network), not the conversion.
     public var playbackRate: Double
+    /// The decoded picture's height in pixels (a packed stereo frame's
+    /// whole height), so a host can tell what a lower stream would save.
+    /// 0 when unknown.
+    public var sourceHeight: Int
 
     public init(shownFramesPerSecond: Double, sourceFramesPerSecond: Double,
-                deliveredFraction: Double, playbackRate: Double) {
+                deliveredFraction: Double, playbackRate: Double, sourceHeight: Int = 0) {
         self.shownFramesPerSecond = shownFramesPerSecond
         self.sourceFramesPerSecond = sourceFramesPerSecond
         self.deliveredFraction = deliveredFraction
         self.playbackRate = playbackRate
+        self.sourceHeight = sourceHeight
     }
 
     /// The conversion, not the source, is what's falling behind.
