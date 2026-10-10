@@ -68,6 +68,8 @@ public struct SpatialVideoSource: Sendable {
     /// A frame-packed layout the file's metadata declares.
     public let declaredLayout: PackedStereoLayout?
     public let audioTracks: [String]
+    /// When the last frame presents, in seconds, from the sample table.
+    public let lastFrameTime: Double?
 
     public var isHDR: Bool {
         transferFunction == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
@@ -108,6 +110,7 @@ public struct SpatialVideoSource: Sendable {
         }
 
         let audio = try await AudioTrackReader.tracks(url).map(\.summary)
+        let lastFrame = await lastFrameTime(track)
 
         return SpatialVideoSource(
             url: url, frameSize: pixels, frameRate: Double(rate), duration: duration,
@@ -117,7 +120,24 @@ public struct SpatialVideoSource: Sendable {
             colorPrimaries: extensions[kCMFormatDescriptionExtension_ColorPrimaries as String] as? String,
             transferFunction: extensions[kCMFormatDescriptionExtension_TransferFunction as String] as? String,
             yCbCrMatrix: extensions[kCMFormatDescriptionExtension_YCbCrMatrix as String] as? String,
-            isMultiviewStereo: multiview, declaredLayout: declared, audioTracks: audio)
+            isMultiviewStereo: multiview, declaredLayout: declared, audioTracks: audio, lastFrameTime: lastFrame)
+    }
+
+    /// The latest presentation time among the last samples in decode order
+    /// (with B-frames the last decoded isn't always the last shown).
+    static func lastFrameTime(_ track: AVAssetTrack) async -> Double? {
+        #if os(macOS)
+        guard (try? await track.load(.canProvideSampleCursors)) == true,
+              let cursor = track.makeSampleCursorAtLastSampleInDecodeOrder() else { return nil }
+        var latest = cursor.presentationTimeStamp
+        for _ in 0 ..< 16 {
+            guard cursor.stepInDecodeOrder(byCount: -1) == -1 else { break }
+            latest = CMTimeMaximum(latest, cursor.presentationTimeStamp)
+        }
+        return latest.isNumeric ? latest.seconds : nil
+        #else
+        return nil
+        #endif
     }
 
     /// `count` greyscale pictures from across the video, at most `maxWidth`

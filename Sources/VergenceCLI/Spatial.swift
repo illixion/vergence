@@ -316,6 +316,12 @@ func sideBySide(_ o: Options) async throws {
     #else
     let inputs = videoInputs(o.positional, forSideBySide: true).filter { FFmpeg.isNative($0) }
     guard !inputs.isEmpty else { usage("sbs needs a spatial video (.mov) or a folder of them") }
+    if o.info || o.segments != nil {
+        guard inputs.count == 1 else { usage("--info and --segments take one video") }
+        guard o.segmentSeconds >= 0.5, o.segmentSeconds <= 60 else { usage("--segment-seconds must be 0.5...60") }
+        try await sideBySideSegments(inputs[0], o)
+        return
+    }
     if inputs.count > 1, o.output != "-" {
         try FileManager.default.createDirectory(at: URL(fileURLWithPath: o.output), withIntermediateDirectories: true)
     }
@@ -370,3 +376,49 @@ func sideBySide(_ o: Options) async throws {
     if failed > 0 { exit(1) }
     #endif
 }
+
+#if canImport(AVFoundation) && !os(tvOS)
+/// `sbs --info` and `sbs --segments`.
+func sideBySideSegments(_ input: URL, _ o: Options) async throws {
+    let source = try await SpatialVideoSource.open(input)
+    let job = SideBySideJob(source: source, output: input, halfWidth: o.half, maxEyeSide: o.maxEye,
+                            quality: o.quality, bitsPerSecond: o.bitrate, includeAmbisonics: false)
+    let request = SideBySideSegments(job: job, directory: URL(fileURLWithPath: o.segments ?? "."),
+                                     segmentSeconds: o.segmentSeconds, first: o.firstSegment, last: o.lastSegment,
+                                     includeAudio: o.includeAudio)
+    let grid = request.grid
+    if o.info {
+        var info: [String: Any] = ["spatial": source.isMultiviewStereo]
+        if source.isMultiviewStereo {
+            info.merge([
+                "durationSeconds": source.duration, "frameRate": source.frameRate,
+                "width": job.pictureSize.width, "height": job.pictureSize.height,
+                "eyeWidth": job.storedEye.width, "eyeHeight": job.storedEye.height, "halfWidth": o.half,
+                "bitsPerSecond": job.resolvedBitsPerSecond, "hdr": source.isHDR,
+                "segmentSeconds": grid.segmentSeconds, "segments": grid.count,
+                "audio": source.audioTracks,
+            ]) { $1 }
+        }
+        let data = try JSONSerialization.data(withJSONObject: info, options: [.sortedKeys])
+        FileHandle.standardOutput.write(data + Data("\n".utf8))
+        return
+    }
+    guard source.isMultiviewStereo else { throw FormatError("\(input.lastPathComponent) is not spatial video (one view)") }
+    let directory = request.directory
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let playlist = directory.appendingPathComponent("index.m3u8")
+    if !FileManager.default.fileExists(atPath: playlist.path) {
+        try grid.mediaPlaylist(initURI: SideBySideSegments.initName, uri: SideBySideSegments.segmentName)
+            .write(to: playlist, atomically: true, encoding: .utf8)
+    }
+    let last = min(o.lastSegment ?? grid.count - 1, grid.count - 1)
+    log(String(format: "vergence: %@ segments %d-%d of %d (%.1f s each), %d×%d, HEVC %.1f Mbps", input.lastPathComponent,
+               o.firstSegment, last, grid.count, grid.segmentSeconds, job.pictureSize.width, job.pictureSize.height,
+               Double(job.resolvedBitsPerSecond) / 1_000_000))
+    let began = Date()
+    let result = try await SideBySideSegmenter.run(request) { log("vergence: segment \($0)") }
+    let seconds = Date().timeIntervalSince(began)
+    log(String(format: "vergence: %d segments, %d frames in %.1f s (%.1f fps)%@", result.segments.count, result.frames, seconds,
+               Double(result.frames) / max(seconds, 0.001), result.audio ? ", stereo audio copied" : ""))
+}
+#endif

@@ -156,6 +156,21 @@ the left eye on the left:
 
 `vergence make` turns such a file back into spatial video, reading the layout from its `st3d`.
 
+A server can stream it instead of converting whole files first:
+
+```sh
+vergence sbs IMG_0664.MOV --info                          # JSON: spatial or not, size, segment count
+vergence sbs IMG_0664.MOV --segments cache/ --first 30 --last 59
+```
+
+`--segments` writes the same picture as HLS fragmented-MP4 segments, `init.mp4` and `N.m4s`, on
+a fixed grid (`--segment-seconds`, default 4) from the start, each renamed into place the moment
+it is complete. Every segment opens with a keyframe and carries the video's own times, so a
+server can make any stretch on demand (where the viewer seeks) and segments from different runs
+play as one stream; `index.m3u8` lists the whole grid. The stereo AAC is copied; the ambisonic
+track is left out, since an encoder restarted at every seek would click where runs join. The
+Convolution Jellyfin plugin streams spatial video to its Quest app this way.
+
 ### Spatial audio
 
 ```sh

@@ -6,6 +6,8 @@
                  [--quality low|standard|high|max] [--bitrate MBPS] [--no-audio] [--dry-run] [--force]
    vergence inspect VIDEO|DISC
    vergence sbs SPATIAL-VIDEO|FOLDER... [--output FILE|DIR] [--half] [--max-eye PIXELS] [--no-ambisonics]
+   vergence sbs SPATIAL-VIDEO --segments DIR [--segment-seconds S] [--first N] [--last N] [--half] [--max-eye PIXELS]
+   vergence sbs SPATIAL-VIDEO --info [--segment-seconds S] [--half] [--max-eye PIXELS]
    vergence audio VIDEO [--track N] [--bitrate KBPS] --output FILE.opus|.ogg|.mka|.webm|.mp4|.wav
    vergence info DISC
    vergence decode DISC [--playlist NNNNN] [options]
@@ -72,6 +74,16 @@
  st3d and SA3D boxes and a name players recognise: VIDEO.3D.FSBS.mp4
  (.3D.HSBS.mp4 with --half).
 
+ With --segments it writes the same picture as HLS stream segments instead,
+ for a server that converts while it streams: DIR/init.mp4 and DIR/N.m4s for
+ segments --first to --last (default: all) on a fixed grid of
+ --segment-seconds (default 4) from the start, each renamed into place once
+ complete, plus DIR/index.m3u8 for the whole grid. Every segment starts with
+ a keyframe and carries the video's own times, so segments from different
+ runs join; the stereo AAC is copied, the ambisonic track left out. --info
+ prints, as JSON on stdout, whether the file is spatial and what the
+ segments would be (size, bitrate, count), without converting anything.
+
  audio VIDEO exports one audio track, by default the spatial one: a Vision
  Pro's or iPhone's APAC track, which only Apple's frameworks decode, comes
  out as first-order ambisonics (AmbiX: ACN order, SN3D), as Opus with
@@ -126,6 +138,12 @@ struct Options {
     var includeAudio = true
     var dryRun = false
     var force = false
+    // sbs as stream segments
+    var segments: String?
+    var segmentSeconds = 4.0
+    var firstSegment = 0
+    var lastSegment: Int?
+    var info = false
 }
 
 func usage(_ problem: String? = nil) -> Never {
@@ -217,6 +235,11 @@ func parse(_ args: [String]) -> Options {
         case "--no-audio": flag(); o.includeAudio = false
         case "--dry-run", "-n": flag(); o.dryRun = true
         case "--force", "-y": flag(); o.force = true
+        case "--segments": o.segments = value()
+        case "--segment-seconds": o.segmentSeconds = number(value())
+        case "--first": o.firstSegment = Int(number(value()))
+        case "--last": o.lastSegment = Int(number(value()))
+        case "--info": flag(); o.info = true
         default: usage("unknown option \(name)")
         }
     }

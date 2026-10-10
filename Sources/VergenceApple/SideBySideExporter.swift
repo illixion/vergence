@@ -209,7 +209,8 @@ public enum SideBySideExporter {
                     if let sample = videoOutput.copyNextSampleBuffer() {
                         if let views = sample.taggedBuffers {
                             let time = CMSampleBufferGetPresentationTimeStamp(sample)
-                            let packed = try pack(views, transfer: transfer, eyePool: eyePool, adaptor: adaptor)
+                            guard let pool = adaptor.pixelBufferPool else { throw SpatialVideoError.writer("the writer has no buffer pool") }
+                            let packed = try pack(views, transfer: transfer, eyePool: eyePool, pool: pool)
                             guard adaptor.append(packed, withPresentationTime: time) else {
                                 throw SpatialVideoError.writer(writer.error?.localizedDescription ?? "frame \(frames) was refused")
                             }
@@ -263,7 +264,7 @@ public enum SideBySideExporter {
 
     /// Both views scaled into one picture, left eye on the left.
     static func pack(_ views: [CMTaggedBuffer], transfer: VTPixelTransferSession, eyePool: CVPixelBufferPool,
-                     adaptor: AVAssetWriterInputPixelBufferAdaptor) throws -> CVPixelBuffer {
+                     pool: CVPixelBufferPool) throws -> CVPixelBuffer {
         func view(_ which: CMStereoViewComponents) -> CVPixelBuffer? {
             for tagged in views {
                 guard case .pixelBuffer(let buffer) = tagged.buffer,
@@ -273,7 +274,6 @@ public enum SideBySideExporter {
             return nil
         }
         guard let left = view(.leftEye), let right = view(.rightEye) else { throw SpatialVideoError.unreadable("a frame is missing an eye") }
-        guard let pool = adaptor.pixelBufferPool else { throw SpatialVideoError.writer("the writer has no buffer pool") }
         var out: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out)
         guard let out else { throw SpatialVideoError.writer("out of pixel buffers") }

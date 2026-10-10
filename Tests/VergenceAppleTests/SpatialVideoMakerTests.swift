@@ -15,7 +15,7 @@ import Testing
 
     /// A noise scene seen by two eyes `disparity` pixels apart, side by side,
     /// with the left eye's top-left pixel marked bright and the right's dark.
-    static func writeSideBySideClip(to url: URL) async throws {
+    static func writeSideBySideClip(to url: URL, frames: Int = frames) async throws {
         let width = eye.width * 2, height = eye.height
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
@@ -119,6 +119,55 @@ import Testing
             try await SpatialVideoMaker.make(SpatialVideoJob(source: again, output: directory.appendingPathComponent("x.mov"),
                                                              layout: layout, camera: SpatialPreset.generic.metadata))
         }
+    }
+
+    @Test func streamSegmentsFromTwoRunsJoinIntoTheWholeVideo() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("vergence-segments-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let clip = directory.appendingPathComponent("clip.mp4"), spatial = directory.appendingPathComponent("clip.spatial.mov")
+        try await Self.writeSideBySideClip(to: clip, frames: 48)
+        _ = try await SpatialVideoMaker.make(SpatialVideoJob(source: try await SpatialVideoSource.open(clip), output: spatial,
+                                                              layout: PackedStereoLayout(arrangement: .sideBySide, isHalfResolution: false),
+                                                              camera: SpatialPreset.generic.metadata))
+        let job = SideBySideJob(source: try await SpatialVideoSource.open(spatial), output: spatial)
+        let segments = directory.appendingPathComponent("segments")
+        // Two seconds in half-second segments, made out of order by two runs.
+        let late = try await SideBySideSegmenter.run(SideBySideSegments(job: job, directory: segments, segmentSeconds: 0.5, first: 2))
+        let early = try await SideBySideSegmenter.run(SideBySideSegments(job: job, directory: segments, segmentSeconds: 0.5, first: 0, last: 1))
+        #expect(early.segments == [0, 1] && late.segments == [2, 3])
+        #expect(early.frames + late.frames == 48)
+
+        var joined = try Data(contentsOf: segments.appendingPathComponent(SideBySideSegments.initName))
+        for n in 0 ..< 4 { joined += try Data(contentsOf: segments.appendingPathComponent(SideBySideSegments.segmentName(n))) }
+        let file = directory.appendingPathComponent("joined.mp4")
+        try joined.write(to: file)
+
+        // Every frame once, at its own time, a keyframe opening every
+        // segment. (AVFoundation starts a fragmented file's timeline at its
+        // first fragment, so the offset doesn't show here.)
+        let asset = AVURLAsset(url: file)
+        let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        #expect(reader.startReading())
+        var times: [Double] = [], keys: [Int] = []
+        while let sample = output.copyNextSampleBuffer() {
+            guard CMSampleBufferGetNumSamples(sample) > 0 else { continue }
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
+            if attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool != true { keys.append(times.count) }
+            times.append(CMSampleBufferGetPresentationTimeStamp(sample).seconds)
+        }
+        #expect(times.count == 48, "\(times)")
+        // In the segment itself: 1 s in, plus the offset.
+        let scale = try #require(FragmentTimes.timescales(initSegment: try Data(contentsOf: segments.appendingPathComponent(SideBySideSegments.initName)))[1])
+        let start = try #require(FragmentTimes.firstPresentation(try Data(contentsOf: segments.appendingPathComponent(SideBySideSegments.segmentName(2))))[1])
+        #expect(abs(Double(start) / Double(scale) - (1 + SideBySideSegments.timeOffset.seconds)) < 0.001)
+        #expect(zip(times, (0 ..< 48).map { Double($0) / 24 }).allSatisfy { abs($0 - $1) < 0.001 }, "\(times)")
+        #expect(keys == [0, 12, 24, 36], "\(keys)")
+        let halves = try await Self.markerMeansSideBySide(file)
+        #expect(halves.left > 200 && halves.right < 50, "left \(halves.left), right \(halves.right)")
     }
 
     /// The mean luma of the marker band in each half of a packed picture.
