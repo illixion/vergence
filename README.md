@@ -12,8 +12,9 @@ It contains no AACS or BD+ code.
 
 | Module | What | Builds on |
 | --- | --- | --- |
+| `VergenceCore` | Stereo layouts (`PackedStereoLayout`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
 | `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
-| `VergenceApple` | The Apple-framework half: `CVPixelBuffer` output, AC-3 decoding through AudioToolbox. Re-exports `VergenceDisc`. Builds empty elsewhere. | Apple platforms |
+| `VergenceApple` | The Apple-framework half: `CVPixelBuffer` output, AC-3 decoding through AudioToolbox. Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms |
 | `vergence` | The command line tool. | macOS, Linux (no PNG or audio output there) |
 
 No consumer platform ships an MVC decoder: Apple's VideoToolbox, Android's MediaCodec and FFmpeg

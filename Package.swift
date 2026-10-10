@@ -2,6 +2,8 @@
 import PackageDescription
 
 // Layers (see README → Layout):
+// - VergenceCore: stereo layouts, warp settings and depth maths (anchoring,
+//   depth budget, histograms). Foundation only, no dependencies.
 // - VergenceDisc: Blu-ray reading and MVC decoding, Foundation only, so it
 //   builds wherever Swift does (Apple platforms, Linux, Android, Windows).
 // - VergenceApple: the Apple-framework half (CoreVideo pixel buffers,
@@ -22,6 +24,7 @@ let package = Package(
     name: "Vergence",
     platforms: [.macOS(.v14), .iOS(.v17), .visionOS(.v1), .tvOS(.v17)],
     products: [
+        .library(name: "VergenceCore", targets: ["VergenceCore"]),
         .library(name: "VergenceDisc", targets: ["VergenceDisc"]),
         .library(name: "VergenceApple", targets: ["VergenceApple"]),
         .executable(name: "vergence", targets: ["VergenceCLI"]),
@@ -44,9 +47,11 @@ let package = Package(
                 .define("NDEBUG", .when(configuration: .release)),
             ]
         ),
+        .target(name: "VergenceCore"),
         .target(name: "VergenceDisc", dependencies: ["CEdge264"]),
-        .target(name: "VergenceApple", dependencies: ["VergenceDisc"]),
+        .target(name: "VergenceApple", dependencies: ["VergenceCore", "VergenceDisc"]),
         .executableTarget(name: "VergenceCLI", dependencies: ["VergenceDisc", "VergenceApple"]),
+        .testTarget(name: "VergenceCoreTests", dependencies: ["VergenceCore"]),
         .testTarget(name: "VergenceDiscTests", dependencies: ["VergenceDisc"] + testCrypto, resources: [.copy("Fixtures")]),
         .testTarget(name: "VergenceAppleTests", dependencies: ["VergenceApple"]),
     ],

@@ -1,2 +1,3 @@
-// Apps import VergenceApple alone and get the portable layer with it.
+// Apps import VergenceApple alone and get the portable layers with it.
+@_exported import VergenceCore
 @_exported import VergenceDisc
