@@ -11,10 +11,14 @@ enum PGS {
     static func u16(_ v: Int) -> [UInt8] { [UInt8(v >> 8), UInt8(v & 0xFF)] }
 
     /// A composition placing `objects` (id, x, y); state 0x80 = epoch start.
-    static func composition(state: UInt8, objects: [(UInt16, Int, Int)], paletteUpdate: Bool = false) -> Data {
+    /// `objectFlags` per object: 0x40 forced, 0x80 cropped (a crop rectangle
+    /// of the object's own top-left 2x1 pixels follows).
+    static func composition(state: UInt8, objects: [(UInt16, Int, Int)], paletteUpdate: Bool = false,
+                            objectFlags: UInt8 = 0) -> Data {
         var body = u16(1920) + u16(1080) + [0x10] + u16(1) + [state, paletteUpdate ? 0x80 : 0, 0, UInt8(objects.count)]
         for (id, x, y) in objects {
-            body += u16(Int(id)) + [0, 0] + u16(x) + u16(y)
+            body += u16(Int(id)) + [0, objectFlags] + u16(x) + u16(y)
+            if objectFlags & 0x80 != 0 { body += u16(0) + u16(0) + u16(2) + u16(1) }
         }
         return segment(0x16, body)
     }
@@ -153,4 +157,30 @@ private let rle: [UInt8] = [1, 1, 0, 0x02, 0, 0, 0, 0xC0, 4, 2, 0, 0]
     #expect(units == 2)
     #expect(side.map(\.pid) == [0x1200, 0x1100])
     #expect(side.map(\.pts) == [1000, 3000])
+}
+
+/// A forced-only track flags every caption 0x40 (forced). Read as the cropped
+/// flag, it sent the parser looking for a crop rectangle that isn't there and
+/// every caption of the track came out empty (Baby Driver UHD, 2026-10-10).
+@Test func pgsForcedCaptionsKeepTheirObjects() throws {
+    var decoder = PGSDecoder()
+    var captions: [PGSCaption] = []
+    for segment in [PGS.composition(state: 0x80, objects: [(7, 100, 900)], objectFlags: 0x40), PGS.palette()]
+        + PGS.object(id: 7, width: 4, height: 2, rle: rle) + [PGS.end] {
+        captions += decoder.feed(pes: segment, pts: 9000)
+    }
+    let caption = try #require(captions.first)
+    #expect(!caption.isEmpty)
+    #expect(caption.bounds?.x == 100 && caption.bounds?.width == 4)
+}
+
+@Test func pgsCroppedCaptionsReadTheirCropRectangle() throws {
+    var decoder = PGSDecoder()
+    var captions: [PGSCaption] = []
+    for segment in [PGS.composition(state: 0x80, objects: [(7, 100, 900)], objectFlags: 0x80), PGS.palette()]
+        + PGS.object(id: 7, width: 4, height: 2, rle: rle) + [PGS.end] {
+        captions += decoder.feed(pes: segment, pts: 9000)
+    }
+    let caption = try #require(captions.first)
+    #expect(caption.objects.first?.crop?.width == 2)
 }

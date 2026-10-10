@@ -230,7 +230,10 @@ public struct PGSDecoder {
             for _ in 0 ..< Int(b[10]) {
                 guard i + 8 <= b.count else { break }
                 let id = UInt16(u16(i))
-                let cropped = b[i + 3] & 0x40 != 0
+                // 0x80 is the cropped flag (a crop rectangle follows);
+                // 0x40 is forced, which a forced-only track sets on every
+                // caption. Reading 0x40 as cropped dropped all of them.
+                let cropped = b[i + 3] & 0x80 != 0
                 let x = u16(i + 4), y = u16(i + 6)
                 i += 8
                 var crop: (Int, Int, Int, Int)?
