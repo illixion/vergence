@@ -71,6 +71,9 @@ public enum SpatialPreset: String, Sendable, CaseIterable, Codable {
     /// Recorded on an iPhone with spatial video capture (iPhone 15 Pro and
     /// later): its two rear cameras are about 19 mm apart.
     case iphone
+    /// Recorded on Apple Vision Pro: its cameras sit about an eye distance
+    /// apart.
+    case visionPro = "avp"
     /// A 3D film (a Blu-ray, a cinema release): shot for a screen, so the
     /// baseline is nominal, and a field of view like a good cinema seat.
     case film
@@ -83,6 +86,11 @@ public enum SpatialPreset: String, Sendable, CaseIterable, Codable {
             // The values `spatial` documents for iPhone 15 Pro-style video.
             SpatialCameraMetadata(baselineMillimeters: 19.24, horizontalFieldOfViewDegrees: 63.4,
                                   horizontalDisparityAdjustment: 0.02)
+        case .visionPro:
+            // Read from a spatial video an Apple Vision Pro (M5, visionOS
+            // 27.2) recorded.
+            SpatialCameraMetadata(baselineMillimeters: 63.664, horizontalFieldOfViewDegrees: 71.59,
+                                  horizontalDisparityAdjustment: 0.0293)
         case .film:
             SpatialCameraMetadata(baselineMillimeters: 65, horizontalFieldOfViewDegrees: 60)
         }
@@ -92,6 +100,7 @@ public enum SpatialPreset: String, Sendable, CaseIterable, Codable {
         switch self {
         case .generic: "unknown stereo footage"
         case .iphone: "iPhone spatial capture"
+        case .visionPro: "Apple Vision Pro capture"
         case .film: "3D films"
         }
     }

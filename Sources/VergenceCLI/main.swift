@@ -2,7 +2,7 @@
  Vergence - command line
 
    vergence make VIDEO|FOLDER... [--output FILE|DIR] [--layout auto|sbs|hsbs|ou|hou] [--swap-eyes]
-                 [--preset generic|iphone|film] [--baseline MM] [--hfov DEG] [--adjust -1...1]
+                 [--preset generic|iphone|avp|film] [--baseline MM] [--hfov DEG] [--adjust -1...1]
                  [--quality low|standard|high|max] [--bitrate MBPS] [--no-audio] [--dry-run] [--force]
    vergence inspect VIDEO|DISC
    vergence info DISC
@@ -109,7 +109,7 @@ func usage(_ problem: String? = nil) -> Never {
     if let problem { FileHandle.standardError.write(Data("vergence: \(problem)\n".utf8)) }
     FileHandle.standardError.write(Data("""
     usage: vergence make VIDEO|FOLDER... [--output FILE|DIR] [--layout auto|sbs|hsbs|ou|hou] [--swap-eyes]
-                         [--preset generic|iphone|film] [--baseline MM] [--hfov DEG] [--adjust -1...1]
+                         [--preset generic|iphone|avp|film] [--baseline MM] [--hfov DEG] [--adjust -1...1]
                          [--quality low|standard|high|max] [--bitrate MBPS] [--no-audio] [--dry-run] [--force]
            vergence inspect VIDEO|DISC
            vergence info DISC

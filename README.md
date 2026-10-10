@@ -102,7 +102,7 @@ swift build -c release
   only be two squeezed eyes). It says what it found and how sure it is, and skips files that
   look 2D;
 - **writes complete metadata** from a preset (`--preset generic`, the default; `iphone`;
-  `film`): camera baseline, field of view, disparity adjustment, projection and eyes.
+  `avp` for Apple Vision Pro; `film`): camera baseline, field of view, disparity adjustment, projection and eyes.
   `--baseline MM`, `--hfov DEG` and `--adjust -1...1` change single values;
 - **stretches half-resolution eyes** back to their display size;
 - **picks the bitrate** from the eye size and frame rate (`--quality low|standard|high|max`,

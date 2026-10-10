@@ -122,6 +122,13 @@ import Testing
         #expect(negative.disparityAdjustmentNormalized == -200)
     }
 
+    @Test func theVisionProPresetMatchesItsOwnRecording() {
+        let avp = SpatialPreset(rawValue: "avp")?.metadata
+        #expect(avp?.baselineMicrometers == 63_664)
+        #expect(avp?.fieldOfViewThousandthsOfDegree == 71_590)
+        #expect(avp?.disparityAdjustmentNormalized == 293)
+    }
+
     @Test func impossibleValuesAreReported() {
         var bad = SpatialPreset.generic.metadata
         bad.baselineMillimeters = 0
