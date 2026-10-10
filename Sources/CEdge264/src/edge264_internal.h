@@ -407,6 +407,7 @@ typedef struct Edge264Decoder {
 	pthread_cond_t task_ready;
 	pthread_cond_t task_progress; // signals next_deblock_addr has been updated
 	pthread_cond_t task_complete;
+	int stopping; // Vergence: set by edge264_free so the workers return and can be joined
 	Edge264Frame out;
 	
 	// general contextual fields

@@ -1,13 +1,32 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
+// Layers (see README → Layout):
+// - VergenceDisc: Blu-ray reading and MVC decoding, Foundation only, so it
+//   builds wherever Swift does (Apple platforms, Linux, Android, Windows).
+// - VergenceApple: the Apple-framework half (CoreVideo pixel buffers,
+//   AudioToolbox AC-3). Its sources are wrapped in `#if canImport(...)`, so
+//   the target exists and builds empty elsewhere and consumers need no
+//   per-platform dependency lists.
+// The tests check decoded pictures against ffmpeg's MD5. Apple platforms
+// have CryptoKit; elsewhere swift-crypto supplies the same API, fetched only
+// there (this is the manifest's host OS, the Oneiros pattern).
+var dependencies: [Package.Dependency] = []
+var testCrypto: [Target.Dependency] = []
+#if !canImport(Darwin)
+dependencies.append(.package(url: "https://github.com/apple/swift-crypto.git", "3.0.0" ..< "5.0.0"))
+testCrypto.append(.product(name: "Crypto", package: "swift-crypto"))
+#endif
+
 let package = Package(
-    name: "mvc3d",
+    name: "Vergence",
     platforms: [.macOS(.v14), .iOS(.v17), .visionOS(.v1), .tvOS(.v17)],
     products: [
-        .library(name: "MVC3D", targets: ["MVC3D"]),
-        .executable(name: "mvc3d", targets: ["mvc3d-cli"]),
+        .library(name: "VergenceDisc", targets: ["VergenceDisc"]),
+        .library(name: "VergenceApple", targets: ["VergenceApple"]),
+        .executable(name: "vergence", targets: ["VergenceCLI"]),
     ],
+    dependencies: dependencies,
     targets: [
         // edge264 (BSD-3), vendored with the patches listed in Vendor/README.md.
         // It is a unity build: edge264.c includes every other source file.
@@ -25,9 +44,11 @@ let package = Package(
                 .define("NDEBUG", .when(configuration: .release)),
             ]
         ),
-        .target(name: "MVC3D", dependencies: ["CEdge264"]),
-        .executableTarget(name: "mvc3d-cli", dependencies: ["MVC3D"]),
-        .testTarget(name: "MVC3DTests", dependencies: ["MVC3D"], resources: [.copy("Fixtures")]),
+        .target(name: "VergenceDisc", dependencies: ["CEdge264"]),
+        .target(name: "VergenceApple", dependencies: ["VergenceDisc"]),
+        .executableTarget(name: "VergenceCLI", dependencies: ["VergenceDisc", "VergenceApple"]),
+        .testTarget(name: "VergenceDiscTests", dependencies: ["VergenceDisc"] + testCrypto, resources: [.copy("Fixtures")]),
+        .testTarget(name: "VergenceAppleTests", dependencies: ["VergenceApple"]),
     ],
     cLanguageStandard: .gnu11
 )

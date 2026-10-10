@@ -258,7 +258,7 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 
 
 
-/* mvc3d: the FrameId of the picture most recently started by a slice
+/* Vergence: the FrameId of the picture most recently started by a slice
  * (edge264_get_frame reports it back), for tagging access units with their
  * timestamps. Only the thread calling edge264_decode_NAL writes it. */
 int32_t edge264_last_frame_id(const Edge264Decoder *dec) {
@@ -283,8 +283,15 @@ void edge264_free(Edge264Decoder **pdec) {
 	if (pdec != NULL && (dec = *pdec) != NULL) {
 		*pdec = NULL;
 		if (dec->n_threads) {
+			// Vergence: stop the workers and join them before destroying what
+			// they wait on. Cancelling them left glibc's pthread_cond_destroy
+			// waiting forever for the cancelled waiters (it hung on Linux).
+			pthread_mutex_lock(&dec->lock);
+			dec->stopping = 1;
+			pthread_cond_broadcast(&dec->task_ready);
+			pthread_mutex_unlock(&dec->lock);
 			for (int i = 0; i < dec->n_threads; i++)
-				pthread_cancel(dec->threads[i]);
+				pthread_join(dec->threads[i], NULL);
 			pthread_mutex_destroy(&dec->lock);
 			pthread_cond_destroy(&dec->task_ready);
 			pthread_cond_destroy(&dec->task_progress);

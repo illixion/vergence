@@ -1,10 +1,23 @@
-# mvc3d
+# Vergence
 
-Decode 3D Blu-ray video (H.264 MVC, "Stereo High") into ordinary left/right pictures, in Swift,
-on any platform Swift runs on, Apple's included.
+Stereo 3D video tools in Swift. Today: decode 3D Blu-ray video (H.264 MVC, "Stereo High") into
+ordinary left/right pictures, on any platform Swift runs on, Apple's included. Planned: making
+Apple spatial and immersive video (MV-HEVC, Apple Projected Media Profile) from any stereo source
+without typing camera parameters by hand, and 2D-to-3D conversion from estimated depth.
+
+Vergence works with decrypted discs only: a disc folder or image you have already made readable.
+It contains no AACS or BD+ code.
+
+## Layout
+
+| Module | What | Builds on |
+| --- | --- | --- |
+| `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android and Windows (planned) |
+| `VergenceApple` | The Apple-framework half: `CVPixelBuffer` output, AC-3 decoding through AudioToolbox. Re-exports `VergenceDisc`. Builds empty elsewhere. | Apple platforms |
+| `vergence` | The command line tool. | macOS, Linux (no PNG or audio output there) |
 
 No consumer platform ships an MVC decoder: Apple's VideoToolbox, Android's MediaCodec and FFmpeg
-all decode only the base view of a 3D Blu-ray and silently drop the second eye. mvc3d reads both
+all decode only the base view of a 3D Blu-ray and silently drop the second eye. Vergence reads both
 views off the disc's clip files, joins them into one MVC stream, decodes it with
 [edge264](https://github.com/tvlabs/edge264) and hands back both eyes, either as planes in memory
 or frame-packed (top-and-bottom or side by side) for an encoder.
@@ -20,9 +33,11 @@ with every timestamp one frame after the last and no errors, read from the disc 
 
 ## Tests
 
-`swift test` runs on synthetic data only. `scripts/fetch-conformance.sh` downloads the ITU-T MVC
+`swift test` runs on synthetic data only, on macOS and on Linux
+(`docker run --rm -v "$PWD":/src:ro swift:6.2.4-noble bash -c 'cp -r /src /work && cd /work && swift test'`;
+the copy keeps the container's build out of the checkout). `scripts/fetch-conformance.sh` downloads the ITU-T MVC
 conformance bitstreams (36 MB, not redistributed here);
-`MVC3D_CONFORMANCE=.build/conformance/mvc swift test` then decodes them too.
+`VERGENCE_CONFORMANCE=.build/conformance/mvc swift test` then decodes them too.
 
 Disc images (`.iso`) are read in place, without mounting, by a read-only UDF 2.50 reader
 (metadata partition included) over any `ByteSource`. `HTTPByteSource` reads one from a web server
@@ -58,33 +73,33 @@ Apple M-series Mac, both eyes of a 1080p Blu-ray:
 
 ```sh
 swift build -c release
-.build/release/mvc3d info /Volumes/DISC          # playlists; * marks the feature
-.build/release/mvc3d decode /Volumes/DISC --threads -1 \
+.build/release/vergence info /Volumes/DISC          # playlists; * marks the feature
+.build/release/vergence decode /Volumes/DISC --threads -1 \
   | ffmpeg -f rawvideo -pix_fmt yuv420p -s 1920x2160 -r 24000/1001 -i - \
            -c:v hevc_videotoolbox -q:v 65 -tag:v hvc1 film.3D.FTAB.mov
 ```
 
 `DISC` is a folder holding `BDMV`, a disc image (`.iso`), or the `http(s)` URL of one
-(`--header "Name: value"` or `MVC3D_HTTP_HEADER` for authentication). `--playlist NNNNN` picks another title; a clip pair
+(`--header "Name: value"` or `VERGENCE_HTTP_HEADER` for authentication). `--playlist NNNNN` picks another title; a clip pair
 (`decode 00007.m2ts 00008.m2ts`) works too. `--packing sbs` for side by side,
 `--seek SECONDS` to start part way in, `--start N --frames N` for a range of frames,
 `--output FILE`.
 
-`mvc3d stream DISC [--seek SECONDS]` writes the feature's main clips (base view,
+`vergence stream DISC [--seek SECONDS]` writes the feature's main clips (base view,
 audio, subtitles) as a `.m2ts` byte stream from the entry point at or before the
 seek, for tools that can read a stream but not seek in a disc image. ffmpeg's
 `bluray:` input took 75 s to start a cut an hour into a film on a home server,
 this about 2 s:
 
 ```sh
-.build/release/mvc3d stream disc.iso --seek 3600 | ffmpeg -i - -map 0:1 -c copy -f truehd audio.thd
+.build/release/vergence stream disc.iso --seek 3600 | ffmpeg -i - -map 0:1 -c copy -f truehd audio.thd
 ```
 
-`mvc3d subtitles DISC --pid 0x1203 [--output DIR]` decodes a PGS subtitle track
-(PIDs as `mvc3d streams` lists them) without the video: a line per caption with
+`vergence subtitles DISC --pid 0x1203 [--output DIR]` decodes a PGS subtitle track
+(PIDs as `vergence streams` lists them) without the video: a line per caption with
 its time and place in the frame, and with `--output` each caption as a PNG.
 
-`mvc3d audio DISC --pid 0x1101 --seek 600 --frames 20 -o out.wav` decodes an AC-3
+`vergence audio DISC --pid 0x1101 --seek 600 --frames 20 -o out.wav` decodes an AC-3
 or E-AC-3 track, or the AC-3 core of a TrueHD track, through Apple's decoder to a
 5.1 WAV (L R C LFE Ls Rs). It reads in windows of a few seconds, the way a player
 does. Against ffmpeg's decode of the same core it lines up within 32 samples, and
@@ -94,7 +109,7 @@ because it applies the stream's dynamic range compression.
 ## Library
 
 ```swift
-import MVC3D
+import VergenceApple // or VergenceDisc off Apple platforms
 
 let disc = BlurayDisc(fileSystem: DirectoryFileSystem(root: discFolder))
 let decoder = try PlaylistDecoder(disc: disc, playlist: try disc.mainPlaylist()!.playlist, threads: -1)
@@ -115,7 +130,8 @@ and `onSidePackets` hands over their PES, on the playlist timeline, as the video
 read. `PGSDecoder` turns subtitle PES (or a `.sup` file, through `SupFile`) into
 captions. They keep their bitmaps compressed until `renderRGBA()`.
 `PlaylistAudioReader` reads any window of an audio track as 5.1 PCM. It uses its
-own reads, so sound can be ready ahead of the picture.
+own reads, so sound can be ready ahead of the picture. It takes an `AudioFrameDecoder`;
+`VergenceApple` supplies `AC3Decoder` and a convenience initializer that uses it.
 
 ## License
 

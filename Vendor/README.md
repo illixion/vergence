@@ -29,9 +29,14 @@ decoder doing the actual picture decoding, MVC (Stereo High) included.
    dependent view; an earlier local patch skipping the frame_num gap process on IDR pictures
    only hid that and has been dropped.
 3. `edge264.c` / `edge264.h`: `edge264_last_frame_id()`, the FrameId the last slice started.
-   mvc3d files each access unit's PTS under it and reads it back from the output frame's
-   `FrameId`, since edge264 carries no timestamps. mvc3d-only (upstream might prefer a per-picture
+   Vergence files each access unit's PTS under it and reads it back from the output frame's
+   `FrameId`, since edge264 carries no timestamps. Vergence-only (upstream might prefer a per-picture
    user value).
+4. `edge264.c`, `edge264_headers.c`, `edge264_internal.h`: `edge264_free` stops the worker
+   threads through a `stopping` flag and joins them before destroying the mutex and condition
+   variables. Upstream cancelled them and destroyed the condition variables at once; glibc's
+   `pthread_cond_destroy` then waits for the cancelled waiters forever, so freeing a threaded
+   decoder hung on Linux (macOS returns). Found by the Linux test run; to be offered upstream.
 
 ## Known upstream issues
 
