@@ -21,9 +21,15 @@
    place before zero; a stream player times segments by the playlist, so
    it never shows.
  - Audio: the first plain AAC track, copied packet for packet, each packet in
-   the segment its time falls in. An ambisonic track is left out: it would
-   have to be re-encoded, and an encoder restarted at every seek primes
-   differently, which shows as clicks where runs join.
+   the segment its time falls in, and placed by its own source time (less
+   the priming the reader reports), not by the writer's placing against the
+   video: the writer rounds that to a video tick, which moved a run's audio
+   by up to one, so it jumped where two runs' segments joined. An ambisonic
+   track is left out: it would have to be re-encoded, and an encoder
+   restarted at every seek primes differently, which shows as clicks where
+   runs join.
+ - HDR keeps the source's colour tags, set on the encoder: it writes only
+   what it's told into the stream, whatever the pictures carry.
  */
 
 #if canImport(AVFoundation) && !os(tvOS)
@@ -119,6 +125,7 @@ public enum SideBySideSegmenter {
 
         var audioOutput: AVAssetReaderTrackOutput?
         var audioFormat: CMFormatDescription?
+        var audioLead = CMTime.zero
         if request.includeAudio {
             let infos = try await AudioTrackReader.tracks(job.source.url)
             for (track, info) in zip(try await asset.loadTracks(withMediaType: .audio), infos)
@@ -129,11 +136,19 @@ public enum SideBySideSegmenter {
                 reader.add(output)
                 audioOutput = output
                 audioFormat = format
+                audioLead = try primingLead(asset, track: track)
                 break
             }
         }
 
-        let encoder = try SegmentEncoder(width: picture.width, height: picture.height, tenBit: tenBit, hdr: hdr,
+        // The encoder tags its stream only with what it's told, whatever the
+        // pictures carry: HDR keeps the source's tags, the rest is BT.709.
+        let color: SegmentEncoder.Color = hdr
+            ? ((job.source.colorPrimaries ?? AVVideoColorPrimaries_ITU_R_2020) as CFString,
+               (job.source.transferFunction ?? AVVideoTransferFunction_SMPTE_ST_2084_PQ) as CFString,
+               (job.source.yCbCrMatrix ?? AVVideoYCbCrMatrix_ITU_R_2020) as CFString)
+            : (kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+        let encoder = try SegmentEncoder(width: picture.width, height: picture.height, tenBit: tenBit, color: color,
                                          bitsPerSecond: bitsPerSecond, frameRate: job.source.frameRate,
                                          keyFrameSeconds: request.segmentSeconds)
         defer { encoder.invalidate() }
@@ -234,8 +249,12 @@ public enum SideBySideSegmenter {
                 if let after { pendingAudio = after; break }
             }
 
-            // Where this segment's first frame plays, which the sink writes into it.
-            sink.expect(segment, CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(encoded[0]), SideBySideSegments.timeOffset))
+            // Where this segment's first frame and first audio packet play,
+            // which the sink writes into it.
+            sink.expect(segment, video: CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(encoded[0]), SideBySideSegments.timeOffset),
+                        audio: audio.first.map {
+                            CMTimeAdd(CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp($0), audioLead), SideBySideSegments.timeOffset)
+                        })
 
             // Interleaved, as the writer asks for each.
             var v = encoded[...], a = audio[...]
@@ -268,6 +287,29 @@ public enum SideBySideSegmenter {
         }
         try sink.check()
         return SideBySideSegmentsResult(segments: sink.written, frames: frames, bitsPerSecond: bitsPerSecond, audio: audioInput != nil)
+    }
+
+    /// How far an audio track's packet times, as a reader gives them, run
+    /// ahead of where the packets play: an AAC track's first buffer carries
+    /// its priming as a trim, and its output time is where the first sample
+    /// after the trim plays, so its first packet plays a trim before that.
+    static func primingLead(_ asset: AVAsset, track: AVAssetTrack) throws -> CMTime {
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        reader.add(output)
+        guard reader.startReading() else { return .zero }
+        defer { reader.cancelReading() }
+        while let sample = output.copyNextSampleBuffer() {
+            guard CMSampleBufferGetNumSamples(sample) > 0 else { continue }
+            var trim = CMTime.zero
+            if let value = CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart, attachmentModeOut: nil) {
+                let time = CMTimeMakeFromDictionary((value as! CFDictionary))
+                if time.isValid { trim = time }
+            }
+            let plays = CMTimeSubtract(CMSampleBufferGetOutputPresentationTimeStamp(sample), trim)
+            return CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(sample), plays)
+        }
+        return .zero
     }
 
     /// The packets of `sample` presented in [`from`, `at`), and the rest.
@@ -313,15 +355,13 @@ private final class SegmentSink: NSObject, AVAssetWriterDelegate, @unchecked Sen
     let done: @Sendable (Int) -> Void
     private let lock = NSLock()
     /// Per segment, where its first frame plays (track 1, the video, as it
-    /// was added first).
-    private var expected: [Int: CMTime] = [:]
+    /// was added first) and its first audio packet (track 2), if it has one.
+    private var expected: [Int: (video: CMTime, audio: CMTime?)] = [:]
     private var timescales: [UInt32: UInt32] = [:]
-    /// What the run's first segment was shifted by, which its audio keeps.
-    private var runShift: Double?
 
-    func expect(_ segment: Int, _ times: CMTime) {
+    func expect(_ segment: Int, video: CMTime, audio: CMTime?) {
         lock.lock()
-        expected[segment] = times
+        expected[segment] = (video, audio)
         lock.unlock()
     }
 
@@ -347,9 +387,14 @@ private final class SegmentSink: NSObject, AVAssetWriterDelegate, @unchecked Sen
                 let time = expected.removeValue(forKey: next)
                 lock.unlock()
                 guard let time, let scale = timescales[1] else { throw SpatialVideoError.writer("segment \(next) came out of nowhere") }
-                let shift = try FragmentTimes.retime(&segment, track: 1, to: CMTimeConvertScale(time, timescale: Int32(scale), method: .roundHalfAwayFromZero).value,
-                                                     timescales: timescales, othersBy: runShift)
-                if runShift == nil { runShift = shift }
+                func ticks(_ time: CMTime, _ scale: UInt32) -> Int64 {
+                    CMTimeConvertScale(time, timescale: Int32(scale), method: .roundHalfAwayFromZero).value
+                }
+                // Each track to its own time, the other left where it is.
+                try FragmentTimes.retime(&segment, track: 1, to: ticks(time.video, scale), timescales: timescales, othersBy: 0)
+                if let audio = time.audio, let audioScale = timescales[2], FragmentTimes.firstPresentation(segment)[2] != nil {
+                    try FragmentTimes.retime(&segment, track: 2, to: ticks(audio, audioScale), timescales: timescales, othersBy: 0)
+                }
                 FragmentTimes.renumber(&segment, segment: next)
                 try place(segment, at: directory.appendingPathComponent(SideBySideSegments.segmentName(next)))
                 written.append(next)
@@ -378,7 +423,9 @@ private final class SegmentEncoder: @unchecked Sendable {
     private var output: [CMSampleBuffer] = []
     private var failure: OSStatus = noErr
 
-    init(width: Int, height: Int, tenBit: Bool, hdr: Bool, bitsPerSecond: Int, frameRate: Double, keyFrameSeconds: Double) throws {
+    typealias Color = (primaries: CFString, transfer: CFString, matrix: CFString)
+
+    init(width: Int, height: Int, tenBit: Bool, color: Color, bitsPerSecond: Int, frameRate: Double, keyFrameSeconds: Double) throws {
         var made: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_HEVC,
@@ -394,11 +441,9 @@ private final class SegmentEncoder: @unchecked Sendable {
         set(kVTCompressionPropertyKey_ExpectedFrameRate, (frameRate > 0 ? frameRate : 30) as CFNumber)
         // Keyframes are forced at every segment; this only bounds a long one.
         set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, keyFrameSeconds * 2 as CFNumber)
-        if !hdr {
-            set(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2)
-            set(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2)
-            set(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)
-        }
+        set(kVTCompressionPropertyKey_ColorPrimaries, color.primaries)
+        set(kVTCompressionPropertyKey_TransferFunction, color.transfer)
+        set(kVTCompressionPropertyKey_YCbCrMatrix, color.matrix)
         VTCompressionSessionPrepareToEncodeFrames(made)
     }
 
