@@ -242,8 +242,14 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 					if (i == n_threads) {
 						return dec;
 					}
+					// Vergence: stop and join the started workers (Android's
+					// Bionic has no pthread_cancel; see edge264_free).
+					pthread_mutex_lock(&dec->lock);
+					dec->stopping = 1;
+					pthread_cond_broadcast(&dec->task_ready);
+					pthread_mutex_unlock(&dec->lock);
 					while (i-- > 0)
-						pthread_cancel(dec->threads[i]);
+						pthread_join(dec->threads[i], NULL);
 					pthread_cond_destroy(&dec->task_complete);
 				}
 				pthread_cond_destroy(&dec->task_progress);

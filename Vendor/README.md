@@ -37,6 +37,8 @@ decoder doing the actual picture decoding, MVC (Stereo High) included.
    variables. Upstream cancelled them and destroyed the condition variables at once; glibc's
    `pthread_cond_destroy` then waits for the cancelled waiters forever, so freeing a threaded
    decoder hung on Linux (macOS returns). Found by the Linux test run; to be offered upstream.
+   `edge264_alloc`'s cleanup after a failed thread start does the same, which removes edge264's
+   last `pthread_cancel`: Android's Bionic doesn't have it.
 
 ## Known upstream issues
 

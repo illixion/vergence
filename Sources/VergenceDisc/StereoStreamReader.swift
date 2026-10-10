@@ -10,6 +10,9 @@
  */
 
 import Foundation
+#if canImport(Android)
+import Android // open, pread: Android's Foundation doesn't re-export them
+#endif
 
 /// Random-access bytes: a local file now; an HTTP range reader or a disc
 /// image's file later.
@@ -40,8 +43,10 @@ public final class FileByteSource: ByteSource {
     }
 
     public func read(at offset: Int64, count: Int) throws -> Data {
+        // An empty buffer has no address, and Bionic's pread takes a non-null one.
+        guard count > 0 else { return Data() }
         var data = Data(count: count)
-        let read = data.withUnsafeMutableBytes { pread(descriptor, $0.baseAddress, count, off_t(offset)) }
+        let read = data.withUnsafeMutableBytes { pread(descriptor, $0.baseAddress!, count, off_t(offset)) }
         guard read >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         data.count = read
         return data

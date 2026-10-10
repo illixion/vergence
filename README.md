@@ -12,7 +12,7 @@ It contains no AACS or BD+ code.
 
 | Module | What | Builds on |
 | --- | --- | --- |
-| `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android and Windows (planned) |
+| `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
 | `VergenceApple` | The Apple-framework half: `CVPixelBuffer` output, AC-3 decoding through AudioToolbox. Re-exports `VergenceDisc`. Builds empty elsewhere. | Apple platforms |
 | `vergence` | The command line tool. | macOS, Linux (no PNG or audio output there) |
 
@@ -35,7 +35,9 @@ with every timestamp one frame after the last and no errors, read from the disc 
 
 `swift test` runs on synthetic data only, on macOS and on Linux
 (`docker run --rm -v "$PWD":/src:ro swift:6.2.4-noble bash -c 'cp -r /src /work && cd /work && swift test'`;
-the copy keeps the container's build out of the checkout). `scripts/fetch-conformance.sh` downloads the ITU-T MVC
+the copy keeps the container's build out of the checkout). `scripts/build-android.sh` cross-compiles
+for Android arm64 with the open-source toolchain and its Android SDK bundle; nothing runs on a device
+yet. `scripts/fetch-conformance.sh` downloads the ITU-T MVC
 conformance bitstreams (36 MB, not redistributed here);
 `VERGENCE_CONFORMANCE=.build/conformance/mvc swift test` then decodes them too.
 
