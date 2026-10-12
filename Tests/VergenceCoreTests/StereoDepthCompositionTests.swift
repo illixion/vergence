@@ -75,3 +75,69 @@ struct StereoDepthCompositionTests {
         #expect(tracker.current?.start == 2)
     }
 }
+
+@Suite struct DepthGapCompressorTests {
+    /// 256 bins over 0…1 with the given shares of pixels at the given depths.
+    private func bins(_ spread: [(depth: Float, share: Float)], pixels: Float = 100_000) -> [UInt32] {
+        var b = [UInt32](repeating: 0, count: 256)
+        for (d, share) in spread { b[min(255, Int(d * 256))] += UInt32(share * pixels) }
+        return b
+    }
+
+    @Test func nearSubjectBeforeFarBackgroundIsSqueezed() {
+        var c = DepthGapCompressor()
+        // Background at 0–0.15, subject at 0.85–1, a thin outline ramp between.
+        var spread: [(Float, Float)] = []
+        for i in 0..<15 { spread.append((Float(i) / 100, 0.65 / 15)) }
+        for i in 85..<100 { spread.append((Float(i) / 100, 0.3 / 15)) }
+        for i in 15..<85 { spread.append((Float(i) / 100, 0.05 / 70)) }
+        let curve = c.update(bins: bins(spread), lo: 0, hi: 1, mapping: .identity, dt: 1 / 30, cut: true)
+        #expect(curve.span < 0.6)
+        #expect(abs(curve.apply(1) - 1) < 1e-5)                  // the near end stays on the glass
+        // The subject keeps its own roundness.
+        #expect(abs((curve.apply(0.99) - curve.apply(0.88)) - 0.11) < 0.02)
+        // Monotone.
+        var last = -Float.infinity
+        for i in 0...100 { let v = curve.apply(Float(i) / 100); #expect(v >= last); last = v }
+    }
+
+    @Test func depthSpreadThroughTheRoomIsLeftAlone() {
+        var c = DepthGapCompressor()
+        let spread = (0..<100).map { (Float($0) / 100, Float(0.01)) }
+        let curve = c.update(bins: bins(spread), lo: 0, hi: 1, mapping: .identity, dt: 1 / 30, cut: true)
+        #expect(abs(curve.span - 1) < 1e-4)
+    }
+
+    @Test func curveFollowsTheShotSlowlyAndRestartsAtACut() {
+        var c = DepthGapCompressor()
+        let room = bins((0..<100).map { (Float($0) / 100, Float(0.01)) })
+        var gap: [(Float, Float)] = []
+        for i in 0..<15 { gap.append((Float(i) / 100, 0.7 / 15)) }
+        for i in 85..<100 { gap.append((Float(i) / 100, 0.3 / 15)) }
+        let split = bins(gap)
+        _ = c.update(bins: room, lo: 0, hi: 1, mapping: .identity, dt: 1 / 30, cut: true)
+        let soon = c.update(bins: split, lo: 0, hi: 1, mapping: .identity, dt: 1 / 30, cut: false)
+        #expect(soon.span > 0.95)                                // one frame barely moves it
+        let atCut = c.update(bins: split, lo: 0, hi: 1, mapping: .identity, dt: 1 / 30, cut: true)
+        #expect(atCut.span < 0.6)
+    }
+
+    /// A thin near object (a rail) is the only thing near: the rest of the
+    /// picture must come forward rather than carry the full shift.
+    @Test func sparseNearTailIsSqueezedToo() {
+        var c = DepthGapCompressor()
+        var spread: [(Float, Float)] = []
+        for i in 0..<8 { spread.append((Float(i) / 100, 0.96 / 8)) }
+        for i in 30..<100 { spread.append((Float(i) / 100, 0.04 / 70)) }
+        let curve = c.update(bins: bins(spread), lo: 0, hi: 1, mapping: .identity, dt: 1 / 30, cut: true)
+        #expect(abs(curve.apply(1) - 1) < 1e-5)
+        #expect(curve.apply(0.04) > 0.5)
+    }
+
+    @Test func outsideTheRangeTheSlopeIsOne() {
+        let curve = DepthGapCurve(knots: (0...32).map { 0.5 + Float($0) / 64 })
+        #expect(abs(curve.apply(1.2) - 1.2) < 1e-5)
+        #expect(abs(curve.apply(-0.1) - 0.4) < 1e-5)
+        #expect(abs(curve.apply(0.5) - 0.75) < 1e-5)
+    }
+}

@@ -61,6 +61,18 @@ public enum DepthRefinement {
     /// Mean luma change across the frame that reads as a hard cut, regardless
     /// of what the depth histogram says (realtime has no lookahead to confirm).
     public static let cutMeanLumaDelta: Float = 0.12
+
+    /// Snap soft depth outlines to the picture (realtime refined depth; see
+    /// `depthEdgeSnap`). On by default; a debug switch for comparing.
+    nonisolated(unsafe) public static var snapsEdges = true
+    /// Fill the strips a near subject uncovers with the background beside
+    /// them, instead of stretching the outline across them (the mesh warp; see
+    /// `meshEdgeFill`). On by default; a debug switch for comparing.
+    nonisolated(unsafe) public static var fillsUncoveredEdges = true
+    /// Squeeze the empty depth between a near subject and a far background
+    /// out of each shot (realtime refined depth; see `DepthGapCompressor`).
+    /// On by default; a debug switch for comparing.
+    nonisolated(unsafe) public static var compressesGaps = true
 }
 
 /// `y = a·x + b`.

@@ -65,6 +65,8 @@ struct VideoStereoUniforms {
     var depthValueScale: Float
     var depthValueBias: Float
     var depthBudget: SIMD2<Float>
+    var edgeFill: Float = 0
+    var pad0: Float = 0
 }
 
 // MARK: - StereoPump (off-main: decode -> warp -> enqueue)
@@ -390,7 +392,15 @@ public final class StereoPump: @unchecked Sendable {
         guard videoRenderer.isReadyForMoreMediaData, let textureCache else { return }
 
         let hostTime = CACurrentMediaTime()
-        guard let frame = frameSource.nextFrame(hostTime: hostTime) else { return }
+        guard let frame = frameSource.nextFrame(hostTime: hostTime) else {
+            // A paused picture draws nothing new; a capture (debug server)
+            // gets the last frame drawn again instead.
+            if StereoEyeCapture.isRequested, !pictureUnshowable {
+                if StereoEyeCapture.recomputesDepth { depthSource?.recomputeNextDepth() }
+                reshowLastFrame()
+            }
+            return
+        }
         if !checkedPicture {
             checkedPicture = true
             if DolbyVisionFrames.needsSystemRenderer(frame.pixelBuffer) {
@@ -518,6 +528,8 @@ public final class StereoPump: @unchecked Sendable {
         // The depth budget keeps depth inside [0, 1], so no warped pixel shifts further than
         // (1 - convergence) × strength; the margin in front of that keeps the
         // strength the ramp is heading for, so text doesn't sink mid-ramp.
+        let capture = StereoEyeCapture.takeRequest()
+            ? StereoEyeCapture.encodeDepthReadback(frameDepth, device: device, commandBuffer: cmdBuf) : nil
         subtitles?.encode(
             left: leftTex, right: rightTex, packed: layout != nil && !cfg.isFlat,
             maxContentShift: (1 - cfg.convergence) * cfg.depthStrength,
@@ -529,6 +541,12 @@ public final class StereoPump: @unchecked Sendable {
         // must complete before VTPixelTransferSession reads the BGRA surfaces.
         cmdBuf.waitUntilCompleted()
         subtitles?.didComplete()
+        if let capture {
+            StereoEyeCapture.deliver(.init(
+                left: leftBGRA, right: rightBGRA, source: src, depth: capture.read(),
+                itemSeconds: itemTime.seconds, depthStrength: cfg.depthStrength, convergence: cfg.convergence
+            ))
+        }
         signposter.endInterval("pump-warp", warpState)
         let warpDone = CACurrentMediaTime()
 
@@ -634,7 +652,8 @@ public final class StereoPump: @unchecked Sendable {
             depthUVOffset: depth?.uvOffset ?? SIMD2(0, 0),
             depthValueScale: depth?.valueScale ?? 1,
             depthValueBias: depth?.valueBias ?? 0,
-            depthBudget: (depth?.budget ?? .legacy).knees
+            depthBudget: (depth?.budget ?? .legacy).knees,
+            edgeFill: DepthRefinement.fillsUncoveredEdges ? 1 : 0
         )
 
         // With a real depth map: occlusion-correct depth-displaced mesh. Without
@@ -675,6 +694,7 @@ public final class StereoPump: @unchecked Sendable {
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<VideoStereoUniforms>.size, index: 1)
             encoder.setVertexTexture(depth.texture, index: 0)
             encoder.setFragmentTexture(source, index: 0)
+            encoder.setFragmentTexture(depth.texture, index: 1)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VideoStereoUniforms>.size, index: 0)
             encoder.drawIndexedPrimitives(
                 type: .triangle, indexCount: dense ? warp.denseGridIndexCount : warp.gridIndexCount,

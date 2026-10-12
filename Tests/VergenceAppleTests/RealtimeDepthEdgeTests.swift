@@ -13,7 +13,7 @@ import Testing
 /// hard-stepped map at model resolution puts that crossing on depth texel
 /// boundaries (~3.7 video px at 1080p) and a smooth edge stairsteps; the
 /// guided upsample has to pull it back onto the image edge.
-@Suite("Realtime depth edges")
+@Suite("Realtime depth edges", .serialized)
 struct RealtimeDepthEdgeTests {
     static let videoWidth = 1920, videoHeight = 1080
     static let depthWidth = 518, depthHeight = 392
@@ -100,8 +100,304 @@ struct RealtimeDepthEdgeTests {
         #expect(wobbleRMS < 0.5)
     }
 
+    /// The model draws outlines soft: depth ramps from subject to background
+    /// over several of its texels. The warp stretches the picture across that
+    /// whole ramp, so the edge snap must turn it back into a step on the
+    /// image edge (and leave it alone when switched off).
+    @Test func softOutlineIsSnappedToTheImageEdge() throws {
+        guard let metal = RAVEMediaMetal.shared else { return }
+        // The snap alone: the gap curve would squeeze the disc's step too.
+        let compressed = DepthRefinement.compressesGaps
+        DepthRefinement.compressesGaps = false
+        defer { DepthRefinement.compressesGaps = compressed }
+        let device = metal.device
+        let queue = try #require(device.makeCommandQueue())
+        var cache: CVMetalTextureCache?
+        CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
+        let textureCache = try #require(cache)
+        // Low contrast, as a subject against a similar background is in film:
+        // the refiner's luma-guided bilateral sharpens a high-contrast edge by
+        // itself, so only a faint one shows what the snap adds.
+        let frame = try #require(Self.discFrame(inside: 0.5, outside: 0.42))
+        // Ramp over 6 model texels (~22 video px), centred on the edge.
+        let raw = try #require(Self.discDepth(device: device, rampTexels: 6))
+
+        func rampWidth(snapping: Bool) throws -> (width: Float, centre: Float) {
+            let saved = DepthRefinement.snapsEdges
+            DepthRefinement.snapsEdges = snapping
+            defer { DepthRefinement.snapsEdges = saved }
+            let refiner = try #require(RealtimeDepthRefiner(device: device, commandQueue: queue, textureCache: textureCache))
+            var out: MTLTexture?
+            for i in 0..<4 { out = refiner.refine(raw: raw, frame: frame, frameSeconds: Double(i) / 30) }
+            let depth = try #require(out)
+            let (w, h, values) = try #require(Self.read(depth, device: device, queue: queue))
+            let uv = CoreMLDepthProvider.letterboxUVTransform(
+                videoWidth: Self.videoWidth, videoHeight: Self.videoHeight, depthWidth: w, depthHeight: h
+            )
+            // Along the middle row, video px → nearest depth texel.
+            func at(_ x: Float) -> Float {
+                let u = (x + 0.5) / Float(Self.videoWidth) * uv.scale.x + uv.offset.x
+                let v = (Self.center.y + 0.5) / Float(Self.videoHeight) * uv.scale.y + uv.offset.y
+                let i = max(0, min(w - 1, Int(u * Float(w)))), j = max(0, min(h - 1, Int(v * Float(h))))
+                return values[j * w + i]
+            }
+            let edge = Self.center.x + Self.radius
+            let fg = at(Self.center.x), bg = at(edge + 80)
+            var hi: Float?, lo: Float?, mid: Float?
+            var x = edge - 60
+            while x < edge + 60 {
+                let t = (at(x) - bg) / max(fg - bg, 1e-6)
+                if hi == nil, t < 0.9 { hi = x }
+                if mid == nil, t < 0.5 { mid = x }
+                if lo == nil, t < 0.1 { lo = x }
+                x += 0.5
+            }
+            return ((lo ?? x) - (hi ?? x), (mid ?? x) - edge)
+        }
+        let soft = try rampWidth(snapping: false)
+        let snapped = try rampWidth(snapping: true)
+        print(String(format: "soft outline ramp 10–90%%: %.1f px unsnapped, %.1f px snapped (centre %.1f / %.1f px from the edge)",
+                     soft.width, snapped.width, soft.centre, snapped.centre))
+        #expect(soft.width > 10)
+        #expect(snapped.width < soft.width / 2)
+        #expect(abs(snapped.centre) < 3)
+    }
+
+    /// A thin near rail on pale ground with dark steps right under it, the
+    /// model's depth soft above and below the rail (Nope's corral). The steps'
+    /// top rows must not keep the rail's depth (they shear like a smudge), and
+    /// the rail must stay near.
+    @Test func stepsUnderANearRailKeepTheirOwnDepth() throws {
+        guard let metal = RAVEMediaMetal.shared else { return }
+        let compressed = DepthRefinement.compressesGaps
+        DepthRefinement.compressesGaps = false
+        defer { DepthRefinement.compressesGaps = compressed }
+        let device = metal.device
+        let queue = try #require(device.makeCommandQueue())
+        var cache: CVMetalTextureCache?
+        CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
+        let textureCache = try #require(cache)
+        let railTop: Float = 500, railBottom: Float = 530
+        let steps = (x: Float(900)...Float(1000), y: railBottom...Float(600))
+        let frame = try #require(Self.frame { x, y in
+            if (railTop..<railBottom).contains(y) { return 0.35 }
+            if steps.x.contains(x), steps.y.contains(y) { return 0.12 }
+            return 0.7
+        })
+        let raw = try #require(Self.depth(device: device) { _, y in
+            let outside = max(0, max(railTop - y, y - railBottom))
+            return 0.2 + 0.8 * max(0, 1 - outside / 30)
+        })
+
+        func sample(snapping: Bool) throws -> (stepsTop: Float, railCore: Float) {
+            let saved = DepthRefinement.snapsEdges
+            DepthRefinement.snapsEdges = snapping
+            defer { DepthRefinement.snapsEdges = saved }
+            let refiner = try #require(RealtimeDepthRefiner(device: device, commandQueue: queue, textureCache: textureCache))
+            var out: MTLTexture?
+            for i in 0..<4 { out = refiner.refine(raw: raw, frame: frame, frameSeconds: Double(i) / 30) }
+            let depth = try #require(out)
+            let (w, h, values) = try #require(Self.read(depth, device: device, queue: queue))
+            func at(_ x: Float, _ y: Float) -> Float {
+                let i = max(0, min(w - 1, Int(x / Float(Self.videoWidth) * Float(w))))
+                let j = max(0, min(h - 1, Int(y / Float(Self.videoHeight) * Float(h))))
+                return values[j * w + i]
+            }
+            let near = at(400, 515), far = at(400, 800)
+            func t(_ v: Float) -> Float { (v - far) / max(near - far, 1e-6) }
+            var top: Float = 0, n: Float = 0
+            for y in stride(from: railBottom + 3, to: railBottom + 18, by: 2) {
+                for x in stride(from: Float(920), to: 980, by: 6) { top += t(at(x, y)); n += 1 }
+            }
+            return (top / n, t(at(950, 515)))
+        }
+        let soft = try sample(snapping: false)
+        let snapped = try sample(snapping: true)
+        print(String(format: "steps under a rail, top rows: %.2f of the rail's depth unsnapped, %.2f snapped; rail core %.2f",
+                     soft.stepsTop, snapped.stepsTop, snapped.railCore))
+        #expect(soft.stepsTop > 0.3)
+        #expect(snapped.stepsTop < soft.stepsTop / 2)
+        #expect(snapped.railCore > 0.85)
+    }
+
+    /// Ground running off to the horizon: depth falls gently from the bottom
+    /// of the frame to the top, with dark tufts on pale ground. Not an outline,
+    /// so the snap must leave it as it is (it once pushed the tufts far, as
+    /// speckles).
+    @Test func slopingGroundIsLeftAlone() throws {
+        guard let metal = RAVEMediaMetal.shared else { return }
+        let compressed = DepthRefinement.compressesGaps
+        DepthRefinement.compressesGaps = false
+        defer { DepthRefinement.compressesGaps = compressed }
+        let device = metal.device
+        let queue = try #require(device.makeCommandQueue())
+        var cache: CVMetalTextureCache?
+        CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
+        let textureCache = try #require(cache)
+        let frame = try #require(Self.frame { x, y in
+            // Tufts: 12 px dark blobs on a 40 px lattice.
+            let fx = x.truncatingRemainder(dividingBy: 40) - 20, fy = y.truncatingRemainder(dividingBy: 40) - 20
+            return fx * fx + fy * fy < 36 ? 0.2 : 0.7
+        })
+        let raw = try #require(Self.depth(device: device) { _, y in 0.1 + 0.9 * y / Float(Self.videoHeight) })
+
+        func values(snapping: Bool) throws -> [Float] {
+            let saved = DepthRefinement.snapsEdges
+            DepthRefinement.snapsEdges = snapping
+            defer { DepthRefinement.snapsEdges = saved }
+            let refiner = try #require(RealtimeDepthRefiner(device: device, commandQueue: queue, textureCache: textureCache))
+            var out: MTLTexture?
+            for i in 0..<4 { out = refiner.refine(raw: raw, frame: frame, frameSeconds: Double(i) / 30) }
+            let depth = try #require(out)
+            return try #require(Self.read(depth, device: device, queue: queue)).2
+        }
+        let soft = try values(snapping: false), snapped = try values(snapping: true)
+        let lo = soft.min() ?? 0, hi = soft.max() ?? 1
+        let worst = zip(soft, snapped).map { abs($0 - $1) }.max() ?? 0
+        print(String(format: "sloping ground: snap moved depth by at most %.3f of the range", worst / max(hi - lo, 1e-6)))
+        #expect(worst / max(hi - lo, 1e-6) < 0.02)
+    }
+
+    /// A dark cap with a lit rim in front of dark trees (Nope, walking away):
+    /// inside the cap the colour matches the trees, but the rim stands between
+    /// them, so the snap must not cut a far hole into the cap.
+    @Test func darkSubjectBeforeDarkBackgroundKeepsItsInside() throws {
+        guard let metal = RAVEMediaMetal.shared else { return }
+        let compressed = DepthRefinement.compressesGaps
+        DepthRefinement.compressesGaps = false
+        defer { DepthRefinement.compressesGaps = compressed }
+        let device = metal.device
+        let queue = try #require(device.makeCommandQueue())
+        var cache: CVMetalTextureCache?
+        CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
+        let textureCache = try #require(cache)
+        let frame = try #require(Self.frame { x, y in
+            let r = simd_length(SIMD2<Float>(x, y) - Self.center)
+            if r > Self.radius { return 0.25 }
+            return r > Self.radius - 6 ? 0.6 : 0.27
+        })
+        let raw = try #require(Self.discDepth(device: device, rampTexels: 10))
+
+        func inside(snapping: Bool) throws -> Float {
+            let saved = DepthRefinement.snapsEdges
+            DepthRefinement.snapsEdges = snapping
+            defer { DepthRefinement.snapsEdges = saved }
+            let refiner = try #require(RealtimeDepthRefiner(device: device, commandQueue: queue, textureCache: textureCache))
+            var out: MTLTexture?
+            for i in 0..<4 { out = refiner.refine(raw: raw, frame: frame, frameSeconds: Double(i) / 30) }
+            let depth = try #require(out)
+            let (w, h, values) = try #require(Self.read(depth, device: device, queue: queue))
+            func at(_ x: Float, _ y: Float) -> Float {
+                values[max(0, min(h - 1, Int(y / Float(Self.videoHeight) * Float(h)))) * w
+                       + max(0, min(w - 1, Int(x / Float(Self.videoWidth) * Float(w))))]
+            }
+            let near = at(Self.center.x, Self.center.y), far = at(Self.center.x + Self.radius + 120, Self.center.y)
+            // The least near texel 8–24 px inside the rim, along the middle row.
+            var worst: Float = 1
+            for dx in stride(from: Float(14), to: 30, by: 1) {
+                worst = min(worst, (at(Self.center.x + Self.radius - dx, Self.center.y) - far) / max(near - far, 1e-6))
+            }
+            return worst
+        }
+        let soft = try inside(snapping: false), snapped = try inside(snapping: true)
+        print(String(format: "dark cap before dark trees, just inside the rim: %.2f near unsnapped, %.2f snapped", soft, snapped))
+        #expect(snapped > soft - 0.05)
+    }
+
+    /// A tan glove before tan hills, with the white horse below it (Nope):
+    /// the model's depth is soft across the glove's top, and the glove is
+    /// coloured like the hills, not like what is near below it. It must keep
+    /// its top.
+    @Test func nearObjectColouredLikeTheBackgroundKeepsItsTop() throws {
+        guard let metal = RAVEMediaMetal.shared else { return }
+        let compressed = DepthRefinement.compressesGaps
+        DepthRefinement.compressesGaps = false
+        defer { DepthRefinement.compressesGaps = compressed }
+        let device = metal.device
+        let queue = try #require(device.makeCommandQueue())
+        var cache: CVMetalTextureCache?
+        CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
+        let textureCache = try #require(cache)
+        let gloveTop: Float = 500, gloveBottom: Float = 600
+        let frame = try #require(Self.frame { x, y in
+            if y < gloveTop { return 0.6 }                                  // hills
+            if y < gloveBottom, (800...1100).contains(x) { return 0.62 }    // glove
+            return y < gloveBottom ? 0.6 : 0.9                              // hills beside it, horse below
+        })
+        let raw = try #require(Self.depth(device: device) { x, y in
+            let near = (800...1100).contains(x) ? max(0, min(1, (y - gloveTop) / 30 + 0.5)) : (y >= gloveBottom ? 1 : 0)
+            return 0.2 + 0.8 * near
+        })
+        func top(snapping: Bool) throws -> Float {
+            let saved = DepthRefinement.snapsEdges
+            DepthRefinement.snapsEdges = snapping
+            defer { DepthRefinement.snapsEdges = saved }
+            let refiner = try #require(RealtimeDepthRefiner(device: device, commandQueue: queue, textureCache: textureCache))
+            var out: MTLTexture?
+            for i in 0..<4 { out = refiner.refine(raw: raw, frame: frame, frameSeconds: Double(i) / 30) }
+            let depth = try #require(out)
+            let (w, h, values) = try #require(Self.read(depth, device: device, queue: queue))
+            func at(_ x: Float, _ y: Float) -> Float {
+                values[max(0, min(h - 1, Int(y / Float(Self.videoHeight) * Float(h)))) * w
+                       + max(0, min(w - 1, Int(x / Float(Self.videoWidth) * Float(w))))]
+            }
+            let near = at(950, 580), far = at(950, 300)
+            var sum: Float = 0, n: Float = 0
+            for y in stride(from: gloveTop + 2, to: gloveTop + 14, by: 2) {
+                for x in stride(from: Float(860), to: 1040, by: 12) { sum += (at(x, y) - far) / max(near - far, 1e-6); n += 1 }
+            }
+            return sum / n
+        }
+        let soft = try top(snapping: false), snapped = try top(snapping: true)
+        print(String(format: "glove before hills, its top rows: %.2f near unsnapped, %.2f snapped", soft, snapped))
+        #expect(snapped >= soft - 0.05)
+    }
+
+    /// A full-HD BGRA frame, grey from `value(x, y)` (video pixels).
+    static func frame(_ value: (Float, Float) -> Float) -> CVPixelBuffer? {
+        var pb: CVPixelBuffer?
+        let attrs: [CFString: Any] = [kCVPixelBufferMetalCompatibilityKey: true, kCVPixelBufferIOSurfacePropertiesKey: [:]]
+        guard CVPixelBufferCreate(nil, videoWidth, videoHeight, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb) == kCVReturnSuccess,
+              let pb else { return nil }
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
+        let stride = CVPixelBufferGetBytesPerRow(pb)
+        for y in 0..<videoHeight {
+            let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self)
+            for x in 0..<videoWidth {
+                let v = UInt8(max(0, min(1, value(Float(x) + 0.5, Float(y) + 0.5))) * 255)
+                row[x * 4] = v; row[x * 4 + 1] = v; row[x * 4 + 2] = v; row[x * 4 + 3] = 255
+            }
+        }
+        return pb
+    }
+
+    /// Model-resolution depth from `value(x, y)` in video pixels.
+    static func depth(device: MTLDevice, _ value: (Float, Float) -> Float) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: depthWidth, height: depthHeight, mipmapped: false)
+        desc.usage = [.shaderRead]
+        guard let texture = device.makeTexture(descriptor: desc) else { return nil }
+        let uv = CoreMLDepthProvider.letterboxUVTransform(
+            videoWidth: videoWidth, videoHeight: videoHeight, depthWidth: depthWidth, depthHeight: depthHeight
+        )
+        var values = [Float16](repeating: 0, count: depthWidth * depthHeight)
+        for j in 0..<depthHeight {
+            for i in 0..<depthWidth {
+                let u = (Float(i) + 0.5) / Float(depthWidth), v = (Float(j) + 0.5) / Float(depthHeight)
+                let x = (u - uv.offset.x) / uv.scale.x * Float(videoWidth), y = (v - uv.offset.y) / uv.scale.y * Float(videoHeight)
+                values[j * depthWidth + i] = Float16(value(x, y))
+            }
+        }
+        values.withUnsafeBytes {
+            texture.replace(region: MTLRegionMake2D(0, 0, depthWidth, depthHeight), mipmapLevel: 0,
+                            withBytes: $0.baseAddress!, bytesPerRow: depthWidth * 2)
+        }
+        return texture
+    }
+
     /// Anti-aliased white disc on grey, BGRA, full HD.
-    static func discFrame() -> CVPixelBuffer? {
+    static func discFrame(inside: Float = 0.95, outside: Float = 0.25) -> CVPixelBuffer? {
         var pb: CVPixelBuffer?
         let attrs: [CFString: Any] = [kCVPixelBufferMetalCompatibilityKey: true, kCVPixelBufferIOSurfacePropertiesKey: [:]]
         guard CVPixelBufferCreate(nil, videoWidth, videoHeight, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb) == kCVReturnSuccess,
@@ -115,7 +411,7 @@ struct RealtimeDepthEdgeTests {
             for x in 0..<videoWidth {
                 let d = simd_length(SIMD2<Float>(Float(x) + 0.5, Float(y) + 0.5) - center)
                 let coverage = max(0, min(1, radius - d + 0.5))
-                let v = UInt8((0.25 + 0.7 * coverage) * 255)
+                let v = UInt8((outside + (inside - outside) * coverage) * 255)
                 row[x * 4] = v; row[x * 4 + 1] = v; row[x * 4 + 2] = v; row[x * 4 + 3] = 255
             }
         }
@@ -123,7 +419,7 @@ struct RealtimeDepthEdgeTests {
     }
 
     /// The model's view of it: a hard near/far step on the depth texel lattice.
-    static func discDepth(device: MTLDevice) -> MTLTexture? {
+    static func discDepth(device: MTLDevice, rampTexels: Float = 0) -> MTLTexture? {
         let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: depthWidth, height: depthHeight, mipmapped: false)
         desc.usage = [.shaderRead]
         guard let texture = device.makeTexture(descriptor: desc) else { return nil }
@@ -135,7 +431,10 @@ struct RealtimeDepthEdgeTests {
             for i in 0..<depthWidth {
                 let u = (Float(i) + 0.5) / Float(depthWidth), v = (Float(j) + 0.5) / Float(depthHeight)
                 let video = SIMD2((u - uv.offset.x) / uv.scale.x * Float(videoWidth), (v - uv.offset.y) / uv.scale.y * Float(videoHeight))
-                values[j * depthWidth + i] = simd_length(video - center) < radius ? 1.0 : 0.2
+                // Signed distance from the edge in depth texels (positive inside).
+                let inside = (radius - simd_length(video - center)) / Float(videoWidth) * Float(depthWidth) / uv.scale.x
+                let t: Float = rampTexels > 0 ? max(0, min(1, inside / rampTexels + 0.5)) : (inside > 0 ? 1 : 0)
+                values[j * depthWidth + i] = Float16(0.2 + 0.8 * t)
             }
         }
         values.withUnsafeBytes {

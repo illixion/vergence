@@ -89,6 +89,14 @@ public protocol PumpDepthSource: AnyObject {
     var prefersDenseWarpGrid: Bool { get }
     /// Release decode/GPU resources; the pump is shutting down.
     func invalidate()
+    /// Drop any held map so the next request computes it afresh, as if the
+    /// frame were the first of a shot (a paused picture captured for the debug
+    /// server, so a changed setting shows on it).
+    func recomputeNextDepth()
+}
+
+extension PumpDepthSource {
+    public func recomputeNextDepth() {}
 }
 
 /// Which pipeline a depth model is being loaded for. The preference is split:
@@ -176,6 +184,12 @@ public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
 
     public func invalidate() {
         held = nil
+    }
+
+    public func recomputeNextDepth() {
+        held = nil
+        heldItemSeconds = -.infinity
+        provider.resetRefinement()
     }
 }
 
@@ -549,6 +563,12 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
     /// `DepthBudget.studio`. `frameSeconds` is the frame's media time; a jump
     /// back or of more than half a second restarts the lock. Nil on failure
     /// (the pump renders that frame flat). Same threading rule as `depth(for:)`.
+    /// The next refined frame starts a new shot (no temporal blend, mapping
+    /// and gap curve from that frame alone).
+    public func resetRefinement() {
+        refiner?.reset()
+    }
+
     public func refinedDepth(for pixelBuffer: CVPixelBuffer, frameSeconds: Double) -> MTLTexture? {
         guard let refiner else { return depth(for: pixelBuffer) }
         let inferState = signposter.beginInterval("depth-inference")

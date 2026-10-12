@@ -92,6 +92,10 @@ struct VideoStereoUniforms {
     // Depth budget knees (see DepthBudget): identity between them, tanh toe
     // and shoulder outside. (0, 1) is the old clamp.
     float2 depthBudget;
+    // 1 = fill the strips a near subject uncovers with the background beside
+    // them (mesh warp only), 0 = stretch the image across them as before.
+    float edgeFill;
+    float pad0;
 };
 
 // The depth budget: shot-space depth (unbounded once anchored) → 0…1, near
@@ -229,7 +233,21 @@ fragment float4 videoPackedEyeFragmentShader(
 struct MeshVertexOut {
     float4 position [[position]];
     float2 texCoord;
+    // Screen distance per unit of source distance across the cell: 1 on the
+    // plain picture, above 1 where the mesh stretches over an uncovered strip,
+    // below 0 where it folds back over a subject (see meshEdgeFill).
+    float stretch;
 };
+
+// The disparity at a grid point, as the vertex shader shifts it.
+static inline float meshDisparity(float2 grid, constant VideoStereoUniforms &u, texture2d<float> depthTex, sampler s) {
+    float2 uv = grid;
+    if (u.mirror > 0.5) { uv.x = 1.0 - uv.x; }
+    const float2 duv = uv * u.depthUVScale + u.depthUVOffset;
+    const float depth = pseudo3DDepthBudget(depthTex.sample(s, duv, level(0)).r
+                                            * u.depthValueScale + u.depthValueBias, u.depthBudget);
+    return (depth - u.convergence) * u.depthStrength * pseudo3DEdgeFeather(grid.x);
+}
 
 vertex MeshVertexOut videoStereoMeshVertex(
     uint vid [[vertex_id]],
@@ -259,16 +277,60 @@ vertex MeshVertexOut videoStereoMeshVertex(
     MeshVertexOut out;
     out.position = float4(ndcX, ndcY, ndcZ, 1.0);
     out.texCoord = uv;
+    // Measured per vertex from the depth either side and interpolated across
+    // the cell, so it varies smoothly; the fragment's own derivative of its
+    // source coordinate flickered per 2×2 pixel block along an outline, which
+    // drew the fill as spikes (headset, 2026-10-11).
+    const float h = 1.0 / 769.0;
+    const float left = meshDisparity(float2(max(grid.x - h, 0.0), grid.y), u, depthTex, depthSampler);
+    const float right = meshDisparity(float2(min(grid.x + h, 1.0), grid.y), u, depthTex, depthSampler);
+    out.stretch = 1.0 + u.eyeSign * (right - left) / (2.0 * h);
     return out;
+}
+
+// Where a near subject's outline moves off the background, the mesh's cells
+// across the outline stretch over the strip of background that comes into
+// view, smearing the outline's own pixels across it. Such a fragment is
+// recognised by its cell's stretch (MeshVertexOut.stretch); it is given the source pixel on the far side of the outline instead (whichever
+// neighbour is farther), so the strip repeats the background beside it.
+static inline float2 meshEdgeFill(
+    float2 tc, float stretch, texture2d<float> depthTex, sampler s, constant VideoStereoUniforms &u
+) {
+    // Only stretched cells. Cells folded back over a subject (stretch below 0:
+    // the background shifting onto it) are left alone: their fragments
+    // z-fight the subject's own, and painting them background bit pieces out
+    // of its outline (an ear, on the headset).
+    // From 1.2×: with outlines snapped sharp, a cell across one is stretched
+    // a little or a lot, and below 1.4× (the first threshold) the picture
+    // still smeared across it, which read as every edge looking stretched
+    // (Nope, headset 2026-10-12). A gentle depth slope stretches cells by a
+    // few per cent at most.
+    const float fill = smoothstep(1.2, 1.8, stretch);
+    if (fill <= 0.0) { return tc; }
+    // Two dense cells either side: past the outline whatever side it is on.
+    const float reach = 2.0 / 769.0;
+    const float2 leftUV = float2(max(tc.x - reach, 0.0), tc.y);
+    const float2 rightUV = float2(min(tc.x + reach, 1.0), tc.y);
+    // Depth was inferred on the unmirrored frame (as in the vertex shader).
+    float2 dl = leftUV, dr = rightUV;
+    if (u.mirror > 0.5) { dl.x = 1.0 - dl.x; dr.x = 1.0 - dr.x; }
+    const float depthLeft = depthTex.sample(s, dl * u.depthUVScale + u.depthUVOffset, level(0)).r;
+    const float depthRight = depthTex.sample(s, dr * u.depthUVScale + u.depthUVOffset, level(0)).r;
+    const float2 far = depthLeft < depthRight ? leftUV : rightUV;
+    return mix(tc, far, fill);
 }
 
 fragment float4 videoStereoMeshFragment(
     MeshVertexOut in [[stage_in]],
     texture2d<float> tex [[texture(0)]],
+    texture2d<float> depthTex [[texture(1)]],
     constant VideoStereoUniforms &u [[buffer(0)]]
 ) {
     constexpr sampler texSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
-    float4 color = tex.sample(texSampler, in.texCoord);
+    const float2 tc = u.edgeFill > 0.5
+        ? meshEdgeFill(in.texCoord, in.stretch, depthTex, texSampler, u)
+        : in.texCoord;
+    float4 color = tex.sample(texSampler, tc);
     color.rgb += u.brightness;
     color.rgb = (color.rgb - 0.5) * u.contrast + 0.5;
     float luminance = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
@@ -695,6 +757,305 @@ kernel void depthHistogram256Ranged(
     atomic_fetch_add_explicit(&bins[bin], 1u, memory_order_relaxed);
 }
 
+// Measurement only: how much of a shot-space depth map sits on a large depth
+// step once shown through the budget. Each texel is compared with the texels
+// `offset` to its right and below; steps[i] counts texels whose larger step
+// exceeds thresholds[i]. A near subject against a far background is a step of
+// most of the budget along its whole outline, which an interior rarely has.
+kernel void depthStepCensus(
+    texture2d<float, access::read> src [[texture(0)]],
+    device atomic_uint *steps          [[buffer(0)]],
+    constant float4 &thresholds        [[buffer(1)]],
+    constant float2 &knees             [[buffer(2)]],
+    constant uint &offset              [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = src.get_width(), h = src.get_height();
+    if (gid.x >= w || gid.y >= h) { return; }
+    const float d = pseudo3DDepthBudget(src.read(gid).r, knees);
+    const float dx = pseudo3DDepthBudget(src.read(uint2(min(gid.x + offset, w - 1), gid.y)).r, knees);
+    const float dy = pseudo3DDepthBudget(src.read(uint2(gid.x, min(gid.y + offset, h - 1))).r, knees);
+    const float step = max(abs(d - dx), abs(d - dy));
+    if (!isfinite(step)) { return; }
+    for (uint i = 0; i < 3; i++) {
+        if (step > thresholds[i]) { atomic_fetch_add_explicit(&steps[i], 1u, memory_order_relaxed); }
+    }
+}
+
+// Snap a soft depth outline to the picture. The model draws outlines soft,
+// so around a near subject against a far background there is a band of
+// in-between depth, and the warp stretches both the subject's edge and the
+// background across it. Within `radius` texels along the row, a texel
+// whose window's depth range exceeds `minStep` takes the near or the
+// far depth, whichever end's colour it matches. Ambiguous colour leaves the
+// texel as it was: a wrong snap tears an outline, which is worse than a soft
+// one. Gentle slopes (floors, walls) never span `minStep` within the radius.
+struct DepthEdgeSnapParams {
+    float2 uvScale;   // as DepthGuideParams: depth texel UV → video UV
+    float2 uvOffset;
+    int   radius;
+    float minStep;    // shot-space depth range that counts as an outline
+    float minContrast; // colour difference between the two ends to trust them
+};
+
+kernel void depthEdgeSnap(
+    texture2d<float, access::read>   src   [[texture(0)]],
+    texture2d<float, access::sample> video [[texture(1)]],
+    texture2d<float, access::write>  dst   [[texture(2)]],
+    constant DepthEdgeSnapParams &p        [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const int W = int(src.get_width()), H = int(src.get_height());
+    if (int(gid.x) >= W || int(gid.y) >= H) { return; }
+    const int x = int(gid.x), y = int(gid.y);
+    const float d = src.read(gid).r;
+    float dMin = d, dMax = d;
+    for (int i = -p.radius; i <= p.radius; i++) {
+        const float v = src.read(uint2(clamp(x + i, 0, W - 1), y)).r;
+        dMin = min(dMin, v);
+        dMax = max(dMax, v);
+    }
+    const float range = dMax - dMin;
+    if (!(range > p.minStep)) { dst.write(float4(d, 0, 0, 1), gid); return; }
+    const float tDepth = (d - dMin) / range;
+    // Confident depth (inside the subject, the background) stands.
+    if (tDepth < 0.08 || tDepth > 0.92) { dst.write(float4(d, 0, 0, 1), gid); return; }
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    const float2 size = float2(W, H);
+    const float2 sc = max(p.uvScale, float2(1e-5));
+    #define VIDEO_AT(px) video.sample(s, clamp(((float2(px, y) + 0.5) / size - p.uvOffset) / sc, 0.0, 1.0)).rgb
+    // The outline is the strongest colour edge inside the soft band along the
+    // row: the model says roughly where the outline is, the picture says
+    // exactly. Earlier versions sorted each texel by colour, near or far, and
+    // a dark subject before a dark background (a cap and neck against trees,
+    // Nope, headset 2026-10-12) had texels inside it sorted far, as holes the
+    // far eye saw the background through. With one edge per outline, every
+    // texel of the band agrees on it, and nothing deeper inside can flip.
+    int edge = -1000;
+    float strongest = 0.0, strongestG = 0.0;
+    float3 prevC = VIDEO_AT(x - p.radius);
+    float prevT = (src.read(uint2(clamp(x - p.radius, 0, W - 1), y)).r - dMin) / range;
+    for (int i = -p.radius + 1; i <= p.radius; i++) {
+        const int q = clamp(x + i, 0, W - 1);
+        const float3 cq = VIDEO_AT(q);
+        const float tq = (src.read(uint2(q, y)).r - dMin) / range;
+        // Only between two texels inside the band's core, and weighted
+        // towards where the model's depth is halfway, a little outwards of it.
+        // The strongest edge alone was at times one inside the subject (a
+        // cap's brim against the neck, beside a dark head against dark trees),
+        // which put the depth outline inside the head and the far eye's fill
+        // painted background over it (Nope, headset 2026-10-12). Erring
+        // outwards costs a sliver of background moving with the subject,
+        // erring inwards a missing piece of it.
+        const float mid = 0.5 * (tq + prevT);
+        if (mid > 0.15 && mid < 0.85) {
+            const float off = (mid - 0.42) / 0.45;
+            const float centred = 1.0 - off * off;
+            const float g = length(cq - prevC);
+            const float score = g * max(centred, 0.0);
+            if (score > strongest) { strongest = score; edge = i; strongestG = g; }   // between i-1 and i
+        }
+        prevC = cq;
+        prevT = tq;
+    }
+    if (edge == -1000 || strongestG < p.minContrast) { dst.write(float4(d, 0, 0, 1), gid); return; }
+    // Which side of the edge is near: the depth just past it on each side.
+    const float tLeft = (src.read(uint2(clamp(x + edge - 3, 0, W - 1), y)).r - dMin) / range;
+    const float tRight = (src.read(uint2(clamp(x + edge + 2, 0, W - 1), y)).r - dMin) / range;
+    const bool nearOnRight = tRight > tLeft;
+    // The two sides' depth: the window's ends.
+    const float dNear = dMax, dFar = dMin;
+    // A texel at the edge keeps its share of each side's colour (the outline's
+    // sub-texel position); the rest take their side's depth.
+    float t;
+    if (edge == 0 || edge == 1) {
+        const float3 cA = VIDEO_AT(x + edge - 2), cB = VIDEO_AT(x + edge + 1);
+        const float3 span = cB - cA;
+        const float tc = clamp(dot(VIDEO_AT(x) - cA, span) / max(dot(span, span), 1e-6), 0.0, 1.0);
+        t = nearOnRight ? tc : 1.0 - tc;
+    } else {
+        const bool onRight = edge <= 0;
+        t = (onRight == nearOnRight) ? 1.0 : 0.0;
+    }
+    #undef VIDEO_AT
+    // Snap fully inside the band's core, easing out towards its ends.
+    const float w = smoothstep(0.08, 0.2, tDepth) * (1.0 - smoothstep(0.8, 0.92, tDepth));
+    dst.write(float4(mix(d, mix(dFar, dNear, t), w), 0, 0, 1), gid);
+}
+
+// The vertical half of the snap, after `depthEdgeSnap`. The model draws a
+// thin near object's top and bottom soft too, and that band spilled onto
+// whatever sits just below: the dark steps under Nope's corral rail took
+// part of the rail's depth on their top rows, which shifted less than their
+// bottom rows and sheared them like a smudge (headset 2026-10-11). Colour
+// alone can't settle it (the first, symmetric column arm matched the dark
+// steps to the rail's shaded underside and pulled them up to it), so this
+// side is earned: inside the soft band a texel keeps the near depth only if
+// its colour is the near side's and every texel between it and the near
+// side's is too. Anything else in the band goes to the far side. Leaning far
+// is cheap here: depth shifts the picture sideways, and a horizontal edge's
+// rows sliding sideways along it doesn't show.
+kernel void depthEdgeSnapVertical(
+    texture2d<float, access::read>   src   [[texture(0)]],
+    texture2d<float, access::sample> video [[texture(1)]],
+    texture2d<float, access::write>  dst   [[texture(2)]],
+    constant DepthEdgeSnapParams &p        [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const int W = int(src.get_width()), H = int(src.get_height());
+    if (int(gid.x) >= W || int(gid.y) >= H) { return; }
+    const int x = int(gid.x), y = int(gid.y);
+    const float d = src.read(gid).r;
+    // Twice the row pass's reach: a thin object's soft band spans more than
+    // the object itself, and the window must reach past it to see the far side.
+    const int R = 2 * p.radius;
+    float dMin = d, dMax = d;
+    // The steepest change over a few texels: an outline's soft band is steep,
+    // the ground running off to the horizon is a gentle slope over the whole
+    // window. Without this the ground counted as an outline, its darker tufts
+    // were pushed to the far side as speckles, and each column deciding alone
+    // drew streaks (Nope's corral, headset 2026-10-12).
+    constexpr int kStep = 3;
+    float steepest = 0.0;
+    float back[kStep];
+    for (int k = 0; k < kStep; k++) { back[k] = src.read(uint2(x, clamp(y - R + k, 0, H - 1))).r; }
+    for (int i = -R; i <= R; i++) {
+        const float v = src.read(uint2(x, clamp(y + i, 0, H - 1))).r;
+        dMin = min(dMin, v);
+        dMax = max(dMax, v);
+        if (i >= -R + kStep) {
+            const int slot = (i + R) % kStep;
+            steepest = max(steepest, abs(v - back[slot]));
+            back[slot] = v;
+        }
+    }
+    const float range = dMax - dMin;
+    if (!(range > p.minStep) || steepest < max(0.25 * p.minStep, 0.12 * range)) {
+        dst.write(float4(d, 0, 0, 1), gid);
+        return;
+    }
+    // Only where the outline runs across the column: a mostly sideways depth
+    // change is the row pass's, and there this pass would only add streaks.
+    {
+        const float gy = abs(src.read(uint2(x, clamp(y + kStep, 0, H - 1))).r - src.read(uint2(x, clamp(y - kStep, 0, H - 1))).r);
+        const float gx = abs(src.read(uint2(clamp(x + kStep, 0, W - 1), y)).r - src.read(uint2(clamp(x - kStep, 0, W - 1), y)).r);
+        if (gy < 2.0 * gx) { dst.write(float4(d, 0, 0, 1), gid); return; }
+    }
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    const float2 size = float2(W, H);
+    const float2 sc = max(p.uvScale, float2(1e-5));
+    #define VIDEO_AT(px, py) video.sample(s, clamp(((float2(px, py) + 0.5) / size - p.uvOffset) / sc, 0.0, 1.0)).rgb
+    const float mid = 0.5 * (dMin + dMax);
+    float3 cNearSum = 0, cFarSum = 0;
+    float dNearSum = 0, dFarSum = 0, nNear = 0, nFar = 0;
+    for (int i = -R; i <= R; i++) {
+        if (i == 0) { continue; }
+        const int qy = clamp(y + i, 0, H - 1);
+        const float v = src.read(uint2(x, qy)).r;
+        const float e = 2.0 * (v - mid) / range;
+        const float wq = smoothstep(0.5, 1.0, abs(e));
+        if (wq <= 1e-4) { continue; }
+        const float3 cq = VIDEO_AT(x, qy);
+        if (v > mid) { cNearSum += wq * cq; dNearSum += wq * v; nNear += wq; }
+        else { cFarSum += wq * cq; dFarSum += wq * v; nFar += wq; }
+    }
+    if (nNear < 0.25 || nFar < 0.25) { dst.write(float4(d, 0, 0, 1), gid); return; }
+    const float3 cNear = cNearSum / nNear, cFar = cFarSum / nFar;
+    const float dNear = dNearSum / nNear, dFar = dFarSum / nFar;
+    const float3 span = cNear - cFar;
+    const float spanLen = length(span);
+    if (spanLen < p.minContrast) { dst.write(float4(d, 0, 0, 1), gid); return; }
+    const float tDepth = clamp((d - dFar) / max(dNear - dFar, 1e-6), 0.0, 1.0);
+    // Confident depth (the near object's core, the background) stands.
+    const float inBand = smoothstep(0.03, 0.12, tDepth) * (1.0 - smoothstep(0.93, 0.99, tDepth));
+    if (inBand <= 0.0) { dst.write(float4(d, 0, 0, 1), gid); return; }
+    // Which sure region the texel belongs to: walk up and down the column
+    // until the colour changes sharply, and see whether the walk reaches sure
+    // near depth, sure far depth, or neither. The first version leaned far
+    // (near only for near-coloured texels joined to the near side), and a
+    // tan glove before tan hills, coloured like neither the jacket and horse
+    // below it nor anything near, lost its top to the background (Nope,
+    // headset 2026-10-12). Joined to both, it stays near: a near object keeps
+    // all of itself, and at worst a sliver of background moves with it.
+    // Joined to neither, the model's depth stands.
+    const float edgeStep = max(p.minContrast, 0.35 * spanLen);
+    const float3 cOwn = VIDEO_AT(x, y);
+    bool reachesNear = false, reachesFar = false;
+    for (int dir = -1; dir <= 1; dir += 2) {
+        float3 prev = cOwn;
+        for (int i = 1; i <= R; i++) {
+            const int qy = y + dir * i;
+            if (qy < 0 || qy >= H) { break; }
+            const float3 cq = VIDEO_AT(x, qy);
+            if (length(cq - prev) > edgeStep) { break; }
+            const float tq = (src.read(uint2(x, qy)).r - dFar) / max(dNear - dFar, 1e-6);
+            if (tq > 0.9) { reachesNear = true; break; }
+            if (tq < 0.1) { reachesFar = true; break; }
+            prev = cq;
+        }
+    }
+    #undef VIDEO_AT
+    float target = d;
+    if (reachesNear) { target = max(d, dNear); }
+    else if (reachesFar) { target = dFar; }
+    dst.write(float4(mix(d, target, inBand), 0, 0, 1), gid);
+}
+
+// A 3×3 median after the snap. Where a subject's colour is close to the
+// background's (a pale shirt against pale ground) the snap decides texel by
+// texel, and a few on the subject's side of the outline went far: single
+// specks, which the mesh warp's fill then painted with background as pale
+// blotches along the outline (Nope's corral, headset 2026-10-12). A median
+// drops a speck up to 2×2 texels and leaves an outline where it is.
+//
+// Then held over time where the picture didn't move. The snap runs after the
+// refiner's temporal blend and decided every texel afresh each frame, so on
+// fine texture (a jacket's weave, film grain) its choice of edge changed from
+// frame to frame and the outline shimmered (headset 2026-10-12). Where the
+// luma is unchanged, the previous result is blended toward slowly; where it
+// moved, the new one is taken at once, so a moving outline doesn't lag.
+struct DepthSnapHoldParams {
+    uint  hasPrev;
+    float staticLuma;  // luma change below which a texel counts as static
+    float staticAlpha; // blend toward the new result for a static texel
+    float pad;
+};
+
+kernel void depthMedian3x3(
+    texture2d<float, access::read>   src       [[texture(0)]],
+    texture2d<float, access::write>  dst       [[texture(1)]],
+    texture2d<float, access::read>   prev      [[texture(2)]],
+    texture2d<float, access::sample> guide     [[texture(3)]],
+    texture2d<float, access::sample> guidePrev [[texture(4)]],
+    constant DepthSnapHoldParams &p            [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const int W = int(src.get_width()), H = int(src.get_height());
+    if (int(gid.x) >= W || int(gid.y) >= H) { return; }
+    float v[9];
+    int n = 0;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            v[n++] = src.read(uint2(clamp(int(gid.x) + i, 0, W - 1), clamp(int(gid.y) + j, 0, H - 1))).r;
+        }
+    }
+    // Partial selection: the 5th smallest of nine.
+    for (int a = 0; a < 5; a++) {
+        int m = a;
+        for (int b = a + 1; b < 9; b++) { if (v[b] < v[m]) { m = b; } }
+        const float t = v[a]; v[a] = v[m]; v[m] = t;
+    }
+    float out = v[4];
+    if (p.hasPrev != 0) {
+        constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+        const float2 uv = (float2(gid) + 0.5) / float2(W, H);
+        const float change = abs(guide.sample(s, uv).r - guidePrev.sample(s, uv).r);
+        const float still = saturate(1.0 - change / p.staticLuma);
+        out = mix(prev.read(gid).r, out, mix(1.0, p.staticAlpha, still));
+    }
+    dst.write(float4(out, 0, 0, 1), gid);
+}
+
 struct DepthAnchorApplyParams {
     float a;           // this frame's units → shot space
     float b;
@@ -712,6 +1073,17 @@ struct DepthAnchorApplyParams {
 /// pixel's depth is held: only a slow blend toward the new estimate, whatever
 /// the model now says. Monocular depth reshuffles the background non-affinely
 /// when a subject enters; the global anchor can't undo that, this holds it.
+/// The shot's gap curve (DepthGapCurve.apply): piecewise linear through
+/// `depthGapKnots + 1` knots over 0…1, slope 1 outside.
+constant uint depthGapKnots = 32;
+static inline float depthGapCurve(float y, constant float *knots) {
+    if (y <= 0.0) { return knots[0] + y; }
+    if (y >= 1.0) { return knots[depthGapKnots] + (y - 1.0); }
+    const float x = y * float(depthGapKnots);
+    const uint k = min(uint(x), depthGapKnots - 1);
+    return mix(knots[k], knots[k + 1], x - float(k));
+}
+
 kernel void depthAnchorApply(
     texture2d<float, access::read>  depth     [[texture(0)]],
     texture2d<float, access::read>  prev      [[texture(1)]],
@@ -719,10 +1091,11 @@ kernel void depthAnchorApply(
     texture2d<float, access::read>  guide     [[texture(3)]],
     texture2d<float, access::read>  guidePrev [[texture(4)]],
     constant DepthAnchorApplyParams &p        [[buffer(0)]],
+    constant float *gapKnots                  [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= next.get_width() || gid.y >= next.get_height()) { return; }
-    float y = depth.read(gid).r * p.a + p.b;
+    float y = depthGapCurve(depth.read(gid).r * p.a + p.b, gapKnots);
     if (p.hasPrev != 0) {
         const float old = prev.read(gid).r;
         const float moving = clamp(p.baseAlpha + p.motionGain * abs(y - old), p.baseAlpha, 1.0);
