@@ -32,14 +32,16 @@ struct DecoderRecoveryTests {
     @Test("Losses inside the interval are spaced out, not dropped")
     func rateLimited() async {
         let calls = Calls()
-        let recovery = RAVEDecoderRecovery(minimumInterval: 0.2) { calls.add($0) }
+        // A long interval, so a loaded machine's late wake-ups can't carry the
+        // second recovery past the first check; then poll for it, not sleep.
+        let recovery = RAVEDecoderRecovery(minimumInterval: 1.0) { calls.add($0) }
         recovery.noteLoss(.sessionLost)
         await settle()
         recovery.noteLoss(.sessionLost)
         recovery.noteLoss(.sessionLost)
         await settle()
         #expect(calls.count == 1)
-        await settle(0.3)
+        for _ in 0..<100 where calls.count < 2 { await settle(0.05) }
         #expect(calls.count == 2)
     }
 

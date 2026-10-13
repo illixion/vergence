@@ -61,9 +61,11 @@ public enum StereoEyeCapture {
     static var recomputesDepth: Bool { state.withLock { $0.requested && $0.recomputesDepth } }
 
     static func takeRequest() -> Bool {
-        state.withLock {
-            defer { $0.requested = false }
-            return $0.requested
+        // Not `defer { $0… }`: Swift 6.2's parser rejects `$0` inside a defer.
+        state.withLock { state in
+            let wasRequested = state.requested
+            state.requested = false
+            return wasRequested
         }
     }
 

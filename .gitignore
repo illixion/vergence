@@ -7,3 +7,4 @@ DerivedData/
 *.yuv
 *.m2ts
 *.264
+!Tests/**/Fixtures/*.264
