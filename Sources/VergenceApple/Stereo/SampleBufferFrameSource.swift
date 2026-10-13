@@ -38,6 +38,21 @@ public final class SampleBufferFrameSource: PumpFrameSource, @unchecked Sendable
 
     public init(timebase: CMTimebase) { self.timebase = timebase }
 
+    public var isFinished: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return invalidated
+    }
+
+    /// Host-side close. Decoder teardown remains on the pump queue when it
+    /// observes isFinished; closing must never race VideoToolbox work.
+    public func close() {
+        lock.lock(); defer { lock.unlock() }
+        invalidated = true
+        generation += 1
+        samples.removeAll()
+        frames.removeAll()
+    }
+
     public var decodeFailure: OSStatus? {
         lock.lock(); defer { lock.unlock() }
         return failure

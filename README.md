@@ -254,6 +254,43 @@ captions. They keep their bitmaps compressed until `renderRGBA()`.
 own reads, so sound can be ready ahead of the picture. It takes an `AudioFrameDecoder`;
 `VergenceApple` supplies `AC3Decoder` and a convenience initializer that uses it.
 
+## Stereo boundary experiment
+
+`DepthRefinement.separatesBoundaries` opts into a disconnected mesh and explicit
+hole fill; it defaults to false. Triangles spanning a normalized depth jump
+greater than 0.08 and more than one output pixel of differential disparity are
+drawn as separate near/far surfaces, each clipped to its part of the depth map.
+Continuous triangles are drawn normally. Covered surfaces retain depth testing. Holes reflect a nearby covered
+background region, checking its depth to avoid copying a nearer subject. A
+vertical fallback handles horizontal rails whose entire row is uncovered.
+Searches are bounded by disparity plus grid pitch and read only the original
+surface pass, so filling is deterministic and uses no stale frame history.
+
+`showsBoundaryHoles` highlights uncovered pixels in magenta. The prototype uses
+single-sample rasterization because depth and coverage cannot be averaged in its
+packed target. It still needs anti-aliasing, temporal/background reconstruction,
+and device performance validation before becoming the default. Sub-grid hair,
+soft/incorrect depth boundaries and transparent pixels remain limitations.
+
+On-device comparison on the paused Nope corral shot (2026-10-13) found noisy
+outlines, particularly the vertical railing. Keep it opt-in; passing the GPU
+tests does not establish movie quality. A separate Core ML row-stride fix
+removed broad distortion with the custom 686×308 model: its logical rows have
+686 elements but Vision returns a physical stride of 704. All multi-array depth
+reads honor the reported strides, including still images and raw cache output.
+The original mesh's heuristic background edge fill also defaults to off: an
+exact paused-frame check and headset comparison showed it damaging the horse
+rider's jacket outline. It remains available through the debug switch.
+Luma-based outline snapping defaults to off too: House headset comparisons
+showed improved face and subject edges without it. Joint-bilateral refinement
+and shot stabilization still run.
+
+`swift test --filter StereoBoundaryWarpTests` compiles the actual Metal source at
+runtime and executes the GPU passes, including BGRA output. It checks both eyes,
+vertical and horizontal rails, smooth slopes, zero disparity, mirror and depth
+UV remapping. These tests do not silently skip because a SwiftPM resource bundle
+is missing. Hypnos's `scripts/compare-stereo-edges.py` captures movie-frame A/Bs.
+
 ## License
 
 MIT, see `LICENSE`. edge264 (vendored under `Sources/CEdge264`) is BSD-3-Clause; see

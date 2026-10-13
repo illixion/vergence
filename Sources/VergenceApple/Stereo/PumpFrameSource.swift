@@ -50,6 +50,8 @@ public enum DolbyVisionFrames {
 /// `AVPlayerItemVideoOutput` or the `VTDecompressionSession` accordingly;
 /// `makeTexture` logs the format once if it sees anything else.
 public protocol PumpFrameSource: AnyObject, Sendable {
+    /// The host permanently closed this source. A paused source stays open.
+    var isFinished: Bool { get }
     /// The newest not-yet-delivered frame, or nil if none is ready.
     /// - Parameter hostTime: the pump's `CACurrentMediaTime()` for this tick, so
     ///   a source driven by a host-synchronised clock (AVPlayer) can map it onto
@@ -57,6 +59,10 @@ public protocol PumpFrameSource: AnyObject, Sendable {
     func nextFrame(hostTime: CFTimeInterval) -> PumpFrame?
     /// Release decode resources; the pump is shutting down.
     func invalidate()
+}
+
+public extension PumpFrameSource {
+    var isFinished: Bool { false }
 }
 
 /// Pulls from an `AVPlayerItemVideoOutput` — the original Spatial Stash path,

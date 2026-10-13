@@ -340,6 +340,140 @@ fragment float4 videoStereoMeshFragment(
     return color;
 }
 
+// MARK: - Disconnected boundary prototype
+
+struct BoundaryUniforms {
+    float4 stereo;      // strength, convergence, eye sign, mirror
+    float4 uv;          // depth scale.xy, offset.xy
+    float4 mapping;     // depth value scale, bias, budget knees
+    float4 adjustments; // brightness, contrast, saturation, index count
+    float4 boundary;    // min depth jump, output width, grid pitch, show holes
+};
+
+struct BoundaryVertexOut {
+    float4 position [[position]];
+    float2 uv;
+    float depth;
+    float reject [[flat]];
+    float2 split [[flat]]; // midpoint depth, near(0)/far(1); midpoint -1 = continuous
+};
+
+static inline float boundaryDepth(float2 grid, texture2d<float> depth, constant BoundaryUniforms &u) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    if (u.stereo.w > 0.5) { grid.x = 1 - grid.x; }
+    return pseudo3DDepthBudget(depth.sample(s, grid * u.uv.xy + u.uv.zw).r
+                              * u.mapping.x + u.mapping.y, u.mapping.zw);
+}
+
+vertex BoundaryVertexOut boundaryMeshVertex(
+    uint vid [[vertex_id]], const device float2 *positions [[buffer(0)]],
+    const device uint *indices [[buffer(1)]], constant BoundaryUniforms &u [[buffer(2)]],
+    texture2d<float> depth [[texture(0)]]
+) {
+    uint count = uint(u.adjustments.w);
+    uint layer = vid / count;
+    vid = vid % count;
+    uint tri = (vid / 3) * 3;
+    float d0 = boundaryDepth(positions[indices[tri]], depth, u);
+    float d1 = boundaryDepth(positions[indices[tri + 1]], depth, u);
+    float d2 = boundaryDepth(positions[indices[tri + 2]], depth, u);
+    float near = max(d0, max(d1, d2)), far = min(d0, min(d1, d2));
+    float span = near - far;
+    bool separated = span > u.boundary.x && span * abs(u.stereo.x) * u.boundary.y > 1;
+    float2 grid = positions[indices[vid]];
+    float d = vid % 3 == 0 ? d0 : (vid % 3 == 1 ? d1 : d2);
+    if (separated) { d = layer == 0 ? near : far; }
+    float shift = (d - u.stereo.y) * u.stereo.x * pseudo3DEdgeFeather(grid.x);
+    BoundaryVertexOut out;
+    out.position = float4(grid.x * 2 - 1 + u.stereo.z * shift * 2, 1 - grid.y * 2, 1 - d, 1);
+    out.uv = float2(u.stereo.w > 0.5 ? 1 - grid.x : grid.x, grid.y);
+    out.depth = d;
+    // Sharp depth changes must also cause >1 pixel of differential motion.
+    // Zero strength and smooth surfaces therefore retain their triangles.
+    out.reject = !separated && layer == 1 ? 1 : 0;
+    out.split = float2(separated ? (near + far) * 0.5 : -1, float(layer));
+    return out;
+}
+
+fragment float4 boundaryMeshFragment(BoundaryVertexOut in [[stage_in]],
+                                    texture2d<float> source [[texture(0)]],
+                                    texture2d<float> depth [[texture(1)]],
+                                    constant BoundaryUniforms &u [[buffer(0)]]) {
+    if (in.reject > 0.5) { discard_fragment(); }
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    constexpr sampler point(filter::nearest, address::clamp_to_edge);
+    if (in.split.x >= 0) {
+        float d = pseudo3DDepthBudget(depth.sample(point, in.uv * u.uv.xy + u.uv.zw).r
+                                     * u.mapping.x + u.mapping.y, u.mapping.zw);
+        bool belongsNear = d >= in.split.x;
+        if ((in.split.y < 0.5) != belongsNear) { discard_fragment(); }
+    }
+    // Across a split, bilinear colour sampling can mix a foreground texel
+    // into the far surface even after depth clipping. The hole filler would
+    // then reflect that contaminated sample across the uncovered strip.
+    float3 rgb = (in.split.x >= 0 ? source.sample(point, in.uv).rgb : source.sample(s, in.uv).rgb) + u.adjustments.x;
+    rgb = (rgb - 0.5) * u.adjustments.y + 0.5;
+    rgb = mix(float3(dot(rgb, float3(0.2126, 0.7152, 0.0722))), rgb, u.adjustments.z);
+    return float4(clamp(rgb, 0.0, 1.0), 1 + in.depth);
+}
+
+kernel void boundaryHoleFill(texture2d<float, access::read> surfaces [[texture(0)]],
+                             texture2d<float, access::write> output [[texture(1)]],
+                             constant BoundaryUniforms &u [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+    int width = int(output.get_width());
+    if (p.x >= uint(width) || p.y >= output.get_height()) { return; }
+    float4 center = surfaces.read(p);
+    if (center.a >= 1) { output.write(float4(center.rgb, 1), p); return; }
+    if (u.boundary.w > 0.5) { output.write(float4(1, 0, 1, 1), p); return; }
+
+    // The hole is bounded by differential disparity plus the split cells.
+    // Only holes pay for the scan. Never sample beyond the frame or use the
+    // filled output as input (that would make results scheduling-dependent).
+    int reach = min(width, int(ceil((abs(u.stereo.x) + 2 * u.boundary.z) * width)) + 2);
+    int left = -1, right = -1;
+    for (int distance = 1; distance <= reach; ++distance) {
+        int lx = int(p.x) - distance, rx = int(p.x) + distance;
+        if (left < 0 && lx >= 0 && surfaces.read(uint2(lx, p.y)).a >= 1) { left = lx; }
+        if (right < 0 && rx < width && surfaces.read(uint2(rx, p.y)).a >= 1) { right = rx; }
+        if (left >= 0 && right >= 0) { break; }
+    }
+    int background = left;
+    if (left < 0 || (right >= 0 && surfaces.read(uint2(right, p.y)).a < surfaces.read(uint2(left, p.y)).a)) {
+        background = right;
+    }
+    if (background < 0) {
+        // A horizontal railing can leave an entire row disconnected. There
+        // is no covered pixel left or right, so inspect above and below it.
+        int up = -1, down = -1;
+        for (int distance = 1; distance <= reach; ++distance) {
+            int uy = int(p.y) - distance, dy = int(p.y) + distance;
+            if (up < 0 && uy >= 0 && surfaces.read(uint2(p.x, uy)).a >= 1) { up = uy; }
+            if (down < 0 && dy < int(output.get_height()) && surfaces.read(uint2(p.x, dy)).a >= 1) { down = dy; }
+            if (up >= 0 && down >= 0) { break; }
+        }
+        int by = up;
+        if (up < 0 || (down >= 0 && surfaces.read(uint2(p.x, down)).a < surfaces.read(uint2(p.x, up)).a)) { by = down; }
+        if (by < 0) { output.write(float4(0, 0, 0, 1), p); return; }
+        float4 far = surfaces.read(uint2(p.x, by));
+        int reflectedY = 2 * by - int(p.y);
+        if (reflectedY >= 0 && reflectedY < int(output.get_height())) {
+            float4 candidate = surfaces.read(uint2(p.x, reflectedY));
+            if (candidate.a >= 1 && candidate.a <= far.a + 0.03) { far = candidate; }
+        }
+        output.write(float4(far.rgb, 1), p);
+        return;
+    }
+    float4 far = surfaces.read(uint2(background, p.y));
+    // Reflect texture into the hole from the far side. If the reflection hits
+    // another hole or a nearer object (thin railing), keep the known far sample.
+    int reflected = 2 * background - int(p.x);
+    if (reflected >= 0 && reflected < width) {
+        float4 candidate = surfaces.read(uint2(reflected, p.y));
+        if (candidate.a >= 1 && candidate.a <= far.a + 0.03) { far = candidate; }
+    }
+    output.write(float4(far.rgb, 1), p);
+}
+
 // MARK: - Depth Stabilization (spatial band-limit + motion-adaptive temporal EMA)
 //
 // Two depth artifacts feed the warp:

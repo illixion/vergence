@@ -118,6 +118,9 @@ public final class StereoPump: @unchecked Sendable {
     private let warp: RAVEStereoWarpResources
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
+    private lazy var boundaryWarp = RAVEMediaMetal.shared.flatMap {
+        StereoBoundaryWarp(device: device, library: $0.library)
+    }
     private let startHostTime: CFTimeInterval
     private let onVideoSizeKnown: @Sendable (CGSize) -> Void
 
@@ -329,6 +332,7 @@ public final class StereoPump: @unchecked Sendable {
             self.outPool = nil
             self.eyeDepthTextures = [nil, nil]
             self.eyeMSAAColorTextures = [nil, nil]
+            self.boundaryWarp = nil
         }
     }
 
@@ -375,6 +379,13 @@ public final class StereoPump: @unchecked Sendable {
     }
 
     private func tick() {
+        // A disconnected window can retain its SwiftUI/RealityKit graph.
+        // A host-side close must end the timer and drop lastFrame rather
+        // than masquerading as a pause and answering captures indefinitely.
+        if frameSource.isFinished {
+            stop()
+            return
+        }
         lifecycleLock.lock()
         let backgrounded = isBackgrounded
         lifecycleLock.unlock()
@@ -661,6 +672,21 @@ public final class StereoPump: @unchecked Sendable {
         // attachment (0=left, 1=right) — the two eyes render in one command
         // buffer, so a shared attachment cross-contaminated the depth test.
         let eyeIndex = eyeSign > 0 ? 0 : 1
+        if let depth, DepthRefinement.separatesBoundaries, let boundaryWarp {
+            let dense = depthSource?.prefersDenseWarpGrid == true
+            let columns = dense ? RAVEStereoWarpResources.denseGridColumns : RAVEStereoWarpResources.gridColumns
+            let u = StereoBoundaryWarp.Uniforms(
+                stereo: SIMD4(config.depthStrength, config.convergence, eyeSign, config.mirror ? 1 : 0),
+                uv: SIMD4(depth.uvScale.x, depth.uvScale.y, depth.uvOffset.x, depth.uvOffset.y),
+                mapping: SIMD4(depth.valueScale, depth.valueBias, uniforms.depthBudget.x, uniforms.depthBudget.y),
+                adjustments: SIMD4(config.brightness, config.contrast, config.saturation, 0),
+                boundary: SIMD4(0.08, Float(dest.width), 1 / Float(columns - 1), DepthRefinement.showsBoundaryHoles ? 1 : 0))
+            if boundaryWarp.encode(source: source, depth: depth.texture, destination: dest,
+                positions: dense ? warp.denseGridPositions : warp.gridPositions,
+                indices: dense ? warp.denseGridIndices : warp.gridIndices,
+                indexCount: dense ? warp.denseGridIndexCount : warp.gridIndexCount,
+                uniforms: u, commandBuffer: commandBuffer) { return }
+        }
         if let depth, let depthAttachment = ensureDepthTexture(width: dest.width, height: dest.height, eye: eyeIndex) {
             let desc = MTLRenderPassDescriptor()
             // MSAA: rasterize into a memoryless multisampled target and resolve

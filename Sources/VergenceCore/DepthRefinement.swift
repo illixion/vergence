@@ -63,16 +63,24 @@ public enum DepthRefinement {
     public static let cutMeanLumaDelta: Float = 0.12
 
     /// Snap soft depth outlines to the picture (realtime refined depth; see
-    /// `depthEdgeSnap`). On by default; a debug switch for comparing.
-    nonisolated(unsafe) public static var snapsEdges = true
+    /// `depthEdgeSnap`). Off by default: luma-based cleanup can carve into
+    /// valid face and clothing contours. Retained for debug comparisons.
+    nonisolated(unsafe) public static var snapsEdges = false
     /// Fill the strips a near subject uncovers with the background beside
     /// them, instead of stretching the outline across them (the mesh warp; see
-    /// `meshEdgeFill`). On by default; a debug switch for comparing.
-    nonisolated(unsafe) public static var fillsUncoveredEdges = true
+    /// `meshEdgeFill`). Off by default: the depth/derivative heuristic can
+    /// overwrite real jacket, sleeve and ear outlines with background.
+    /// Retained as a debug switch for comparisons.
+    nonisolated(unsafe) public static var fillsUncoveredEdges = false
     /// Squeeze the empty depth between a near subject and a far background
     /// out of each shot (realtime refined depth; see `DepthGapCompressor`).
     /// On by default; a debug switch for comparing.
     nonisolated(unsafe) public static var compressesGaps = true
+    /// Experimental discontinuity-separated mesh and explicit hole fill.
+    /// Opt in for A/B testing; independent of the depth cleanup switches.
+    nonisolated(unsafe) public static var separatesBoundaries = false
+    /// Show only newly uncovered pixels in magenta (prototype renderer).
+    nonisolated(unsafe) public static var showsBoundaryHoles = false
 }
 
 /// `y = a·x + b`.

@@ -126,5 +126,20 @@ import Testing
         samples.forEach { source.submit($0) }
         #expect(source.nextFrame(hostTime: 0) == nil)
     }
+
+    @Test func hostCloseIsPermanentAcrossResetAndLateSamples() async throws {
+        let source = SampleBufferFrameSource(timebase: try clock(at: 0.35))
+        defer { source.invalidate() }
+        #expect(!source.isFinished)
+        let frames = try await samples()
+        frames.forEach { source.submit($0) }
+        #expect(source.nextFrame(hostTime: 0) != nil)
+        source.close()
+        #expect(source.isFinished)
+        source.reset()
+        frames.forEach { source.submit($0) }
+        #expect(source.isFinished)
+        #expect(source.nextFrame(hostTime: 1) == nil)
+    }
 }
 #endif
