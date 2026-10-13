@@ -27,7 +27,7 @@ struct StereoBoundaryWarpTests {
             self.device = device
             queue = try #require(device.makeCommandQueue())
             let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-                .deletingLastPathComponent().appendingPathComponent("Sources/VergenceApple/Stereo/RAVEStereoShaders.metal")
+                .deletingLastPathComponent().appendingPathComponent("Sources/VergenceApple/Stereo/StereoShaders.metal")
             let library = try device.makeLibrary(source: String(contentsOf: path, encoding: .utf8), options: nil)
             warp = try #require(StereoBoundaryWarp(device: device, library: library))
             func texture(_ format: MTLPixelFormat) throws -> MTLTexture {

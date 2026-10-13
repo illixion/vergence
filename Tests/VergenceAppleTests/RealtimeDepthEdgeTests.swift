@@ -22,7 +22,7 @@ struct RealtimeDepthEdgeTests {
     static let radius: Float = 300
 
     @Test func refinedSilhouetteFollowsTheImageEdge() throws {
-        guard let metal = RAVEMediaMetal.shared else { return }
+        guard let metal = VergenceMetal.shared else { return }
         let device = metal.device
         let queue = try #require(device.makeCommandQueue())
         var cache: CVMetalTextureCache?
@@ -105,7 +105,7 @@ struct RealtimeDepthEdgeTests {
     /// whole ramp, so the edge snap must turn it back into a step on the
     /// image edge (and leave it alone when switched off).
     @Test func softOutlineIsSnappedToTheImageEdge() throws {
-        guard let metal = RAVEMediaMetal.shared else { return }
+        guard let metal = VergenceMetal.shared else { return }
         // The snap alone: the gap curve would squeeze the disc's step too.
         let compressed = DepthRefinement.compressesGaps
         DepthRefinement.compressesGaps = false
@@ -168,7 +168,7 @@ struct RealtimeDepthEdgeTests {
     /// top rows must not keep the rail's depth (they shear like a smudge), and
     /// the rail must stay near.
     @Test func stepsUnderANearRailKeepTheirOwnDepth() throws {
-        guard let metal = RAVEMediaMetal.shared else { return }
+        guard let metal = VergenceMetal.shared else { return }
         let compressed = DepthRefinement.compressesGaps
         DepthRefinement.compressesGaps = false
         defer { DepthRefinement.compressesGaps = compressed }
@@ -225,7 +225,7 @@ struct RealtimeDepthEdgeTests {
     /// so the snap must leave it as it is (it once pushed the tufts far, as
     /// speckles).
     @Test func slopingGroundIsLeftAlone() throws {
-        guard let metal = RAVEMediaMetal.shared else { return }
+        guard let metal = VergenceMetal.shared else { return }
         let compressed = DepthRefinement.compressesGaps
         DepthRefinement.compressesGaps = false
         defer { DepthRefinement.compressesGaps = compressed }
@@ -262,7 +262,7 @@ struct RealtimeDepthEdgeTests {
     /// inside the cap the colour matches the trees, but the rim stands between
     /// them, so the snap must not cut a far hole into the cap.
     @Test func darkSubjectBeforeDarkBackgroundKeepsItsInside() throws {
-        guard let metal = RAVEMediaMetal.shared else { return }
+        guard let metal = VergenceMetal.shared else { return }
         let compressed = DepthRefinement.compressesGaps
         DepthRefinement.compressesGaps = false
         defer { DepthRefinement.compressesGaps = compressed }
@@ -309,7 +309,7 @@ struct RealtimeDepthEdgeTests {
     /// coloured like the hills, not like what is near below it. It must keep
     /// its top.
     @Test func nearObjectColouredLikeTheBackgroundKeepsItsTop() throws {
-        guard let metal = RAVEMediaMetal.shared else { return }
+        guard let metal = VergenceMetal.shared else { return }
         let compressed = DepthRefinement.compressesGaps
         DepthRefinement.compressesGaps = false
         defer { DepthRefinement.compressesGaps = compressed }

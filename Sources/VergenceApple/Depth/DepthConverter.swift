@@ -76,7 +76,7 @@ private struct DepthHistogramParams {
 }
 
 /// CPU mirror of the Metal `DepthGuideParams` struct (2 float2s). Internal:
-/// `DepthPipelineSpike` drives the same guide kernel.
+/// `DepthPipelineBenchmark` drives the same guide kernel.
 struct DepthGuideParams {
     var uvScale: SIMD2<Float>
     var uvOffset: SIMD2<Float>
@@ -183,7 +183,7 @@ final class DepthConverter: @unchecked Sendable {
     /// halo pulsing on motion — and those conversions are already 2x faster.
     fileprivate static let twoPassMinFrameRate: Double = 48
 
-    private let queue = DispatchQueue(label: "com.spatialstash.depth-converter", qos: .utility)
+    private let queue = DispatchQueue(label: "com.illixion.vergence.depth-converter", qos: .utility)
     private let cancelLock = NSLock()
     private var _cancelled = false
     private let signposter = VergenceLog.signposter
@@ -267,14 +267,14 @@ final class DepthConverter: @unchecked Sendable {
         let bilateralVPipeline: MTLComputePipelineState
         let encodePipeline: MTLComputePipelineState
         let textureCache: CVMetalTextureCache
-        let metal: RAVEMediaMetal
+        let metal: VergenceMetal
     }
 
     private func makeGPUContext() -> GPUContext? {
         // The package's library, not the host app's — a bare
         // `device.makeDefaultLibrary()` searches the app bundle, where none of
         // these kernels live any more.
-        guard let metal = RAVEMediaMetal.shared else { return nil }
+        guard let metal = VergenceMetal.shared else { return nil }
         let device = metal.device
         guard let commandQueue = device.makeCommandQueue() else { return nil }
         func pipeline(_ name: String) -> MTLComputePipelineState? {
@@ -446,7 +446,7 @@ final class DepthConverter: @unchecked Sendable {
             gpu: gpu, provider: provider, plan: plan, directory: directory, sweep: sweep,
             progress: progress, isCancelled: { [weak self] in self?.isCancelled ?? true }
         )
-        let postQueue = DispatchQueue(label: "com.spatialstash.depth-converter.post", qos: .utility)
+        let postQueue = DispatchQueue(label: "com.illixion.vergence.depth-converter.post", qos: .utility)
         let inFlight = DispatchSemaphore(value: 2)
         let signposter = self.signposter
 

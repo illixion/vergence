@@ -115,16 +115,16 @@ public final class StereoPump: @unchecked Sendable {
 
     private let videoRenderer: AVSampleBufferVideoRenderer
     private let frameSource: PumpFrameSource
-    private let warp: RAVEStereoWarpResources
+    private let warp: StereoWarpResources
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
-    private lazy var boundaryWarp = RAVEMediaMetal.shared.flatMap {
+    private lazy var boundaryWarp = VergenceMetal.shared.flatMap {
         StereoBoundaryWarp(device: device, library: $0.library)
     }
     private let startHostTime: CFTimeInterval
     private let onVideoSizeKnown: @Sendable (CGSize) -> Void
 
-    private let queue = DispatchQueue(label: "com.illixion.ravemedia.stereo-pump", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "com.illixion.vergence.stereo-pump", qos: .userInteractive)
     private var timer: DispatchSourceTimer?
     /// Backgrounded: **visionOS refuses GPU submission from a background app**,
     /// so every command buffer a tick builds is aborted with
@@ -179,8 +179,8 @@ public final class StereoPump: @unchecked Sendable {
     /// flush (a paused picture has no new frame coming).
     private var lastFrame: PumpFrame?
     /// Flushes the renderer when visionOS took its decoding away; see
-    /// `RAVEDecoderRecovery`. Made in `start()`, as it captures self.
-    private var decoderRecovery: RAVEDecoderRecovery?
+    /// `DecoderRecovery`. Made in `start()`, as it captures self.
+    private var decoderRecovery: DecoderRecovery?
     /// Draws subtitles into both eyes (see StereoSubtitles.swift). Nil only if
     /// its shaders failed to build, which leaves the picture without them.
     private let subtitles: StereoSubtitleCompositor?
@@ -210,7 +210,7 @@ public final class StereoPump: @unchecked Sendable {
     private var delivery = DeliveryWindow()
     private let performanceInterval: Double = 2
     /// Any thread may read; set before `start()`. Called on the pump queue.
-    public var onPerformance: (@Sendable (RAVEStereoPerformance) -> Void)?
+    public var onPerformance: (@Sendable (StereoPerformance) -> Void)?
     /// Any thread may read; set before `start()`. Called once, on the pump
     /// queue, when the first frame is one no warp can show right (Dolby
     /// Vision profile 5, `DolbyVisionFrames`); nothing is rendered from then
@@ -244,7 +244,7 @@ public final class StereoPump: @unchecked Sendable {
     /// pool allocate IOSurfaces without limit.
     private let maxInFlightBuffers = 8
 
-    /// - Parameter warp: shared pipelines and grids; `RAVEStereoWarpResources.shared`
+    /// - Parameter warp: shared pipelines and grids; `StereoWarpResources.shared`
     ///   unless a caller has reason to build its own.
     /// - Returns: nil when Metal can't give the pump its own command queue or
     ///   the pixel-transfer session can't be created — both mean "no fake-3D",
@@ -255,7 +255,7 @@ public final class StereoPump: @unchecked Sendable {
     public init?(
         videoRenderer: AVSampleBufferVideoRenderer,
         frameSource: PumpFrameSource,
-        warp: RAVEStereoWarpResources,
+        warp: StereoWarpResources,
         startHostTime: CFTimeInterval,
         depthSource: PumpDepthSource?,
         frameInterval: Double,
@@ -276,7 +276,7 @@ public final class StereoPump: @unchecked Sendable {
         self.frameInterval = frameInterval
         self.onVideoSizeKnown = onVideoSizeKnown
         self.transferSession = session
-        self.subtitles = RAVEMediaMetal.shared.flatMap {
+        self.subtitles = VergenceMetal.shared.flatMap {
             StereoSubtitleCompositor(device: $0.device, library: $0.library)
         }
         CVMetalTextureCacheCreate(nil, nil, warp.device, nil, &textureCache)
@@ -305,7 +305,7 @@ public final class StereoPump: @unchecked Sendable {
 
     public func start() {
         observeAppLifecycle()
-        decoderRecovery = RAVEDecoderRecovery(renderer: videoRenderer) { [weak self] _ in
+        decoderRecovery = DecoderRecovery(renderer: videoRenderer) { [weak self] _ in
             self?.queue.async { self?.flushAndReshow() }
         }
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -351,10 +351,10 @@ public final class StereoPump: @unchecked Sendable {
         }
         lifecycleObservers = [
             center.addObserver(
-                forName: RAVEAppLifecycle.didEnterBackground, object: nil, queue: nil
+                forName: VergenceAppLifecycle.didEnterBackground, object: nil, queue: nil
             ) { _ in setBackgrounded(true) },
             center.addObserver(
-                forName: RAVEAppLifecycle.willEnterForeground, object: nil, queue: nil
+                forName: VergenceAppLifecycle.willEnterForeground, object: nil, queue: nil
             ) { _ in setBackgrounded(false) }
         ]
     }
@@ -460,7 +460,7 @@ public final class StereoPump: @unchecked Sendable {
         guard let onPerformance, delivery.frames >= 4, delivery.sourceSpacing.isFinite,
               delivery.itemSpan > 0 else { return }
         let expected = delivery.itemSpan / delivery.sourceSpacing
-        onPerformance(RAVEStereoPerformance(
+        onPerformance(StereoPerformance(
             shownFramesPerSecond: Double(delivery.frames) / window,
             sourceFramesPerSecond: 1 / delivery.sourceSpacing,
             deliveredFraction: min(1, Double(delivery.frames) / expected),
@@ -674,7 +674,7 @@ public final class StereoPump: @unchecked Sendable {
         let eyeIndex = eyeSign > 0 ? 0 : 1
         if let depth, DepthRefinement.separatesBoundaries, let boundaryWarp {
             let dense = depthSource?.prefersDenseWarpGrid == true
-            let columns = dense ? RAVEStereoWarpResources.denseGridColumns : RAVEStereoWarpResources.gridColumns
+            let columns = dense ? StereoWarpResources.denseGridColumns : StereoWarpResources.gridColumns
             let u = StereoBoundaryWarp.Uniforms(
                 stereo: SIMD4(config.depthStrength, config.convergence, eyeSign, config.mirror ? 1 : 0),
                 uv: SIMD4(depth.uvScale.x, depth.uvScale.y, depth.uvOffset.x, depth.uvOffset.y),
@@ -922,7 +922,7 @@ private func fourCC(_ value: OSType) -> String {
 /// How well the stereo pump keeps up with its source, over the last couple
 /// of seconds of playback. Reported only while frames are arriving, so a
 /// paused or stalled player says nothing (a stall is the player's to report).
-public struct RAVEStereoPerformance: Sendable, Equatable {
+public struct StereoPerformance: Sendable, Equatable {
     /// Frames that reached the eyes, per second of wall time.
     public var shownFramesPerSecond: Double
     /// The source's own frame rate, from the shortest gap between frames.

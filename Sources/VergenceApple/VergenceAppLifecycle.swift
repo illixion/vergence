@@ -21,7 +21,7 @@ import UIKit
 import VergenceCore
 #endif
 
-enum RAVEAppLifecycle {
+enum VergenceAppLifecycle {
     /// False while the app is backgrounded or inactive. The conversion pipeline
     /// treats anything but active as "do not start / do not continue encoding".
     @MainActor
@@ -38,8 +38,8 @@ enum RAVEAppLifecycle {
     static let willEnterForeground = UIApplication.willEnterForegroundNotification
     #else
     /// Names nothing posts, so observers register harmlessly and never fire.
-    static let didEnterBackground = Notification.Name("RAVEMediaHostDidEnterBackground")
-    static let willEnterForeground = Notification.Name("RAVEMediaHostWillEnterForeground")
+    static let didEnterBackground = Notification.Name("VergenceHostDidEnterBackground")
+    static let willEnterForeground = Notification.Name("VergenceHostWillEnterForeground")
     #endif
 }
 #endif

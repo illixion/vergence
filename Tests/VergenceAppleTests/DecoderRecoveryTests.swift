@@ -11,7 +11,7 @@ struct DecoderRecoveryTests {
         private let lock = NSLock()
         private var reasons: [String] = []
         private var gaveUp: [String] = []
-        func add(_ r: RAVEDecoderRecovery.Reason) { lock.lock(); reasons.append(r.description); lock.unlock() }
+        func add(_ r: DecoderRecovery.Reason) { lock.lock(); reasons.append(r.description); lock.unlock() }
         func giveUp(_ r: String) { lock.lock(); gaveUp.append(r); lock.unlock() }
         var count: Int { lock.lock(); defer { lock.unlock() }; return reasons.count }
         var gaveUpCount: Int { lock.lock(); defer { lock.unlock() }; return gaveUp.count }
@@ -22,7 +22,7 @@ struct DecoderRecoveryTests {
     @Test("A loss is recovered asynchronously, once")
     func recoversOnce() async {
         let calls = Calls()
-        let recovery = RAVEDecoderRecovery(minimumInterval: 0.2) { calls.add($0) }
+        let recovery = DecoderRecovery(minimumInterval: 0.2) { calls.add($0) }
         recovery.noteLoss(.sessionLost)
         #expect(calls.count == 0) // never from inside the caller's call
         await settle()
@@ -34,7 +34,7 @@ struct DecoderRecoveryTests {
         let calls = Calls()
         // A long interval, so a loaded machine's late wake-ups can't carry the
         // second recovery past the first check; then poll for it, not sleep.
-        let recovery = RAVEDecoderRecovery(minimumInterval: 1.0) { calls.add($0) }
+        let recovery = DecoderRecovery(minimumInterval: 1.0) { calls.add($0) }
         recovery.noteLoss(.sessionLost)
         await settle()
         recovery.noteLoss(.sessionLost)
@@ -48,7 +48,7 @@ struct DecoderRecoveryTests {
     @Test("After a recovery, delta frames are dropped until a key frame")
     func keyFrameGate() async {
         let calls = Calls()
-        let recovery = RAVEDecoderRecovery(minimumInterval: 0.2) { calls.add($0) }
+        let recovery = DecoderRecovery(minimumInterval: 0.2) { calls.add($0) }
         #expect(recovery.admit(isKeyFrame: false))
         recovery.noteLoss(.sessionLost)
         await settle()
@@ -60,7 +60,7 @@ struct DecoderRecoveryTests {
     @Test("Deltas that keep coming ask for a key frame again")
     func asksAgain() async {
         let calls = Calls()
-        let recovery = RAVEDecoderRecovery(minimumInterval: 0.1) { calls.add($0) }
+        let recovery = DecoderRecovery(minimumInterval: 0.1) { calls.add($0) }
         recovery.expectKeyFrame()
         #expect(!recovery.admit(isKeyFrame: false))
         await settle(0.15)
@@ -72,7 +72,7 @@ struct DecoderRecoveryTests {
     @Test("Gives up after the attempt limit; a key frame resets the count")
     func givesUp() async {
         let calls = Calls()
-        let recovery = RAVEDecoderRecovery(minimumInterval: 0.01, maximumAttempts: 2,
+        let recovery = DecoderRecovery(minimumInterval: 0.01, maximumAttempts: 2,
                                            onGiveUp: { calls.giveUp($0) }) { calls.add($0) }
         for _ in 0..<3 {
             recovery.noteLoss(.rendererFailed)
@@ -89,7 +89,7 @@ struct DecoderRecoveryTests {
     @Test("Cancelled recovery does nothing")
     func cancelled() async {
         let calls = Calls()
-        let recovery = RAVEDecoderRecovery(minimumInterval: 0.01) { calls.add($0) }
+        let recovery = DecoderRecovery(minimumInterval: 0.01) { calls.add($0) }
         recovery.cancel()
         recovery.noteLoss(.sessionLost)
         await settle()
@@ -102,7 +102,7 @@ struct DecoderRecoveryLimitTests {
     @Test("Withdrawn decoding never counts toward giving up")
     func withdrawnNeverGivesUp() async {
         let calls = DecoderRecoveryTests.Calls()
-        let recovery = RAVEDecoderRecovery(minimumInterval: 0.01, maximumAttempts: 1,
+        let recovery = DecoderRecovery(minimumInterval: 0.01, maximumAttempts: 1,
                                            onGiveUp: { calls.giveUp($0) }) { calls.add($0) }
         for _ in 0..<4 {
             recovery.noteLoss(.sessionLost)

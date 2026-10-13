@@ -79,7 +79,7 @@ final class DepthAnchorGPU {
     private(set) var partials: MTLBuffer?
     private var partialsCapacity = 0
 
-    init?(metal: RAVEMediaMetal) {
+    init?(metal: VergenceMetal) {
         guard let reduce = metal.computePipeline("depthAnchorReduce"),
               let fold = metal.computePipeline("depthAnchorFoldRange"),
               let histogram = metal.computePipeline("depthHistogram256Ranged"),
@@ -256,7 +256,7 @@ final class RealtimeDepthRefiner {
     private let signposter = VergenceLog.signposter
 
     init?(device: MTLDevice, commandQueue: MTLCommandQueue, textureCache: CVMetalTextureCache) {
-        guard let metal = RAVEMediaMetal.shared,
+        guard let metal = VergenceMetal.shared,
               let anchor = DepthAnchorGPU(metal: metal),
               let guide = metal.computePipeline("depthGuideLuma"),
               let h = metal.computePipeline("depthJointBilateralH"),

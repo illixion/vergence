@@ -22,16 +22,16 @@ import Metal
 import os
 import VergenceCore
 
-/// Device + shader library for everything in RAVEMedia that touches the GPU.
-public final class RAVEMediaMetal: Sendable {
+/// Device + shader library for everything in Vergence that touches the GPU.
+public final class VergenceMetal: Sendable {
     /// `nil` only on a device with no Metal support (the simulator's software
     /// renderer included) or if the package's shader library failed to load —
     /// callers treat that the same as "fake-3D unavailable".
-    public static let shared = RAVEMediaMetal()
+    public static let shared = VergenceMetal()
 
     public let device: MTLDevice
     /// The package's own default library, compiled from
-    /// `Resources/RAVEStereoShaders.metal`. Distinct from the app's — a
+    /// `Resources/StereoShaders.metal`. Distinct from the app's — a
     /// `makeDefaultLibrary()` with no bundle would find the app's functions and
     /// none of ours.
     public let library: MTLLibrary
@@ -86,10 +86,10 @@ public final class RAVEMediaMetal: Sendable {
 
 /// The render pipelines and geometry the per-eye warp needs. Built once; every
 /// `StereoPump` shares them.
-public final class RAVEStereoWarpResources: Sendable {
+public final class StereoWarpResources: Sendable {
     /// `nil` when Metal or the shader library is unavailable, which callers
     /// treat as "fake-3D unavailable" rather than an error.
-    public static let shared = RAVEStereoWarpResources()
+    public static let shared = StereoWarpResources()
 
     public let device: MTLDevice
     /// Per-pixel backward warp (heuristic fallback; the real-depth path always
@@ -138,7 +138,7 @@ public final class RAVEStereoWarpResources: Sendable {
     public let denseGridIndexCount: Int
 
     private init?() {
-        guard let metal = RAVEMediaMetal.shared else { return nil }
+        guard let metal = VergenceMetal.shared else { return nil }
         let device = metal.device
         let library = metal.library
         self.device = device

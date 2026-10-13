@@ -23,7 +23,7 @@ import VergenceCore
 /// `@unchecked Sendable`: all state is touched only on `queue`.
 public final class StereoTestPatternPump: @unchecked Sendable {
     private let videoRenderer: AVSampleBufferVideoRenderer
-    private let queue = DispatchQueue(label: "com.illixion.ravemedia.stereo-testpattern", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "com.illixion.vergence.stereo-testpattern", qos: .userInteractive)
     private let width = 1280
     private let height = 720
     /// Half-frame disparity of the bar between eyes (px). Bigger = more depth.

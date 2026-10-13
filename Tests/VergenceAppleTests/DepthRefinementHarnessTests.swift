@@ -21,7 +21,7 @@ struct DepthRefinementHarnessTests {
     @Test func measureBackgroundStability() throws {
         let env = ProcessInfo.processInfo.environment
         guard let modelPath = env["DEPTH_HARNESS_MODEL"], let framesPath = env["DEPTH_HARNESS_FRAMES"],
-              let metal = RAVEMediaMetal.shared else { return }
+              let metal = VergenceMetal.shared else { return }
         let patch = (env["DEPTH_HARNESS_PATCH"] ?? "0.03,0.03,0.25,0.35")
             .split(separator: ",").compactMap { Float($0) }
         let device = metal.device

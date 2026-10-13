@@ -279,7 +279,7 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
     }
 
     /// Load a specific model file, bypassing the role preference. Internal:
-    /// `DepthPipelineSpike` benchmarks every installed model in turn, which the
+    /// `DepthPipelineBenchmark` benchmarks every installed model in turn, which the
     /// preference-driven initializer cannot express.
     init?(device: MTLDevice, modelURL: URL) {
         guard let compiledURL = Self.compiledModelURL(for: modelURL),
@@ -313,7 +313,7 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
     /// `device.makeDefaultLibrary()` here would search the host bundle and find
     /// nothing, silently disabling stabilization.
     private static func makeComputePipeline(_ function: String) -> MTLComputePipelineState? {
-        RAVEMediaMetal.shared?.computePipeline(function)
+        VergenceMetal.shared?.computePipeline(function)
     }
 
     /// Resolve the depth model to load for a role. Fake-3D requires a real

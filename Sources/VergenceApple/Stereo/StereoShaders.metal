@@ -1,5 +1,5 @@
 /*
- RAVEMedia - Stereo Warp and Depth Shaders
+ Vergence - Stereo Warp and Depth Shaders
 
  The pseudo-3D half of what used to be Spatial Stash's single Shaders.metal:
  the per-eye warp (backward and depth-displaced-mesh), realtime depth

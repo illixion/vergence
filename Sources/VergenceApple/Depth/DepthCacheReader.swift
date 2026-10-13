@@ -90,7 +90,7 @@ final class DepthCacheReader: @unchecked Sendable {
     private var lastSecondaryProbe: CFTimeInterval = 0
     private var lastMetaProbe: CFTimeInterval = 0
     private var textureCache: CVMetalTextureCache?
-    private let metaRefreshQueue = DispatchQueue(label: "com.spatialstash.depth-cache-meta", qos: .utility)
+    private let metaRefreshQueue = DispatchQueue(label: "com.illixion.vergence.depth-cache-meta", qos: .utility)
     private let metaRefreshLock = NSLock()
     private var knownMetaStamp: MetaFileStamp?
     private var pendingMeta: (DepthCacheStore.Meta, MetaFileStamp)?

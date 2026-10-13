@@ -1,5 +1,5 @@
 /*
- Vergence - Realtime depth pipeline spike.
+ Vergence - Realtime depth pipeline benchmark.
 
  On-device measurements for the lookahead-buffered realtime fake-3D design.
  Three things the offline converter has and the live path lacks — a centered
@@ -37,7 +37,7 @@ import QuartzCore
 import os
 import VergenceCore
 
-public enum DepthPipelineSpike {
+public enum DepthPipelineBenchmark {
     /// Frames timed per model after the warm-up.
     private static let inferenceSampleFrames = 60
     /// First inferences of a freshly loaded model include ANE compilation
@@ -61,11 +61,11 @@ public enum DepthPipelineSpike {
     /// thread, and the whole run is complete when this returns.
     public static func run(videoURL: URL, report: @escaping @Sendable (String) -> Void) async {
         let emit: @Sendable (String) -> Void = { line in
-            VergenceLog.pipeline.info("[spike] \(line, privacy: .public)")
+            VergenceLog.pipeline.info("[benchmark] \(line, privacy: .public)")
             report(line)
         }
 
-        guard let metal = RAVEMediaMetal.shared else {
+        guard let metal = VergenceMetal.shared else {
             emit("No Metal / shader library — fake-3D is unavailable on this device, nothing to measure.")
             return
         }
@@ -111,7 +111,7 @@ public enum DepthPipelineSpike {
     // MARK: - 1 + 2: inference and refinement per model
 
     private static func measureModel(
-        modelURL: URL, asset: AVURLAsset, track: AVAssetTrack, naturalSize: CGSize, metal: RAVEMediaMetal, fps: Double
+        modelURL: URL, asset: AVURLAsset, track: AVAssetTrack, naturalSize: CGSize, metal: VergenceMetal, fps: Double
     ) -> [String] {
         let name = modelURL.deletingPathExtension().lastPathComponent
         var lines: [String] = ["", "Model: \(name)"]
@@ -276,7 +276,7 @@ public enum DepthPipelineSpike {
         private let bins: MTLBuffer
         private var guideParams: DepthGuideParams
 
-        init?(metal: RAVEMediaMetal, depthWidth: Int, depthHeight: Int, videoWidth: Int, videoHeight: Int) {
+        init?(metal: VergenceMetal, depthWidth: Int, depthHeight: Int, videoWidth: Int, videoHeight: Int) {
             guard let queue = metal.device.makeCommandQueue(),
                   let guide = metal.computePipeline("depthGuideLuma"),
                   let bH = metal.computePipeline("depthJointBilateralH"),
@@ -461,7 +461,7 @@ public enum DepthPipelineSpike {
     /// `MLModel.prediction` directly on pre-scaled inputs so nothing but Core
     /// ML is in the measurement.
     private static func measureCoreML(
-        modelURL: URL, asset: AVURLAsset, track: AVAssetTrack, naturalSize: CGSize, metal: RAVEMediaMetal
+        modelURL: URL, asset: AVURLAsset, track: AVAssetTrack, naturalSize: CGSize, metal: VergenceMetal
     ) async -> [String] {
         var lines: [String] = ["  — Core ML direct (no Vision) —"]
         guard let compiled = CoreMLDepthProvider.compiledModelURL(for: modelURL) else {
@@ -535,7 +535,7 @@ public enum DepthPipelineSpike {
     /// Decode frames (at ≤1036 px, like the converter) and scale each into a
     /// fresh pixel buffer of the model's input size and format.
     private static func prepareInputs(
-        asset: AVURLAsset, track: AVAssetTrack, naturalSize: CGSize, metal: RAVEMediaMetal,
+        asset: AVURLAsset, track: AVAssetTrack, naturalSize: CGSize, metal: VergenceMetal,
         width: Int, height: Int, format: OSType, count: Int
     ) -> [CVPixelBuffer] {
         let context = CIContext(mtlDevice: metal.device, options: [.cacheIntermediates: false])

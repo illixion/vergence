@@ -163,12 +163,12 @@ public final class DepthConversionManager {
 
     private init() {
         NotificationCenter.default.addObserver(
-            forName: RAVEAppLifecycle.didEnterBackground, object: nil, queue: .main
+            forName: VergenceAppLifecycle.didEnterBackground, object: nil, queue: .main
         ) { _ in
             MainActor.assumeIsolated { DepthConversionManager.shared.handleDidEnterBackground() }
         }
         NotificationCenter.default.addObserver(
-            forName: RAVEAppLifecycle.willEnterForeground, object: nil, queue: .main
+            forName: VergenceAppLifecycle.willEnterForeground, object: nil, queue: .main
         ) { _ in
             MainActor.assumeIsolated { DepthConversionManager.shared.handleWillEnterForeground() }
         }
@@ -260,7 +260,7 @@ public final class DepthConversionManager {
             lastFrontierSample = nil
             // Interrupted job whose unwinding outlived the foreground
             // transition (handleWillEnterForeground saw activeJob set).
-            if RAVEAppLifecycle.isActive, let request = interruptedRequest {
+            if VergenceAppLifecycle.isActive, let request = interruptedRequest {
                 interruptedRequest = nil
                 enqueue(request)
             }
@@ -310,7 +310,7 @@ public final class DepthConversionManager {
                     guard attempt <= Self.maxConverterRetries,
                           isRetriableConversionFailure(error),
                           interruptedRequest?.videoIdentity != request.videoIdentity,
-                          RAVEAppLifecycle.isActive else {
+                          VergenceAppLifecycle.isActive else {
                         throw error
                     }
                     VergenceLog.cache.notice("Depth conversion transient failure for \(request.videoIdentity, privacy: .private) (attempt \(attempt, privacy: .public)/\(Self.maxConverterRetries, privacy: .public)), retrying: \(error.localizedDescription, privacy: .public)")
@@ -334,7 +334,7 @@ public final class DepthConversionManager {
             if isCancellation(error) {
                 VergenceLog.cache.info("Depth conversion cancelled for \(request.videoIdentity, privacy: .private)")
             } else if interruptedRequest?.videoIdentity == request.videoIdentity
-                || !RAVEAppLifecycle.isActive {
+                || !VergenceAppLifecycle.isActive {
                 // The background HEVC-encoder kill can surface as a writer
                 // failure before (or instead of) our cancellation — treat it
                 // as the interruption it is: restart on foreground, no alert.

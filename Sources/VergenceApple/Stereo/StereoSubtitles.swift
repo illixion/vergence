@@ -41,7 +41,7 @@ import QuartzCore
 import VergenceCore
 
 /// One block of subtitle text, rendered by the host.
-public struct RAVEStereoSubtitle: @unchecked Sendable {
+public struct StereoSubtitle: @unchecked Sendable {
     public enum Placement: Sendable { case top, bottom }
 
     /// Premultiplied, in sRGB. White text on a dark plate is what the
@@ -69,7 +69,7 @@ public struct RAVEStereoSubtitle: @unchecked Sendable {
 /// means subtitles are off; a frame with nothing to show means a track is
 /// on between cues, which keeps live 3D measuring so the next cue has a
 /// depth ready.
-public struct RAVEStereoSubtitleFrame: Equatable {
+public struct StereoSubtitleFrame: Equatable {
     /// Changes whenever `render` would draw something else.
     public var version: Int
     /// The luminance of the text's white on an HDR picture.
@@ -80,13 +80,13 @@ public struct RAVEStereoSubtitleFrame: Equatable {
     public var depthOffset: Double
     /// Draws the cues showing for an eye of the given size, in pixels. Called
     /// on the main actor when the frame changes and when the eye size does.
-    public var render: @MainActor (_ eyeSize: CGSize) -> [RAVEStereoSubtitle]
+    public var render: @MainActor (_ eyeSize: CGSize) -> [StereoSubtitle]
 
     /// BT.2408's reference white for graphics in an HDR programme.
     public static let defaultHDRWhiteNits: Double = 203
 
     public init(version: Int, hdrWhiteNits: Double = defaultHDRWhiteNits, depthOffset: Double = 0,
-                render: @escaping @MainActor (_ eyeSize: CGSize) -> [RAVEStereoSubtitle]) {
+                render: @escaping @MainActor (_ eyeSize: CGSize) -> [StereoSubtitle]) {
         self.version = version
         self.hdrWhiteNits = hdrWhiteNits
         self.depthOffset = depthOffset
@@ -104,7 +104,7 @@ public struct StereoSubtitleOverlay: @unchecked Sendable {
         let texture: MTLTexture
         let pixelSize: CGSize
         let referenceEyeHeight: CGFloat
-        let placement: RAVEStereoSubtitle.Placement
+        let placement: StereoSubtitle.Placement
         let frame: CGRect?
     }
 
@@ -117,7 +117,7 @@ public struct StereoSubtitleOverlay: @unchecked Sendable {
 
     /// Uploads each image. Runs on the caller's thread; subtitle images are a
     /// few hundred kilobytes and change a few times a minute.
-    public init?(subtitles: [RAVEStereoSubtitle], hdrWhiteNits: Double, depthOffset: Double,
+    public init?(subtitles: [StereoSubtitle], hdrWhiteNits: Double, depthOffset: Double,
           generation: Int, device: MTLDevice) {
         var items: [Item] = []
         for subtitle in subtitles {

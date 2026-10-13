@@ -40,7 +40,7 @@ import UIKit
 import VergenceCore
 #endif
 
-public final class RAVEDecoderRecovery: @unchecked Sendable {
+public final class DecoderRecovery: @unchecked Sendable {
     /// Why the client is being asked to recover; for its log line.
     public struct Reason: Sendable, CustomStringConvertible {
         public let description: String
@@ -78,7 +78,7 @@ public final class RAVEDecoderRecovery: @unchecked Sendable {
     private let recover: @Sendable (Reason) -> Void
     private let maximumAttempts: Int?
     private let onGiveUp: (@Sendable (String) -> Void)?
-    private let queue = DispatchQueue(label: "com.illixion.ravemedia.decoder-recovery", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.illixion.vergence.decoder-recovery", qos: .userInitiated)
     private let lock = NSLock()
     private var observers: [NSObjectProtocol] = []
 
@@ -286,10 +286,10 @@ public final class RAVEDecoderRecovery: @unchecked Sendable {
                 self?.queue.async { self?.checkRenderer() }
             })
         }
-        observers.append(center.addObserver(forName: RAVEAppLifecycle.didEnterBackground, object: nil, queue: nil) { [weak self] _ in
+        observers.append(center.addObserver(forName: VergenceAppLifecycle.didEnterBackground, object: nil, queue: nil) { [weak self] _ in
             self?.enteredBackground(appWide: true)
         })
-        observers.append(center.addObserver(forName: RAVEAppLifecycle.willEnterForeground, object: nil, queue: nil) { [weak self] _ in
+        observers.append(center.addObserver(forName: VergenceAppLifecycle.willEnterForeground, object: nil, queue: nil) { [weak self] _ in
             self?.returned()
         })
         #if canImport(UIKit)
