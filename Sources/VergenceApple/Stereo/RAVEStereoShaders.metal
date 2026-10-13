@@ -303,7 +303,7 @@ static inline float2 meshEdgeFill(
     // From 1.2×: with outlines snapped sharp, a cell across one is stretched
     // a little or a lot, and below 1.4× (the first threshold) the picture
     // still smeared across it, which read as every edge looking stretched
-    // (Nope, headset 2026-10-12). A gentle depth slope stretches cells by a
+    // (Movie A, headset 2026-10-12). A gentle depth slope stretches cells by a
     // few per cent at most.
     const float fill = smoothstep(1.2, 1.8, stretch);
     if (fill <= 0.0) { return tc; }
@@ -962,7 +962,7 @@ kernel void depthEdgeSnap(
     // row: the model says roughly where the outline is, the picture says
     // exactly. Earlier versions sorted each texel by colour, near or far, and
     // a dark subject before a dark background (a cap and neck against trees,
-    // Nope, headset 2026-10-12) had texels inside it sorted far, as holes the
+    // Movie A, headset 2026-10-12) had texels inside it sorted far, as holes the
     // far eye saw the background through. With one edge per outline, every
     // texel of the band agrees on it, and nothing deeper inside can flip.
     int edge = -1000;
@@ -978,7 +978,7 @@ kernel void depthEdgeSnap(
         // The strongest edge alone was at times one inside the subject (a
         // cap's brim against the neck, beside a dark head against dark trees),
         // which put the depth outline inside the head and the far eye's fill
-        // painted background over it (Nope, headset 2026-10-12). Erring
+        // painted background over it (Movie A, headset 2026-10-12). Erring
         // outwards costs a sliver of background moving with the subject,
         // erring inwards a missing piece of it.
         const float mid = 0.5 * (tq + prevT);
@@ -1019,7 +1019,7 @@ kernel void depthEdgeSnap(
 
 // The vertical half of the snap, after `depthEdgeSnap`. The model draws a
 // thin near object's top and bottom soft too, and that band spilled onto
-// whatever sits just below: the dark steps under Nope's corral rail took
+// whatever sits just below: the dark steps under Movie A's corral rail took
 // part of the rail's depth on their top rows, which shifted less than their
 // bottom rows and sheared them like a smudge (headset 2026-10-11). Colour
 // alone can't settle it (the first, symmetric column arm matched the dark
@@ -1048,7 +1048,7 @@ kernel void depthEdgeSnapVertical(
     // the ground running off to the horizon is a gentle slope over the whole
     // window. Without this the ground counted as an outline, its darker tufts
     // were pushed to the far side as speckles, and each column deciding alone
-    // drew streaks (Nope's corral, headset 2026-10-12).
+    // drew streaks (Movie A's corral, headset 2026-10-12).
     constexpr int kStep = 3;
     float steepest = 0.0;
     float back[kStep];
@@ -1108,7 +1108,7 @@ kernel void depthEdgeSnapVertical(
     // near depth, sure far depth, or neither. The first version leaned far
     // (near only for near-coloured texels joined to the near side), and a
     // tan glove before tan hills, coloured like neither the jacket and horse
-    // below it nor anything near, lost its top to the background (Nope,
+    // below it nor anything near, lost its top to the background (Movie A,
     // headset 2026-10-12). Joined to both, it stays near: a near object keeps
     // all of itself, and at worst a sliver of background moves with it.
     // Joined to neither, the model's depth stands.
@@ -1139,7 +1139,7 @@ kernel void depthEdgeSnapVertical(
 // background's (a pale shirt against pale ground) the snap decides texel by
 // texel, and a few on the subject's side of the outline went far: single
 // specks, which the mesh warp's fill then painted with background as pale
-// blotches along the outline (Nope's corral, headset 2026-10-12). A median
+// blotches along the outline (Movie A's corral, headset 2026-10-12). A median
 // drops a speck up to 2×2 texels and leaves an outline where it is.
 //
 // Then held over time where the picture didn't move. The snap runs after the

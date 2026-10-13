@@ -272,7 +272,7 @@ packed target. It still needs anti-aliasing, temporal/background reconstruction,
 and device performance validation before becoming the default. Sub-grid hair,
 soft/incorrect depth boundaries and transparent pixels remain limitations.
 
-On-device comparison on the paused Nope corral shot (2026-10-13) found noisy
+On-device comparison on the paused Movie A corral shot (2026-10-13) found noisy
 outlines, particularly the vertical railing. Keep it opt-in; passing the GPU
 tests does not establish movie quality. A separate Core ML row-stride fix
 removed broad distortion with the custom 686×308 model: its logical rows have
@@ -281,7 +281,7 @@ reads honor the reported strides, including still images and raw cache output.
 The original mesh's heuristic background edge fill also defaults to off: an
 exact paused-frame check and headset comparison showed it damaging the horse
 rider's jacket outline. It remains available through the debug switch.
-Luma-based outline snapping defaults to off too: House headset comparisons
+Luma-based outline snapping defaults to off too: Movie B headset comparisons
 showed improved face and subject edges without it. Joint-bilateral refinement
 and shot stabilization still run.
 
@@ -289,7 +289,7 @@ and shot stabilization still run.
 runtime and executes the GPU passes, including BGRA output. It checks both eyes,
 vertical and horizontal rails, smooth slopes, zero disparity, mirror and depth
 UV remapping. These tests do not silently skip because a SwiftPM resource bundle
-is missing. Hypnos's `scripts/compare-stereo-edges.py` captures movie-frame A/Bs.
+is missing. A host app can capture the same movie frames before and after a change to compare them.
 
 ## License
 

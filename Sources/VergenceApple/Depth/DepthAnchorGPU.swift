@@ -536,7 +536,7 @@ final class RealtimeDepthRefiner {
     /// bars come back as depth too: in a 2.2:1 film they were the nearest
     /// thing in the map and 40 % of it, so the robust range, the anchoring and
     /// the cut test all measured them, and the subject sat at half depth with
-    /// the bars on the glass (Nope, headset 2026-10-11). Everything here works
+    /// the bars on the glass (Movie A, headset 2026-10-11). Everything here works
     /// on the picture's own region, copied out; the output then needs no
     /// letterbox transform (its aspect is the frame's).
     private func contentRegion(of padded: MTLTexture, frame: CVPixelBuffer) -> MTLTexture? {

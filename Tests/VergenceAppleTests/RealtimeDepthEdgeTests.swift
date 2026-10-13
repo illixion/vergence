@@ -164,7 +164,7 @@ struct RealtimeDepthEdgeTests {
     }
 
     /// A thin near rail on pale ground with dark steps right under it, the
-    /// model's depth soft above and below the rail (Nope's corral). The steps'
+    /// model's depth soft above and below the rail (Movie A's corral). The steps'
     /// top rows must not keep the rail's depth (they shear like a smudge), and
     /// the rail must stay near.
     @Test func stepsUnderANearRailKeepTheirOwnDepth() throws {
@@ -258,7 +258,7 @@ struct RealtimeDepthEdgeTests {
         #expect(worst / max(hi - lo, 1e-6) < 0.02)
     }
 
-    /// A dark cap with a lit rim in front of dark trees (Nope, walking away):
+    /// A dark cap with a lit rim in front of dark trees (Movie A, walking away):
     /// inside the cap the colour matches the trees, but the rim stands between
     /// them, so the snap must not cut a far hole into the cap.
     @Test func darkSubjectBeforeDarkBackgroundKeepsItsInside() throws {
@@ -304,7 +304,7 @@ struct RealtimeDepthEdgeTests {
         #expect(snapped > soft - 0.05)
     }
 
-    /// A tan glove before tan hills, with the white horse below it (Nope):
+    /// A tan glove before tan hills, with the white horse below it (Movie A):
     /// the model's depth is soft across the glove's top, and the glove is
     /// coloured like the hills, not like what is near below it. It must keep
     /// its top.

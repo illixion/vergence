@@ -7,8 +7,8 @@
  A fixed strength (a share of the picture's width) can't suit every shot.
  Depth is relative, so every shot is spread over the whole budget: the nearest
  content on the glass, the farthest at the full shift. On the headset
- (2026-10-10) a landscape with a near subject (Nope's horse scene) fused
- only at 0.35× the shipped strength, while an interior (House) read flat
+ (2026-10-10) a landscape with a near subject (Movie A's horse scene) fused
+ only at 0.35× the shipped strength, while an interior (Movie B) read flat
  at 0.35× and right at 1×. In the landscape nearly every pixel sits at the far
  end, so nearly the whole picture carries the maximum shift.
 
@@ -103,7 +103,7 @@ public struct DepthComposition: Sendable, Equatable, Codable {
 /// reported, not yet applied.
 public enum StereoStrengthPolicy {
     /// Mean shift across the picture, as a share of the full strength, that a
-    /// shot may use. Uncalibrated: Nope's horse scene wanted about 0.35× and its
+    /// shot may use. Uncalibrated: Movie A's horse scene wanted about 0.35× and its
     /// mean shift is near 0.9, which puts this near 0.3.
     public static let targetMeanShift: Float = 0.3
     /// Never flatter than this: a shot that is all background still keeps
@@ -213,7 +213,7 @@ public enum StereoDepthMetrics {
 
 /// Squeezes the depth no pixel occupies out of a shot.
 ///
-/// A near subject before a far background (Nope's horse scene, Alpha's
+/// A near subject before a far background (Movie A's horse scene, Movie C's
 /// cliffs) spends the whole depth budget on the empty gap between them, so
 /// the step at the subject's outline is the full shift. That step is the
 /// strip each eye uncovers beside the subject, which no warp can fill with
@@ -224,10 +224,10 @@ public enum StereoDepthMetrics {
 /// pixels gets a slope of `floorSlope`, an occupied one keeps slope 1, and
 /// the near end stays where it was (on the glass with convergence 1), so the
 /// background comes forward by what the gap gave up. A room whose depth runs
-/// continuously through the picture (House) has no empty range and is left
+/// continuously through the picture (Movie B) has no empty range and is left
 /// as it was, which a single strength can't do for both.
 ///
-/// The tails are squeezed too: in Nope's wide shot by the corral, a thin
+/// The tails are squeezed too: in Movie A's wide shot by the corral, a thin
 /// rail near the camera was the only thing near and 97 % of the picture sat
 /// at the far end, so everything but the rail carried the full shift and the
 /// fence posts between doubled (headset 2026-10-11). Squeezed, the rail stays
@@ -239,12 +239,12 @@ public struct DepthGapCompressor: Sendable {
     public static let binCount = 32
     public struct Tuning: Sendable, Equatable {
         /// Slope given to an empty range: the gap keeps this share of its
-        /// depth, so what's behind a subject still reads as behind it. Nope
+        /// depth, so what's behind a subject still reads as behind it. Movie A
         /// fused at about 0.35× strength, nearly all of it gap.
         public var floorSlope: Float = 0.25
         /// A range holding at most `emptyDensity` of an even spread counts as
         /// empty, and at least `fullDensity` as occupied; between, the slope
-        /// eases. In Nope's horse scene the gap still held 7 % of the pixels
+        /// eases. In Movie A's horse scene the gap still held 7 % of the pixels
         /// (the horse's body, outline ramps), about 0.13 of an even spread, so
         /// "empty" has to reach past that.
         public var emptyDensity: Float = 0.2
