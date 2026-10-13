@@ -84,27 +84,45 @@ enum StillDepthExtraction {
         let height = shape[shape.count - 2]
         let width = shape[shape.count - 1]
         guard width > 0, height > 0 else { return nil }
+        let strides = array.strides.map(\.intValue)
+        guard strides.count == shape.count else { return nil }
+        let rowStride = strides[strides.count - 2], columnStride = strides[strides.count - 1]
+        guard rowStride > 0, columnStride > 0 else { return nil }
         let count = width * height
         var values = [Float](repeating: 0, count: count)
         switch array.dataType {
         case .float32:
             let ptr = array.dataPointer.assumingMemoryBound(to: Float.self)
-            values.withUnsafeMutableBufferPointer { $0.baseAddress!.update(from: ptr, count: count) }
+            for y in 0..<height {
+                for x in 0..<width { values[y * width + x] = ptr[y * rowStride + x * columnStride] }
+            }
         case .float16:
+            // Core ML may pad each row (686 columns occupy a 704-element
+            // stride on device). Gather only the plane's logical elements.
+            // UInt16 + vImage also works on Intel macOS, without Float16.
+            let ptr = array.dataPointer.assumingMemoryBound(to: UInt16.self)
+            var packed = [UInt16](repeating: 0, count: count)
+            for y in 0..<height {
+                for x in 0..<width { packed[y * width + x] = ptr[y * rowStride + x * columnStride] }
+            }
             values.withUnsafeMutableBytes { destBytes in
-                var source = vImage_Buffer(
-                    data: array.dataPointer, height: 1,
-                    width: vImagePixelCount(count), rowBytes: count * MemoryLayout<UInt16>.stride
-                )
-                var dest = vImage_Buffer(
-                    data: destBytes.baseAddress, height: 1,
-                    width: vImagePixelCount(count), rowBytes: count * MemoryLayout<Float>.stride
-                )
-                vImageConvert_Planar16FtoPlanarF(&source, &dest, 0)
+                packed.withUnsafeMutableBytes { sourceBytes in
+                    var source = vImage_Buffer(
+                        data: sourceBytes.baseAddress, height: 1,
+                        width: vImagePixelCount(count), rowBytes: count * MemoryLayout<UInt16>.stride
+                    )
+                    var dest = vImage_Buffer(
+                        data: destBytes.baseAddress, height: 1,
+                        width: vImagePixelCount(count), rowBytes: count * MemoryLayout<Float>.stride
+                    )
+                    vImageConvert_Planar16FtoPlanarF(&source, &dest, 0)
+                }
             }
         case .double:
             let ptr = array.dataPointer.assumingMemoryBound(to: Double.self)
-            values.withUnsafeMutableBufferPointer { vDSP_vdpsp(ptr, 1, $0.baseAddress!, 1, vDSP_Length(count)) }
+            for y in 0..<height {
+                for x in 0..<width { values[y * width + x] = Float(ptr[y * rowStride + x * columnStride]) }
+            }
         default:
             return nil
         }

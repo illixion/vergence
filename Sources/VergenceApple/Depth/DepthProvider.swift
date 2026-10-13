@@ -724,46 +724,10 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
     /// MLMultiArray output: normalize to 0-1 and upload to an r16Float texture.
     /// Assumes the last two dimensions are height × width.
     private func makeTexture(from array: MLMultiArray) -> MTLTexture? {
-        let shape = array.shape.map(\.intValue)
-        guard shape.count >= 2 else { return nil }
-        let height = shape[shape.count - 2]
-        let width = shape[shape.count - 1]
-        guard width > 0, height > 0 else { return nil }
-
+        guard let plane = StillDepthExtraction.floats(from: array) else { return nil }
+        let width = plane.width, height = plane.height
         let count = width * height
-        var values = [Float](repeating: 0, count: count)
-        let base = 0 // first slice of any leading (batch/channel) dimensions
-        switch array.dataType {
-        case .float32:
-            let ptr = array.dataPointer.assumingMemoryBound(to: Float.self)
-            values.withUnsafeMutableBufferPointer { dest in
-                dest.baseAddress?.update(from: ptr + base, count: count)
-            }
-        case .float16:
-            let ptr = array.dataPointer.assumingMemoryBound(to: UInt16.self)
-            values.withUnsafeMutableBytes { destBytes in
-                var source = vImage_Buffer(
-                    data: UnsafeMutableRawPointer(mutating: ptr + base),
-                    height: 1,
-                    width: vImagePixelCount(count),
-                    rowBytes: count * MemoryLayout<UInt16>.stride
-                )
-                var dest = vImage_Buffer(
-                    data: destBytes.baseAddress,
-                    height: 1,
-                    width: vImagePixelCount(count),
-                    rowBytes: count * MemoryLayout<Float>.stride
-                )
-                vImageConvert_Planar16FtoPlanarF(&source, &dest, 0)
-            }
-        case .double:
-            let ptr = array.dataPointer.assumingMemoryBound(to: Double.self)
-            values.withUnsafeMutableBufferPointer { dest in
-                vDSP_vdpsp(ptr + base, 1, dest.baseAddress!, 1, vDSP_Length(count))
-            }
-        default:
-            return nil
-        }
+        var values = plane.values
 
         var minV: Float = 0
         var maxV: Float = 0
@@ -833,21 +797,22 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
             return texture
         }
 
-        switch array.dataType {
-        case .float16:
-            return makeTexture(.r16Float, bytes: array.dataPointer, bytesPerRow: width * 2)
-        case .float32:
-            return makeTexture(.r32Float, bytes: array.dataPointer, bytesPerRow: width * 4)
-        case .double:
-            let count = width * height
-            let ptr = array.dataPointer.assumingMemoryBound(to: Double.self)
-            var values = [Float](repeating: 0, count: count)
-            for i in 0..<count { values[i] = Float(ptr[i]) }
-            return values.withUnsafeBytes { bytes in
-                makeTexture(.r32Float, bytes: bytes.baseAddress!, bytesPerRow: width * 4)
+        let strides = array.strides.map(\.intValue)
+        guard strides.count == shape.count else { return nil }
+        let rowStride = strides[strides.count - 2], columnStride = strides[strides.count - 1]
+        guard rowStride > 0, columnStride > 0 else { return nil }
+        if columnStride == 1 {
+            switch array.dataType {
+            case .float16:
+                return makeTexture(.r16Float, bytes: array.dataPointer, bytesPerRow: rowStride * 2)
+            case .float32:
+                return makeTexture(.r32Float, bytes: array.dataPointer, bytesPerRow: rowStride * 4)
+            default: break
             }
-        default:
-            return nil
+        }
+        guard let plane = StillDepthExtraction.floats(from: array) else { return nil }
+        return plane.values.withUnsafeBytes { bytes in
+            makeTexture(.r32Float, bytes: bytes.baseAddress!, bytesPerRow: width * 4)
         }
     }
 }
