@@ -294,4 +294,5 @@ is missing. A host app can capture the same movie frames before and after a chan
 ## License
 
 MIT, see `LICENSE`. edge264 (vendored under `Sources/CEdge264`) is BSD-3-Clause; see
+`THIRD_PARTY_NOTICES.md` and
 `Vendor/README.md` for the local patches.
