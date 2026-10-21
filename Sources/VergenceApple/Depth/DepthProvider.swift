@@ -589,6 +589,7 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
         }
         signposter.endInterval("depth-inference", inferState)
         guard let raw else { return nil }
+        StackHeadroom.check("CoreMLDepthProvider.refinedDepth")
         let refined = refiner.refine(raw: raw, frame: pixelBuffer, frameSeconds: frameSeconds)
         withExtendedLifetime(keepAlive) {}
         return refined

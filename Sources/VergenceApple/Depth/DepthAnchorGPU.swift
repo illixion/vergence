@@ -299,6 +299,7 @@ final class RealtimeDepthRefiner {
     /// Refine `raw` (model output for `frame`) into shot-space depth. The
     /// returned texture stays valid until the call after next.
     func refine(raw padded: MTLTexture, frame: CVPixelBuffer, frameSeconds: Double) -> MTLTexture? {
+        StackHeadroom.check("RealtimeDepthRefiner.refine")
         guard let raw = contentRegion(of: padded, frame: frame),
               ensureTextures(width: raw.width, height: raw.height),
               let videoTex = videoTexture(frame),
@@ -529,6 +530,7 @@ final class RealtimeDepthRefiner {
         StereoDepthMetrics.record(composition, current: shots.current, finished: finished, gapSpan: lastGapCurve.span)
         guard let shot = finished, shot.end - shot.start >= 1 else { return }
         let c = shot.composition
+        StackHeadroom.check("RealtimeDepthRefiner.recordComposition")
         VergenceLog.pipeline.info("Depth shot \(shot.start, format: .fixed(precision: 1), privacy: .public)–\(shot.end, format: .fixed(precision: 1), privacy: .public) s: mean \(c.mean, format: .fixed(precision: 2), privacy: .public), p05/p50/p95 \(c.p05, format: .fixed(precision: 2), privacy: .public)/\(c.p50, format: .fixed(precision: 2), privacy: .public)/\(c.p95, format: .fixed(precision: 2), privacy: .public), far \(c.farShare, format: .fixed(precision: 2), privacy: .public), steps>0.5 \(c.stepShare50, format: .fixed(precision: 3), privacy: .public), gap span \(endingShotGapSpan, format: .fixed(precision: 2), privacy: .public), proposed strength \(shot.proposedScale, format: .fixed(precision: 2), privacy: .public)x")
     }
 

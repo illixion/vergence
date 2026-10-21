@@ -218,6 +218,8 @@ public final class StereoPump: @unchecked Sendable {
     public var onUnshowablePicture: (@Sendable () -> Void)?
     /// Pump-queue only.
     private var checkedPicture = false
+    /// `StackHeadroom.baseline` has run for this pump.
+    private var loggedStackBaseline = false
     private var pictureUnshowable = false
 
     private struct DeliveryWindow {
@@ -379,6 +381,11 @@ public final class StereoPump: @unchecked Sendable {
     }
 
     private func tick() {
+        if !loggedStackBaseline {
+            loggedStackBaseline = true
+            StackHeadroom.baseline("StereoPump.tick")
+        }
+        StackHeadroom.check("StereoPump.tick")
         // A disconnected window can retain its SwiftUI/RealityKit graph.
         // A host-side close must end the timer and drop lastFrame rather
         // than masquerading as a pause and answering captures indefinitely.
@@ -506,6 +513,7 @@ public final class StereoPump: @unchecked Sendable {
         // frame's own depth is ready (slow inference just yields fewer frames);
         // cached mode looks the frame's depth up by presentation time. Either
         // way, image and depth can never mismatch — no ghosting.
+        StackHeadroom.check("StereoPump.renderAndEnqueue")
         let depthState = signposter.beginInterval("pump-depth")
         let frameDepth = depthSource?.frameDepth(itemTime: itemTime, frame: src)
         signposter.endInterval("pump-depth", depthState)
