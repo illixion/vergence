@@ -162,6 +162,10 @@ public final class SampleBufferFrameSource: PumpFrameSource, @unchecked Sendable
         return eligible
     }
 
+    public func playbackRate(hostTime: CFTimeInterval) -> Double? {
+        CMTimebaseGetRate(timebase)
+    }
+
     /// `image` as BGRA, through a pixel transfer when it isn't already.
     private func bgra(_ image: CVPixelBuffer) -> CVPixelBuffer? {
         if CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_32BGRA { return image }

@@ -197,6 +197,14 @@ public final class StereoPump: @unchecked Sendable {
     /// cadence self-throttles. Either way a tick only enqueues when a genuinely
     /// new decoded frame exists.
     private let frameInterval: Double
+    /// Pump-queue only. For a depth source that infers per frame
+    /// (`PumpDepthSource.limitsToSourceFrameRate`): faster than normal speed,
+    /// no more frames a second than the video has at normal speed. A frame
+    /// it leaves out is taken from the source and dropped, so the next tick
+    /// gets a newer one.
+    private var frameRateCap = FrameRateCap()
+    /// Pump-queue only: the last frame taken from the source, shown or not.
+    private var lastSourceSeconds: Double?
     /// Seconds to ramp depth strength back after a flat gap (avoids a 3D "pop").
     private let depthRampDuration: Double = 0.15
     /// Rolling per-stage wall time for the tick, logged once per window so the
@@ -227,10 +235,9 @@ public final class StereoPump: @unchecked Sendable {
         var itemSpan = 0.0
         var lastItemSeconds: Double?
         var sourceHeight = 0
-        /// The shortest gap between consecutive frames seen this pump: the
-        /// source's own frame spacing. Lifetime, so a window of drops can't
-        /// redefine it.
-        var sourceSpacing = Double.infinity
+        /// The source's own frame spacing. Lifetime, so a window of drops
+        /// can't redefine it.
+        var sourceSpacing = SourceFrameSpacing()
         var windowStart = CACurrentMediaTime()
     }
 
@@ -427,6 +434,11 @@ public final class StereoPump: @unchecked Sendable {
             }
         }
         if pictureUnshowable { return }
+        let itemSeconds = frame.itemTime.seconds
+        noteSourceFrame(itemSeconds: itemSeconds)
+        if depthSource?.limitsToSourceFrameRate == true,
+           !frameRateCap.admits(frameAt: itemSeconds, spacing: delivery.sourceSpacing.seconds,
+                                rate: frameSource.playbackRate(hostTime: hostTime) ?? 1) { return }
         lastFrame = frame
         reportSizeIfNeeded(frame.pixelBuffer)
 
@@ -440,18 +452,28 @@ public final class StereoPump: @unchecked Sendable {
         noteDelivered(itemSeconds: frame.itemTime.seconds, height: CVPixelBufferGetHeight(frame.pixelBuffer), at: CACurrentMediaTime())
     }
 
+    /// Every frame taken from the source, shown or left out by the cap,
+    /// tells its frame spacing.
+    private func noteSourceFrame(itemSeconds: Double) {
+        guard itemSeconds.isFinite else { return }
+        if let last = lastSourceSeconds { delivery.sourceSpacing.note(gap: itemSeconds - last) }
+        lastSourceSeconds = itemSeconds
+    }
+
     /// Counts a frame that reached the eyes against the source time it
     /// covers. A pump that can't keep up takes only the newest decoded
     /// frame, so the source frames between are never shown: the gaps between
-    /// shown frames grow past the source's own spacing.
+    /// shown frames grow past the source's own spacing. `itemSeconds` must be
+    /// the frame's own presentation time: the time the tick asked for would
+    /// make the gaps the ticks' spacing instead (a 24 fps film read as 59 or
+    /// 120 fps, so every report said it was overloaded).
     private func noteDelivered(itemSeconds: Double, height: Int, at now: CFTimeInterval) {
         guard itemSeconds.isFinite else { return }
         delivery.sourceHeight = height
         if let last = delivery.lastItemSeconds {
             let gap = itemSeconds - last
             // A seek, a loop or a pause/resume isn't a run of dropped frames.
-            if gap > 0, gap < 0.25 {
-                delivery.sourceSpacing = min(delivery.sourceSpacing, max(gap, 1.0 / 120.0))
+            if SourceFrameSpacing.range.contains(gap) {
                 delivery.itemSpan += gap
                 delivery.frames += 1
             }
@@ -464,16 +486,12 @@ public final class StereoPump: @unchecked Sendable {
             delivery.itemSpan = 0
             delivery.windowStart = now
         }
-        guard let onPerformance, delivery.frames >= 4, delivery.sourceSpacing.isFinite,
-              delivery.itemSpan > 0 else { return }
-        let expected = delivery.itemSpan / delivery.sourceSpacing
-        onPerformance(StereoPerformance(
-            shownFramesPerSecond: Double(delivery.frames) / window,
-            sourceFramesPerSecond: 1 / delivery.sourceSpacing,
-            deliveredFraction: min(1, Double(delivery.frames) / expected),
-            playbackRate: delivery.itemSpan / window,
-            sourceHeight: delivery.sourceHeight
-        ))
+        guard let onPerformance,
+              let report = StereoPerformance.measured(
+                frames: delivery.frames, itemSpan: delivery.itemSpan, window: window,
+                spacing: delivery.sourceSpacing.seconds, maxShownPerSecond: 1 / frameInterval,
+                sourceHeight: delivery.sourceHeight) else { return }
+        onPerformance(report)
     }
 
     /// Warp the mono frame into two BGRA eye render targets, convert each to a
@@ -936,7 +954,10 @@ public struct StereoPerformance: Sendable, Equatable {
     /// The source's own frame rate, from the shortest gap between frames.
     public var sourceFramesPerSecond: Double
     /// Of the source frames the playhead passed, the share that was shown
-    /// (1 = every frame). Below ~0.75 the picture visibly stutters.
+    /// (1 = every frame); faster than normal speed, of the frames the video
+    /// has at normal speed in that time, as no more can be asked of the
+    /// conversion (`StereoPerformance.measured`). Below ~0.75 the picture
+    /// visibly stutters.
     public var deliveredFraction: Double
     /// Source seconds per wall second; well under 1 means the player itself
     /// is starving (decode or network), not the conversion.

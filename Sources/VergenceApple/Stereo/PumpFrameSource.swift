@@ -57,12 +57,17 @@ public protocol PumpFrameSource: AnyObject, Sendable {
     ///   a source driven by a host-synchronised clock (AVPlayer) can map it onto
     ///   its own timeline. Push sources ignore it.
     func nextFrame(hostTime: CFTimeInterval) -> PumpFrame?
+    /// Source seconds per wall second at `hostTime`: 2 at double speed, 0
+    /// paused. Nil when the source can't tell (a push source fed at its own
+    /// pace), which the pump takes as normal speed.
+    func playbackRate(hostTime: CFTimeInterval) -> Double?
     /// Release decode resources; the pump is shutting down.
     func invalidate()
 }
 
 public extension PumpFrameSource {
     var isFinished: Bool { false }
+    func playbackRate(hostTime: CFTimeInterval) -> Double? { nil }
 }
 
 /// Pulls from an `AVPlayerItemVideoOutput` — the original Spatial Stash path,
@@ -77,11 +82,23 @@ public final class AVPlayerFrameSource: PumpFrameSource, @unchecked Sendable {
 
     public func nextFrame(hostTime: CFTimeInterval) -> PumpFrame? {
         let itemTime = output.itemTime(forHostTime: hostTime)
+        var presentationTime = CMTime.invalid
         guard output.hasNewPixelBuffer(forItemTime: itemTime),
-              let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else {
+              let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &presentationTime) else {
             return nil
         }
-        return PumpFrame(pixelBuffer: buffer, itemTime: itemTime)
+        // The frame's own time, not the tick's: the tick runs up to a tick
+        // behind the frame, so cached depth could match the next frame's,
+        // and frame gaps would be the ticks' spacing.
+        return PumpFrame(pixelBuffer: buffer, itemTime: presentationTime.isNumeric ? presentationTime : itemTime)
+    }
+
+    /// From the item's clock: how far it moves over the last tenth of a second.
+    public func playbackRate(hostTime: CFTimeInterval) -> Double? {
+        let now = output.itemTime(forHostTime: hostTime)
+        let before = output.itemTime(forHostTime: hostTime - 0.1)
+        guard now.isNumeric, before.isNumeric else { return nil }
+        return (now - before).seconds / 0.1
     }
 
     public func invalidate() {}

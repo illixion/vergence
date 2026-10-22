@@ -28,6 +28,7 @@ import CoreML
 import CoreVideo
 import Metal
 import os
+import QuartzCore
 import Vision
 import VideoToolbox
 import VergenceCore
@@ -87,6 +88,11 @@ public protocol PumpDepthSource: AnyObject {
     /// residual high-frequency detail rendered as per-vertex wobble when the
     /// grid was densified.
     var prefersDenseWarpGrid: Bool { get }
+    /// True when a new depth map costs an inference. Played faster than
+    /// normal speed, the pump then shows no more frames a second than the
+    /// video has at normal speed, evenly spaced, rather than as many as the
+    /// inference can manage (`FrameRateCap`).
+    var limitsToSourceFrameRate: Bool { get }
     /// Release decode/GPU resources; the pump is shutting down.
     func invalidate()
     /// Drop any held map so the next request computes it afresh, as if the
@@ -96,6 +102,7 @@ public protocol PumpDepthSource: AnyObject {
 }
 
 extension PumpDepthSource {
+    public var limitsToSourceFrameRate: Bool { false }
     public func recomputeNextDepth() {}
 }
 
@@ -122,17 +129,28 @@ public enum DepthModelRole: String, Sendable {
 /// async-decoupled pump — and it keeps ANE load unchanged while the video
 /// doubles in fluidity. ≤30fps content never holds: every frame spacing
 /// exceeds the interval, so it stays fully lock-step as before.
+///
+/// The interval is wall time, so the inference rate doesn't follow the
+/// playback speed: at 2× a 60 fps video shows 60 frames a second (the pump's
+/// cap, `limitsToSourceFrameRate`), each two source frames on, and still
+/// infers every other one, as at normal speed.
 public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
     private let provider: CoreMLDepthProvider
-    /// Video-timeline spacing below which a frame reuses the held depth.
-    /// 1/35s: 48-60fps content alternates infer/hold (24-30Hz inference);
-    /// 24/30fps frame spacing exceeds it, so those always re-infer.
+    /// Wall time since the last inference below which a frame reuses the
+    /// held depth. 1/35s: 48-60fps content alternates infer/hold (24-30Hz
+    /// inference); 24/30fps frame spacing exceeds it, so those always
+    /// re-infer.
     private static let reinferInterval = 1.0 / 35.0
+    /// The furthest on the video's timeline a held map may serve: a seek
+    /// always re-infers. More than a frame, since a faster speed shows frames
+    /// further apart.
+    private static let maxHeldStep = 0.1
     /// Held map is safe to reuse until the next inference: the provider's
     /// ping-pong output isn't rewritten in between, and the pump's previous
     /// warp has fully completed before the next tick.
     private var held: PumpFrameDepth?
     private var heldItemSeconds = -Double.infinity
+    private var heldHostTime = -Double.infinity
     /// Studio refinement (`DepthRefinement`), decided at creation: anchored
     /// shot-space depth, the depth budget, edge-aware filtering.
     private let refined: Bool
@@ -151,12 +169,15 @@ public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
     /// silhouettes would stairstep. Unrefined depth keeps the moderate grid
     /// (its residual detail rendered as per-vertex wobble on the dense one).
     public var prefersDenseWarpGrid: Bool { refined }
+    public let limitsToSourceFrameRate = true
 
     public func frameDepth(itemTime: CMTime, frame: CVPixelBuffer) -> PumpFrameDepth? {
         let t = itemTime.seconds
+        let now = CACurrentMediaTime()
         // Reuse only across a small forward step; a seek (backward or a jump)
         // always re-infers so held depth can never cross a discontinuity.
-        if let held, t.isFinite, t >= heldItemSeconds, t - heldItemSeconds < Self.reinferInterval {
+        if let held, t.isFinite, t >= heldItemSeconds, t - heldItemSeconds < Self.maxHeldStep,
+           now - heldHostTime < Self.reinferInterval {
             return held
         }
         let inferred = refined
@@ -179,6 +200,7 @@ public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
         )
         held = depth
         heldItemSeconds = t.isFinite ? t : -.infinity
+        heldHostTime = now
         return depth
     }
 
