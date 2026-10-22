@@ -527,11 +527,10 @@ final class DepthConverter: @unchecked Sendable {
 /// accumulates into the diff and re-infers, instead of creeping past a
 /// frame-to-frame threshold one sub-threshold step at a time.
 private final class FrameChangeDetector {
-    /// Samples per side of the sparse grid (48x48 = 2304 points, ~µs to read).
-    private static let gridSize = 48
-    /// Mean absolute luma delta (0-255 scale) below which the frame counts as
-    /// unchanged. Sensor grain on real footage typically measures 2-4, so it
-    /// never skips there (no harm); CG stills and freeze frames measure <0.5.
+    /// Mean absolute luma delta (0-255 scale, on `LumaSignature`'s 48×48
+    /// grid) below which the frame counts as unchanged. Sensor grain on real
+    /// footage typically measures 2-4, so it never skips there (no harm); CG
+    /// stills and freeze frames measure <0.5.
     private static let threshold: Float = 1.0
     /// Staleness bound: re-infer after this many consecutive skips regardless,
     /// covering the (rare) case of depth-relevant change with near-constant
@@ -545,19 +544,14 @@ private final class FrameChangeDetector {
     /// depth can be reused. On false, the sampled signature becomes the new
     /// reference and the caller must infer.
     func shouldReuseDepth(for frame: CVPixelBuffer) -> Bool {
-        guard let signature = Self.signature(of: frame) else {
+        guard let signature = LumaSignature.sample(frame) else {
             reference = []
             return false
         }
-        if reference.count == signature.count, consecutiveSkips < Self.maxConsecutiveSkips {
-            var sum: Float = 0
-            for i in 0..<signature.count {
-                sum += abs(signature[i] - reference[i])
-            }
-            if sum / Float(signature.count) < Self.threshold {
-                consecutiveSkips += 1
-                return true
-            }
+        if consecutiveSkips < Self.maxConsecutiveSkips,
+           let delta = LumaSignature.meanDelta(signature, reference), delta < Self.threshold {
+            consecutiveSkips += 1
+            return true
         }
         reference = signature
         consecutiveSkips = 0
@@ -569,33 +563,6 @@ private final class FrameChangeDetector {
     func invalidateReference() {
         reference = []
         consecutiveSkips = 0
-    }
-
-    /// Sparse grid of luma samples from the decoded BGRA frame.
-    private static func signature(of frame: CVPixelBuffer) -> [Float]? {
-        guard CVPixelBufferGetPixelFormatType(frame) == kCVPixelFormatType_32BGRA,
-              CVPixelBufferLockBaseAddress(frame, .readOnly) == kCVReturnSuccess else { return nil }
-        defer { CVPixelBufferUnlockBaseAddress(frame, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(frame) else { return nil }
-        let width = CVPixelBufferGetWidth(frame)
-        let height = CVPixelBufferGetHeight(frame)
-        guard width >= gridSize, height >= gridSize else { return nil }
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(frame)
-        let ptr = base.assumingMemoryBound(to: UInt8.self)
-
-        var signature = [Float](repeating: 0, count: gridSize * gridSize)
-        for gy in 0..<gridSize {
-            let y = gy * (height - 1) / (gridSize - 1)
-            let row = ptr + y * bytesPerRow
-            for gx in 0..<gridSize {
-                let x = gx * (width - 1) / (gridSize - 1)
-                let px = row + x * 4 // BGRA
-                // Integer luma approximation: (B + 2G + R) / 4.
-                let luma = UInt16(px[0]) + 2 * UInt16(px[1]) + UInt16(px[2])
-                signature[gy * gridSize + gx] = Float(luma) * 0.25
-            }
-        }
-        return signature
     }
 }
 

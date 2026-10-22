@@ -55,10 +55,23 @@ public struct PumpFrameDepth {
     /// refined source (anchored, unbounded shot-space depth) uses the studio
     /// S-curve so near content plateaus instead of clipping.
     public let budget: DepthBudget
+    /// What keeps `texture` valid while this value is held: a decoded
+    /// cache frame's texture-cache view, or the pooled copy of an inferred
+    /// map. The pump keeps a frame's depth for drawing it again while
+    /// paused, after its source has moved on.
+    let keepAlive: [Any]
 
     public init(
         texture: MTLTexture, uvScale: SIMD2<Float>, uvOffset: SIMD2<Float>,
         valueScale: Float, valueBias: Float, budget: DepthBudget = .legacy
+    ) {
+        self.init(texture: texture, uvScale: uvScale, uvOffset: uvOffset,
+                  valueScale: valueScale, valueBias: valueBias, budget: budget, keepAlive: [])
+    }
+
+    init(
+        texture: MTLTexture, uvScale: SIMD2<Float>, uvOffset: SIMD2<Float>,
+        valueScale: Float, valueBias: Float, budget: DepthBudget, keepAlive: [Any]
     ) {
         self.texture = texture
         self.uvScale = uvScale
@@ -66,6 +79,73 @@ public struct PumpFrameDepth {
         self.valueScale = valueScale
         self.valueBias = valueBias
         self.budget = budget
+        self.keepAlive = keepAlive
+    }
+}
+
+/// Depth for one frame that may still be being worked out on another thread
+/// (`PumpDepthSource.requestDepth`). Frames that reuse a map share its
+/// request. Thread-safe.
+public final class PumpDepthRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolved = false
+    private var result: PumpFrameDepth?
+    private var cancelled = false
+    private var seconds = 0.0
+    private var whenReady: (@Sendable () -> Void)?
+
+    /// - Parameter whenReady: called once, on whatever thread resolves it.
+    public init(whenReady: (@Sendable () -> Void)? = nil) {
+        self.whenReady = whenReady
+    }
+
+    /// Already resolved: a source that looks depth up on the spot.
+    public convenience init(depth: PumpFrameDepth?) {
+        self.init()
+        resolve(depth, computeSeconds: 0)
+    }
+
+    public var isReady: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return resolved
+    }
+
+    /// Nil until ready, and when there is none (an inference failure).
+    public var depth: PumpFrameDepth? {
+        lock.lock(); defer { lock.unlock() }
+        return result
+    }
+
+    /// How long the map took to work out, once ready.
+    public var computeSeconds: Double {
+        lock.lock(); defer { lock.unlock() }
+        return seconds
+    }
+
+    public var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled
+    }
+
+    /// Nothing is waiting for it any more (the frames were thrown away after
+    /// a seek); work not yet started is skipped.
+    public func cancel() {
+        lock.lock()
+        cancelled = true
+        whenReady = nil
+        lock.unlock()
+    }
+
+    public func resolve(_ depth: PumpFrameDepth?, computeSeconds: Double) {
+        lock.lock()
+        guard !resolved else { lock.unlock(); return }
+        resolved = true
+        result = cancelled ? nil : depth
+        seconds = computeSeconds
+        let notify = whenReady
+        whenReady = nil
+        lock.unlock()
+        notify?()
     }
 }
 
@@ -75,6 +155,16 @@ public protocol PumpDepthSource: AnyObject {
     /// Depth for the frame with presentation time `itemTime`, or nil when none
     /// is available right now (inference failure / cache seek gap).
     func frameDepth(itemTime: CMTime, frame: CVPixelBuffer) -> PumpFrameDepth?
+    /// True when depth is worked out on another thread, ahead of the frame
+    /// being drawn (`requestDepth`): the pump asks as it takes each frame and
+    /// keeps drawing earlier frames meanwhile. False: `frameDepth` is asked
+    /// as each frame is drawn (a lookup, such as cached depth).
+    var computesDepthAhead: Bool { get }
+    /// Start working out `frame`'s depth, in the order frames are shown.
+    /// `shownAt` is the host time it is due on screen (the time it is
+    /// taken, for a source with no clock). `whenReady` runs on any thread.
+    func requestDepth(for frame: PumpFrame, shownAt: CFTimeInterval,
+                      whenReady: @escaping @Sendable () -> Void) -> PumpDepthRequest
     /// True when missing depth should render FLAT (with the pump's strength
     /// ramp back). Both real sources set this: falling back to the
     /// different-looking heuristic warp for a cache seek gap or an isolated
@@ -104,6 +194,11 @@ public protocol PumpDepthSource: AnyObject {
 extension PumpDepthSource {
     public var limitsToSourceFrameRate: Bool { false }
     public func recomputeNextDepth() {}
+    public var computesDepthAhead: Bool { false }
+    public func requestDepth(for frame: PumpFrame, shownAt: CFTimeInterval,
+                             whenReady: @escaping @Sendable () -> Void) -> PumpDepthRequest {
+        PumpDepthRequest(depth: frameDepth(itemTime: frame.itemTime, frame: frame.pixelBuffer))
+    }
 }
 
 /// Which pipeline a depth model is being loaded for. The preference is split:
@@ -121,44 +216,49 @@ public enum DepthModelRole: String, Sendable {
     }
 }
 
-/// Realtime source: synchronous same-frame Core ML inference. High-frame-rate
-/// sources render video at full rate with depth inferred at ~half rate: a frame
-/// arriving sooner than `reinferInterval` after the last inference reuses the
-/// held map. That's a *bounded* ≤1-frame depth age (same as cached playback of
-/// a two-pass conversion's first sweep), not the unbounded staleness of an
-/// async-decoupled pump — and it keeps ANE load unchanged while the video
-/// doubles in fluidity. ≤30fps content never holds: every frame spacing
-/// exceeds the interval, so it stays fully lock-step as before.
+/// Realtime source: Core ML inference on the frames themselves, on a queue of
+/// its own, so the pump keeps drawing the frames before while the model runs
+/// (it used to wait for each map, so inference, warp and transfer took turns
+/// and a 60 fps video showed about 30 frames a second).
 ///
-/// The interval is wall time, so the inference rate doesn't follow the
-/// playback speed: at 2× a 60 fps video shows 60 frames a second (the pump's
-/// cap, `limitsToSourceFrameRate`), each two source frames on, and still
-/// infers every other one, as at normal speed.
+/// High-frame-rate video shows at full rate with depth inferred at about half
+/// rate: a frame shown within 1/35 s of the frame the last map was inferred
+/// for reuses that map (`HeldDepthPolicy`). That's a *bounded* ≤1-frame depth
+/// age (same as cached playback of a two-pass conversion's first sweep), not
+/// the unbounded staleness of an async-decoupled pump, and never across a cut:
+/// a frame that doesn't look like the one the map is for gets its own.
+/// ≤30fps content never holds: every frame spacing exceeds the interval, so
+/// it stays fully lock-step.
+///
+/// The interval is in presentation (wall) time, so the inference rate doesn't
+/// follow the playback speed: at 2× a 60 fps video shows 60 frames a second
+/// (the pump's cap, `limitsToSourceFrameRate`), each two source frames on,
+/// and still infers every other one, as at normal speed.
 public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
     private let provider: CoreMLDepthProvider
-    /// Wall time since the last inference below which a frame reuses the
-    /// held depth. 1/35s: 48-60fps content alternates infer/hold (24-30Hz
-    /// inference); 24/30fps frame spacing exceeds it, so those always
-    /// re-infer.
-    private static let reinferInterval = 1.0 / 35.0
-    /// The furthest on the video's timeline a held map may serve: a seek
-    /// always re-infers. More than a frame, since a faster speed shows frames
-    /// further apart.
-    private static let maxHeldStep = 0.1
-    /// Held map is safe to reuse until the next inference: the provider's
-    /// ping-pong output isn't rewritten in between, and the pump's previous
-    /// warp has fully completed before the next tick.
-    private var held: PumpFrameDepth?
-    private var heldItemSeconds = -Double.infinity
-    private var heldHostTime = -Double.infinity
     /// Studio refinement (`DepthRefinement`), decided at creation: anchored
     /// shot-space depth, the depth budget, edge-aware filtering.
     private let refined: Bool
+    /// The model and the refiner run here, one frame at a time in the order
+    /// frames are shown (the refiner's temporal state depends on it). Nothing
+    /// else touches `provider`.
+    private let inferenceQueue = DispatchQueue(label: "com.illixion.vergence.depth-inference", qos: .userInteractive)
+    /// The provider's output is a two-deep ring that the next inference but
+    /// one overwrites, and with frames taken ahead a map can still be waiting
+    /// to be drawn by then; each map is copied out.
+    private let pool: DepthTexturePool?
+    /// Pump queue only.
+    private var policy = HeldDepthPolicy()
+    /// Pump queue only: the request for the map later frames may reuse.
+    private var keyRequest: PumpDepthRequest?
+    private let stateLock = NSLock()
+    private var invalidated = false
 
     public init?(device: MTLDevice) {
         guard let provider = CoreMLDepthProvider(device: device, role: .realtime) else { return nil }
         self.provider = provider
         self.refined = DepthRefinement.isEnabled && provider.supportsRefinement
+        self.pool = DepthTexturePool(device: device)
     }
 
     /// An inference hiccup renders flat (+ ramp back) rather than swapping in
@@ -170,49 +270,143 @@ public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
     /// (its residual detail rendered as per-vertex wobble on the dense one).
     public var prefersDenseWarpGrid: Bool { refined }
     public let limitsToSourceFrameRate = true
+    public let computesDepthAhead = true
 
+    public func requestDepth(for frame: PumpFrame, shownAt: CFTimeInterval,
+                             whenReady: @escaping @Sendable () -> Void) -> PumpDepthRequest {
+        let seconds = frame.itemTime.seconds
+        // A map that failed or was thrown away has nothing to lend.
+        if let key = keyRequest, key.isCancelled || (key.isReady && key.depth == nil) {
+            keyRequest = nil
+            policy.forget()
+        }
+        let signature = LumaSignature.sample(frame.pixelBuffer)
+        if policy.decide(seconds: seconds, shownAt: shownAt, signature: signature) == .hold {
+            if let keyRequest { return keyRequest }
+            // The policy outlived its map; start over from this frame.
+            policy.forget()
+            _ = policy.decide(seconds: seconds, shownAt: shownAt, signature: signature)
+        }
+        let request = PumpDepthRequest(whenReady: whenReady)
+        keyRequest = request
+        inferenceQueue.async { [self] in
+            guard !request.isCancelled, !isInvalidated else {
+                request.resolve(nil, computeSeconds: 0)
+                return
+            }
+            let start = CACurrentMediaTime()
+            let depth = computeDepth(for: frame.pixelBuffer, seconds: seconds)
+            request.resolve(depth, computeSeconds: CACurrentMediaTime() - start)
+        }
+        return request
+    }
+
+    /// Synchronous, for a caller that wants one map now; still on the
+    /// inference queue, which owns the provider.
     public func frameDepth(itemTime: CMTime, frame: CVPixelBuffer) -> PumpFrameDepth? {
-        let t = itemTime.seconds
-        let now = CACurrentMediaTime()
-        // Reuse only across a small forward step; a seek (backward or a jump)
-        // always re-infers so held depth can never cross a discontinuity.
-        if let held, t.isFinite, t >= heldItemSeconds, t - heldItemSeconds < Self.maxHeldStep,
-           now - heldHostTime < Self.reinferInterval {
-            return held
-        }
+        inferenceQueue.sync { computeDepth(for: frame, seconds: itemTime.seconds) }
+    }
+
+    /// Inference queue only.
+    private func computeDepth(for frame: CVPixelBuffer, seconds: Double) -> PumpFrameDepth? {
         let inferred = refined
-            ? provider.refinedDepth(for: frame, frameSeconds: t)
+            ? provider.refinedDepth(for: frame, frameSeconds: seconds)
             : provider.depth(for: frame)
-        guard let texture = inferred else {
-            // Inference hiccup: don't hold through it — the next frame should
-            // try again rather than extend a map of unknown age.
-            held = nil
-            heldItemSeconds = -.infinity
-            return nil
-        }
+        guard let inferred, let owned = pool?.copy(inferred) else { return nil }
         let uv = CoreMLDepthProvider.letterboxUVTransform(
             videoWidth: CVPixelBufferGetWidth(frame), videoHeight: CVPixelBufferGetHeight(frame),
-            depthWidth: texture.width, depthHeight: texture.height
+            depthWidth: owned.texture.width, depthHeight: owned.texture.height
         )
-        let depth = PumpFrameDepth(
-            texture: texture, uvScale: uv.scale, uvOffset: uv.offset,
-            valueScale: 1, valueBias: 0, budget: refined ? .studio : .legacy
+        return PumpFrameDepth(
+            texture: owned.texture, uvScale: uv.scale, uvOffset: uv.offset,
+            valueScale: 1, valueBias: 0, budget: refined ? .studio : .legacy, keepAlive: [owned]
         )
-        held = depth
-        heldItemSeconds = t.isFinite ? t : -.infinity
-        heldHostTime = now
-        return depth
+    }
+
+    private var isInvalidated: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return invalidated
     }
 
     public func invalidate() {
-        held = nil
+        stateLock.lock()
+        invalidated = true
+        stateLock.unlock()
+        keyRequest?.cancel()
+        keyRequest = nil
     }
 
     public func recomputeNextDepth() {
-        held = nil
-        heldItemSeconds = -.infinity
-        provider.resetRefinement()
+        keyRequest = nil
+        policy.forget()
+        inferenceQueue.async { [provider] in provider.resetRefinement() }
     }
+}
+
+/// Textures inferred maps are copied into, handed back when the last frame
+/// drawn with one lets go of it (`PooledDepthTexture`). The pump only lets go
+/// after the warp that read it has completed.
+final class DepthTexturePool: @unchecked Sendable {
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let lock = NSLock()
+    private var free: [MTLTexture] = []
+    /// More than a pump at 60 fps has in flight; extras are let go.
+    private static let maxFree = 8
+
+    init?(device: MTLDevice) {
+        guard let commandQueue = device.makeCommandQueue() else { return nil }
+        self.device = device
+        self.commandQueue = commandQueue
+    }
+
+    /// A copy of `source` that lives as long as the returned object.
+    func copy(_ source: MTLTexture) -> PooledDepthTexture? {
+        guard let texture = take(matching: source),
+              let cmd = commandQueue.makeCommandBuffer(),
+              let blit = cmd.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: source, to: texture)
+        blit.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        guard cmd.status == .completed else { giveBack(texture); return nil }
+        return PooledDepthTexture(texture: texture, pool: self)
+    }
+
+    private func take(matching source: MTLTexture) -> MTLTexture? {
+        lock.lock()
+        if let index = free.firstIndex(where: {
+            $0.width == source.width && $0.height == source.height && $0.pixelFormat == source.pixelFormat
+        }) {
+            let texture = free.remove(at: index)
+            lock.unlock()
+            return texture
+        }
+        lock.unlock()
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: source.pixelFormat, width: source.width, height: source.height, mipmapped: false
+        )
+        desc.usage = [.shaderRead]
+        desc.storageMode = .private
+        return device.makeTexture(descriptor: desc)
+    }
+
+    fileprivate func giveBack(_ texture: MTLTexture) {
+        lock.lock(); defer { lock.unlock() }
+        if free.count < Self.maxFree { free.append(texture) }
+    }
+}
+
+final class PooledDepthTexture: @unchecked Sendable {
+    let texture: MTLTexture
+    private let pool: DepthTexturePool
+
+    init(texture: MTLTexture, pool: DepthTexturePool) {
+        self.texture = texture
+        self.pool = pool
+    }
+
+    deinit { pool.giveBack(texture) }
 }
 
 /// CPU mirror of the Metal `DepthStabilizeParams` struct (int, 3 floats, uint,

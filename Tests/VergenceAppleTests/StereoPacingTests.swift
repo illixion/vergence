@@ -148,4 +148,190 @@ struct StereoPacingTests {
         for _ in 0 ..< 50 { spacing.note(gap: 2.0 / 30) }
         #expect(abs(spacing.seconds - 1.0 / 30) < 1e-9)
     }
+
+    // MARK: Taking every frame in turn
+
+    static func admitted(fps: Double, speed: Double, limits: Bool, minimumInterval: Double, frames: Int) -> [Int] {
+        var cap = FrameRateCap()
+        return (0 ..< frames).filter {
+            cap.admits(frameAt: Double($0) / fps, spacing: 1 / fps, rate: speed,
+                       limitsToNormalSpeed: limits, minimumInterval: minimumInterval)
+        }
+    }
+
+    @Test func aPumpTakingEveryFrameShowsNoMoreThanItTicks() {
+        // 120 fps at normal speed: every other frame, at 60.
+        let shown = Self.admitted(fps: 120, speed: 1, limits: true, minimumInterval: 1.0 / 60, frames: 240)
+        #expect(zip(shown, shown.dropFirst()).allSatisfy { $1 - $0 == 2 })
+        // 60 fps is the tick rate already: every frame.
+        #expect(Self.admitted(fps: 60, speed: 1, limits: true, minimumInterval: 1.0 / 60, frames: 120).count == 120)
+        #expect(Self.admitted(fps: 59.94, speed: 1, limits: false, minimumInterval: 1.0 / 60, frames: 120).count == 120)
+    }
+
+    @Test func cachedDepthAtTwiceSpeedShowsWhatTheTicksAllow() {
+        // 60 fps at 2×: every other frame (60 a second), as the old pump's
+        // newest-frame-per-tick did.
+        let sixty = Self.admitted(fps: 60, speed: 2, limits: false, minimumInterval: 1.0 / 60, frames: 240)
+        #expect(zip(sixty, sixty.dropFirst()).allSatisfy { $1 - $0 == 2 })
+        // 24 fps at 2× is 48 a second, under the ticks: every frame.
+        #expect(Self.admitted(fps: 24, speed: 2, limits: false, minimumInterval: 1.0 / 60, frames: 96).count == 96)
+    }
+
+    @Test func theNextFrameIsAskedForInTurn() {
+        let s = 1.0 / 60
+        // Starting, or after a seek: the frame showing now.
+        #expect(LookaheadPull.target(last: nil, spacing: s, playhead: 10, windowEnd: 10.075) == 10)
+        // In turn, halfway past the next frame…
+        #expect(abs(LookaheadPull.target(last: 10, spacing: s, playhead: 10, windowEnd: 10.075) - (10 + 1.5 * s)) < 1e-9)
+        // …never past the window…
+        #expect(LookaheadPull.target(last: 10.07, spacing: s, playhead: 10, windowEnd: 10.075) == 10.075)
+        // …and from the playhead when the next one is late already.
+        #expect(LookaheadPull.target(last: 9.9, spacing: s, playhead: 10, windowEnd: 10.075) == 10)
+        // Spacing not known yet: the newest in the window.
+        #expect(LookaheadPull.target(last: 10, spacing: .infinity, playhead: 10, windowEnd: 10.075) == 10.075)
+    }
+
+    @Test func theClockTellsASeekFromAPause() {
+        // Playing on: no jump.
+        #expect(!LookaheadClock.isJump(previous: 10, previousRate: 1, elapsed: 1.0 / 60, playhead: 10 + 1.0 / 60, rate: 1))
+        // Paused, or stalled, in between: stopped short.
+        #expect(!LookaheadClock.isJump(previous: 10, previousRate: 1, elapsed: 1.0 / 60, playhead: 10.005, rate: 0))
+        // Resumed, or sped up, in between.
+        #expect(!LookaheadClock.isJump(previous: 10, previousRate: 0, elapsed: 1.0 / 60, playhead: 10.01, rate: 1))
+        #expect(!LookaheadClock.isJump(previous: 10, previousRate: 1, elapsed: 1.0 / 60, playhead: 10 + 2.0 / 60, rate: 2))
+        // A seek either way, and a paused step of one frame.
+        #expect(LookaheadClock.isJump(previous: 10, previousRate: 1, elapsed: 1.0 / 60, playhead: 40, rate: 1))
+        #expect(LookaheadClock.isJump(previous: 10, previousRate: 1, elapsed: 1.0 / 60, playhead: 3, rate: 1))
+        #expect(LookaheadClock.isJump(previous: 10, previousRate: 0, elapsed: 1.0 / 60, playhead: 10 + 1.0 / 24, rate: 0))
+    }
+
+    @Test func framesQueuedAheadAreRetimedWhenTheClockChanges() {
+        #expect(!LookaheadClock.needsRetime(queuedFor: 5.050, due: 5.052))
+        #expect(LookaheadClock.needsRetime(queuedFor: 5.050, due: nil))     // paused
+        #expect(LookaheadClock.needsRetime(queuedFor: 5.050, due: 5.025))   // twice as fast
+        #expect(LookaheadClock.isDiscontinuous(last: 3, playhead: 10, windowEnd: 10.075))
+        #expect(LookaheadClock.isDiscontinuous(last: 30, playhead: 10, windowEnd: 10.075))
+        #expect(!LookaheadClock.isDiscontinuous(last: 10.075, playhead: 10, windowEnd: 10))   // paused, frames ahead
+    }
+
+    // MARK: Held depth
+
+    static let picture = [Float](repeating: 100, count: 16)
+    static let anotherShot = [Float](repeating: 30, count: 16)
+
+    static func decisions(fps: Double, speed: Double = 1, frames: Int,
+                          signature: (Int) -> [Float]? = { _ in picture }) -> [HeldDepthPolicy.Decision] {
+        var policy = HeldDepthPolicy()
+        return (0 ..< frames).map { i in
+            policy.decide(seconds: Double(i) / fps, shownAt: Double(i) / (fps * speed), signature: signature(i))
+        }
+    }
+
+    @Test func sixtyFramesASecondReuseEveryOtherMap() {
+        let d = Self.decisions(fps: 60, frames: 12)
+        #expect(d == Array(repeating: [HeldDepthPolicy.Decision.infer, .hold], count: 6).flatMap { $0 })
+        // 48 and 50 too.
+        #expect(Self.decisions(fps: 48, frames: 4) == [.infer, .hold, .infer, .hold])
+    }
+
+    @Test func thirtyFramesASecondInferEveryFrame() {
+        #expect(Self.decisions(fps: 30, frames: 6).allSatisfy { $0 == .infer })
+        #expect(Self.decisions(fps: 24, frames: 6).allSatisfy { $0 == .infer })
+        // Slowed to half speed, 60 fps shows 30 a second: every frame.
+        #expect(Self.decisions(fps: 60, speed: 0.5, frames: 6).allSatisfy { $0 == .infer })
+    }
+
+    @Test func aMapIsNeverReusedAcrossACut() {
+        let d = Self.decisions(fps: 60, frames: 4) { $0 >= 1 ? Self.anotherShot : Self.picture }
+        #expect(d == [.infer, .infer, .hold, .infer])
+        // No signature to judge by: infer.
+        #expect(Self.decisions(fps: 60, frames: 4) { _ in nil }.allSatisfy { $0 == .infer })
+    }
+
+    @Test func aMapIsNeverReusedAcrossASeek() {
+        var policy = HeldDepthPolicy()
+        #expect(policy.decide(seconds: 10, shownAt: 0, signature: Self.picture) == .infer)
+        // Back, or forward more than a held step, a frame later on screen.
+        #expect(policy.decide(seconds: 9, shownAt: 0.016, signature: Self.picture) == .infer)
+        #expect(policy.decide(seconds: 9.5, shownAt: 0.032, signature: Self.picture) == .infer)
+        policy.forget()
+        #expect(policy.decide(seconds: 9.5 + 1.0 / 60, shownAt: 0.048, signature: Self.picture) == .infer)
+    }
+
+    @Test func atTwiceSpeedTheMapRateStaysTheSame() {
+        // 60 fps at 2×, capped to every other frame: shown 1/60 s apart, two
+        // source frames apart; still one map for two frames shown.
+        var policy = HeldDepthPolicy()
+        let d = (0 ..< 6).map { k in
+            policy.decide(seconds: Double(2 * k) / 60, shownAt: Double(k) / 60, signature: Self.picture)
+        }
+        #expect(d == [.infer, .hold, .infer, .hold, .infer, .hold])
+    }
+
+    // MARK: The pipeline's budget
+
+    /// A clocked pump taking each frame `lead` ahead, inferring maps one at a
+    /// time on the model's own thread and drawing frames in order on its
+    /// own: which frames are drawn by the time they're due.
+    struct Pipeline {
+        var onTime = 0
+        var late = 0
+        var maps = 0
+        var held = 0
+        var maxDepthAge = 0.0
+    }
+
+    static func runPipeline(fps: Double, seconds: Double, inference: Double, draw: Double,
+                            lead: Double = 0.075) -> Pipeline {
+        var result = Pipeline()
+        var policy = HeldDepthPolicy()
+        var modelFree = 0.0, pumpFree = 0.0
+        var keyReady = 0.0, keySeconds = 0.0
+        let frames = Int(seconds * fps)
+        let start = 0.5
+        for i in 0 ..< frames {
+            let item = Double(i) / fps
+            let due = start + item
+            // Taken at the first tick when it is within `lead`.
+            let taken = max(0, ((due - lead) * 60).rounded(.up) / 60)
+            let ready: Double
+            switch policy.decide(seconds: item, shownAt: due, signature: picture) {
+            case .infer:
+                let begin = max(modelFree, taken)
+                modelFree = begin + inference
+                keyReady = modelFree
+                keySeconds = item
+                ready = keyReady
+                result.maps += 1
+            case .hold:
+                ready = keyReady
+                result.held += 1
+            }
+            result.maxDepthAge = max(result.maxDepthAge, item - keySeconds)
+            pumpFree = max(pumpFree, ready, taken) + draw
+            // The first frames start cold, with nothing taken ahead.
+            if i >= Int(fps / 2) {
+                if pumpFree <= due { result.onTime += 1 } else { result.late += 1 }
+            }
+        }
+        return result
+    }
+
+    @Test func sixtyFramesASecondFitTheMeasuredBudget() {
+        // Vision Pro (M5), 2026-10-22: a map ~24-28 ms, warp ~5 ms,
+        // transfer ~2 ms. The old pump did them in turn and showed ~30 fps.
+        let run = Self.runPipeline(fps: 60, seconds: 10, inference: 0.028, draw: 0.007)
+        #expect(run.late == 0, "\(run)")
+        #expect(run.held == run.maps || run.held == run.maps - 1)
+        #expect(run.maxDepthAge <= 1.0 / 60 + 1e-9)
+        // A slow map now and then still fits within the lead.
+        #expect(Self.runPipeline(fps: 60, seconds: 10, inference: 0.032, draw: 0.009).late == 0)
+    }
+
+    @Test func filmFrameRatesInferEveryFrameOnTime() {
+        let film = Self.runPipeline(fps: 24, seconds: 10, inference: 0.03, draw: 0.007)
+        #expect(film.late == 0 && film.held == 0, "\(film)")
+        let thirty = Self.runPipeline(fps: 30, seconds: 10, inference: 0.028, draw: 0.007)
+        #expect(thirty.late == 0 && thirty.held == 0, "\(thirty)")
+    }
 }

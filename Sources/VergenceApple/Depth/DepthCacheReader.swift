@@ -339,10 +339,12 @@ final class DepthCacheReader: @unchecked Sendable {
             if index < meta.displayBias.count { valueBias = meta.displayBias[index] }
             // meta.displayMedian is no longer consumed — see DepthCacheStore.
         }
+        // The pump may hold a frame's depth past this reader's pruning (a
+        // paused frame drawn again), so it carries the texture view's owners.
         return PumpFrameDepth(
             texture: decoded.texture, uvScale: uvScale, uvOffset: uvOffset,
             valueScale: valueScale, valueBias: valueBias,
-            budget: .studio
+            budget: .studio, keepAlive: decoded.keepAlive
         )
     }
 

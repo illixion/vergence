@@ -25,6 +25,22 @@
  always has, while a browser can push decoded frames in from a WKWebView with
  no AVPlayer anywhere in the picture.
 
+ Working ahead. A clocked source (`LookaheadFrameSource`) hands out frames
+ before they are due, so the pump takes each one `lead` early, in turn, and
+ queues the finished eyes for the host time the frame is due: the renderer
+ shows it on time, in step with the audio. It used to take the frame due *now*
+ and show it once its depth and warp were done, a tick (~33 ms in real time)
+ behind the sound. Real-time depth is inferred on its own queue
+ (`RealtimeDepthSource`) while the pump draws the frames before, so the model,
+ the warp and the transfer overlap instead of taking turns; at 48-60 fps every
+ other frame reuses the map before it (≤1 frame of depth age, never across a
+ cut). Pauses, stalls, speed changes and seeks are read off the clock itself:
+ frames queued for a time the clock no longer keeps are flushed and queued
+ again, and frames taken for a position the playhead left are dropped. A push
+ source has no clock: each frame shows as soon as it is drawn, or with depth
+ worked out ahead a fixed `pushDelay` after it came, so they stay evenly
+ spaced.
+
  visionOS 26 APIs: CMReadySampleBuffer / CMTaggedDynamicBuffer / CVReadOnlyPixelBuffer.
  */
 
@@ -175,9 +191,31 @@ public final class StereoPump: @unchecked Sendable {
     /// When the depth source last transitioned unavailable → available; drives
     /// the flat→3D strength ramp in flatten mode (cached seek gaps, startup).
     private var depthResumeTime: CFTimeInterval?
-    /// Pump-queue only: the last frame taken, re-shown after a renderer
-    /// flush (a paused picture has no new frame coming).
-    private var lastFrame: PumpFrame?
+    /// Set for a source that can hand frames out early; the pump then works
+    /// `lead` seconds ahead of the display.
+    private let clock: LookaheadFrameSource?
+    private let lead: Double
+    /// Pump-queue only: frames taken and not yet on screen, in order.
+    private var schedule: [ScheduledFrame] = []
+    /// Pump-queue only: the frame on screen (the last one queued whose time
+    /// came), drawn again when a paused picture changes.
+    private var shown: ScheduledFrame?
+    /// Pump-queue only: the item time of the last frame taken from the source.
+    private var lastTakenSeconds: Double?
+    /// Pump-queue only: the clock as the last tick read it, to tell a seek.
+    private var lastClockReading: (host: CFTimeInterval, item: Double, rate: Double)?
+    /// Pump-queue only: the renderer was flushed under the frame on screen,
+    /// so it is queued again unless a newer one shows at once.
+    private var needsRedisplay = false
+    /// Pump-queue only: the frame on screen with its depth being worked out
+    /// again (a debug capture asking for it), shown once ready.
+    private var pendingReshow: ScheduledFrame?
+    /// Pump-queue only. Set by the stop drain; a depth completion arriving
+    /// after it does nothing.
+    private var stopped = false
+    /// Pump-queue only: the request of the last frame drawn, to count maps
+    /// reused against maps worked out.
+    private var lastDrawnRequest: ObjectIdentifier?
     /// Flushes the renderer when visionOS took its decoding away; see
     /// `DecoderRecovery`. Made in `start()`, as it captures self.
     private var decoderRecovery: DecoderRecovery?
@@ -191,12 +229,30 @@ public final class StereoPump: @unchecked Sendable {
     private let signposter = VergenceLog.signposter
 
     /// Tick rate: 60fps in both modes — the warp is only a few ms, so the pump
-    /// follows the source up to 60. Cached mode looks depth up by PTS; realtime
-    /// mode infers at ~30Hz and holds the map for the in-between frame (see
-    /// RealtimeDepthSource), with a slow inference gating its own tick so the
-    /// cadence self-throttles. Either way a tick only enqueues when a genuinely
-    /// new decoded frame exists.
+    /// follows the source up to 60 (and no faster: a 120 fps video shows every
+    /// other frame). Cached mode looks depth up by PTS; realtime mode infers
+    /// at ~30Hz and holds the map for the in-between frame (see
+    /// RealtimeDepthSource); a frame whose map isn't ready waits for it, so a
+    /// slow model shows fewer frames, never older depth.
     private let frameInterval: Double
+    /// How far ahead of the display the pump works, for a clocked source:
+    /// long enough for a frame's inference, warp and transfer with room for a
+    /// slow one; a cached or packed picture only needs the warp.
+    private static let realtimeLead = 0.075
+    private static let drawLead = 0.04
+    /// A push source can't hand frames out early, so with depth worked out
+    /// ahead each frame shows this long after it came: a map and a draw fit
+    /// in it, and frames then show as evenly as they came (a frame reusing
+    /// the map before it is drawn right after that one, and shown at once
+    /// they would come in pairs).
+    private static let pushDelay = 0.04
+    /// Frames from a push source waiting for depth, at most; past that the
+    /// model can't keep up, and a newer frame is let go rather than queued
+    /// behind them.
+    private static let maxPushBacklog = 2
+    /// Frames taken and not yet on screen, at most: 75 ms at 60 fps is about
+    /// five, and each holds a decoded frame and two eye buffers.
+    private static let maxScheduled = 8
     /// Pump-queue only. For a depth source that infers per frame
     /// (`PumpDepthSource.limitsToSourceFrameRate`): faster than normal speed,
     /// no more frames a second than the video has at normal speed. A frame
@@ -242,12 +298,60 @@ public final class StereoPump: @unchecked Sendable {
     }
 
     private struct StageTiming {
-        var depth = 0.0
+        /// Looking depth up as a frame is drawn (a source that doesn't work
+        /// it out ahead).
+        var lookup = 0.0
+        /// Maps worked out ahead, their total time, and the frames drawn
+        /// with the map of the frame before.
+        var maps = 0
+        var mapSeconds = 0.0
+        var reused = 0
         var warp = 0.0
         var transfer = 0.0
-        var tick = 0.0
-        var frames = 0
+        var drawn = 0
+        var shown = 0
+        /// Queued after the time they were due (shown as soon as possible).
+        var late = 0
+        /// The last frame drawn's size.
+        var width = 0
+        var height = 0
         var windowStart = CACurrentMediaTime()
+    }
+
+    /// The two finished eye buffers of one frame. Kept, so a flush (a pause,
+    /// a speed change) can queue them again without drawing them again.
+    private struct Eyes {
+        let left: CVReadOnlyPixelBuffer
+        let right: CVReadOnlyPixelBuffer
+    }
+
+    /// A frame from the moment it is taken until it leaves the screen.
+    /// Pump-queue only.
+    private final class ScheduledFrame {
+        let frame: PumpFrame
+        /// Depth being worked out ahead (`PumpDepthSource.computesDepthAhead`).
+        let request: PumpDepthRequest?
+        /// The depth it was drawn with, once looked up: a frame is drawn
+        /// again (a paused picture's setting changed) with the same depth,
+        /// since the source may have moved past it.
+        var depth: PumpFrameDepth?
+        var hasDepth = false
+        var eyes: Eyes?
+        /// The host time it is queued in the renderer for; nil while not.
+        var queuedFor: CFTimeInterval?
+        /// Counted in the delivery report (queued again after a flush, it
+        /// isn't another frame shown).
+        var delivered = false
+        /// When the pump took it (host clock).
+        let takenAt: CFTimeInterval
+
+        init(frame: PumpFrame, request: PumpDepthRequest?, takenAt: CFTimeInterval) {
+            self.frame = frame
+            self.request = request
+            self.takenAt = takenAt
+        }
+
+        var itemSeconds: Double { frame.itemTime.seconds }
     }
     /// Bounds in-flight eye buffers so a stalled compositor can never make the
     /// pool allocate IOSurfaces without limit.
@@ -280,9 +384,14 @@ public final class StereoPump: @unchecked Sendable {
         self.device = warp.device
         self.commandQueue = commandQueue
         self.startHostTime = startHostTime
-        self.depthSource = packedLayout == nil ? depthSource : nil
+        let usedDepthSource = packedLayout == nil ? depthSource : nil
+        let clock = frameSource as? LookaheadFrameSource
+        self.depthSource = usedDepthSource
         self.packedLayout = packedLayout
         self.frameInterval = frameInterval
+        self.clock = clock
+        self.lead = clock == nil ? 0
+            : usedDepthSource?.computesDepthAhead == true ? Self.realtimeLead : Self.drawLead
         self.onVideoSizeKnown = onVideoSizeKnown
         self.transferSession = session
         self.subtitles = VergenceMetal.shared.flatMap {
@@ -333,10 +442,15 @@ public final class StereoPump: @unchecked Sendable {
         // Drain on the pump queue so no tick races teardown.
         queue.async { [weak self] in
             guard let self else { return }
+            stopped = true
+            for entry in schedule { entry.request?.cancel() }
+            schedule = []
+            shown = nil
+            pendingReshow?.request?.cancel()
+            pendingReshow = nil
             depthSource?.invalidate()
             frameSource.invalidate()
             if let textureCache { CVMetalTextureCacheFlush(textureCache, 0) }
-            self.lastFrame = nil
             self.bgraPool = nil
             self.outPool = nil
             self.eyeDepthTextures = [nil, nil]
@@ -370,21 +484,50 @@ public final class StereoPump: @unchecked Sendable {
 
     // MARK: Per-frame work (always on `queue`)
 
-    private func flushAndReshow() {
-        videoRenderer.flush()
-        guard let lastFrame, let textureCache else { return }
-        renderAndEnqueue(from: lastFrame.pixelBuffer, itemTime: lastFrame.itemTime, cache: textureCache,
-                         pts: CMTime(seconds: CACurrentMediaTime() - startHostTime, preferredTimescale: 90_000))
+    private var backgroundedNow: Bool {
+        lifecycleLock.lock(); defer { lifecycleLock.unlock() }
+        return isBackgrounded
     }
 
+    /// The renderer lost its decoding (see `DecoderRecovery`) and was
+    /// flushed: queue the frames again, the one on screen first.
+    private func flushAndReshow() {
+        videoRenderer.flush()
+        unqueueAll()
+        service(now: CACurrentMediaTime())
+    }
+
+    /// A setting or the subtitles changed. A paused picture has no new frame
+    /// coming, so the one on screen is drawn again, and the frames taken
+    /// ahead of it are drawn afresh before play resumes. While the clock
+    /// runs, the frames drawn next carry the change (within `lead`); drawing
+    /// the one on screen again would put it between frames already queued.
     private func reshowLastFrame() {
-        lifecycleLock.lock()
-        let backgrounded = isBackgrounded
-        lifecycleLock.unlock()
-        guard !backgrounded, videoRenderer.isReadyForMoreMediaData,
-              let lastFrame, let textureCache else { return }
-        renderAndEnqueue(from: lastFrame.pixelBuffer, itemTime: lastFrame.itemTime, cache: textureCache,
-                         pts: CMTime(seconds: CACurrentMediaTime() - startHostTime, preferredTimescale: 90_000))
+        guard !stopped, !backgroundedNow, !pictureUnshowable, let textureCache, let shown else { return }
+        let now = CACurrentMediaTime()
+        if let clock, (clock.playbackRate(hostTime: now) ?? 0) > 0.01 { return }
+        for entry in schedule where entry.queuedFor == nil { entry.eyes = nil }
+        if videoRenderer.isReadyForMoreMediaData, let eyes = draw(shown, cache: textureCache) {
+            shown.eyes = eyes
+            enqueue(eyes, at: now)
+            shown.queuedFor = now
+        }
+        service(now: now)
+    }
+
+    /// A debug capture wants the paused frame's depth worked out again: ask
+    /// for it as for the first frame of a shot, and show it once ready.
+    private func recomputeShownDepth() {
+        guard let shown, let depthSource, depthSource.computesDepthAhead else {
+            depthSource?.recomputeNextDepth()
+            reshowLastFrame()
+            return
+        }
+        guard pendingReshow == nil else { return }
+        depthSource.recomputeNextDepth()
+        let now = CACurrentMediaTime()
+        let request = depthSource.requestDepth(for: shown.frame, shownAt: now, whenReady: depthReadyHandler)
+        pendingReshow = ScheduledFrame(frame: shown.frame, request: request, takenAt: now)
     }
 
     private func tick() {
@@ -394,38 +537,113 @@ public final class StereoPump: @unchecked Sendable {
         }
         StackHeadroom.check("StereoPump.tick")
         // A disconnected window can retain its SwiftUI/RealityKit graph.
-        // A host-side close must end the timer and drop lastFrame rather
+        // A host-side close must end the timer and drop the frames rather
         // than masquerading as a pause and answering captures indefinitely.
         if frameSource.isFinished {
             stop()
             return
         }
-        lifecycleLock.lock()
-        let backgrounded = isBackgrounded
-        lifecycleLock.unlock()
         // No GPU work at all while backgrounded — not the warp, and not the
-        // depth inference that feeds it. The frame source keeps taking frames
-        // and discarding all but the newest, so foregrounding resumes on
-        // current content rather than replaying a backlog.
-        guard !backgrounded else { return }
+        // depth inference that feeds it. Frames taken ahead are let go (their
+        // inference called off); the frame source keeps taking frames and
+        // discarding all but the newest, so foregrounding resumes on current
+        // content rather than replaying a backlog.
+        guard !backgroundedNow else {
+            if !schedule.isEmpty { discardSchedule(now: CACurrentMediaTime()) }
+            return
+        }
 
         // A renderer whose decoding visionOS took away (another app's
         // immersive space) drops everything until flushed; the recovery
-        // flushes on this queue and re-shows the last frame.
+        // flushes on this queue and queues the frames again.
         if decoderRecovery?.checkRenderer() == true { return }
 
-        guard videoRenderer.isReadyForMoreMediaData, let textureCache else { return }
+        let now = CACurrentMediaTime()
+        if let clock { reconcile(with: clock, now: now) }
+        let took = takeFrames(now: now)
+        service(now: now)
+        // A paused picture draws nothing new; a capture (debug server) gets
+        // the frame on screen drawn again instead.
+        if !took, StereoEyeCapture.isRequested, !pictureUnshowable,
+           !schedule.contains(where: { $0.eyes == nil }) {
+            if StereoEyeCapture.recomputesDepth { recomputeShownDepth() } else { reshowLastFrame() }
+        }
+    }
 
-        let hostTime = CACurrentMediaTime()
-        guard let frame = frameSource.nextFrame(hostTime: hostTime) else {
-            // A paused picture draws nothing new; a capture (debug server)
-            // gets the last frame drawn again instead.
-            if StereoEyeCapture.isRequested, !pictureUnshowable {
-                if StereoEyeCapture.recomputesDepth { depthSource?.recomputeNextDepth() }
-                reshowLastFrame()
-            }
+    /// The clock moved under the frames taken ahead. Past a seek or a loop
+    /// they belong to the old position and are dropped; after a pause, a
+    /// stall or a speed change the ones already queued are due at other
+    /// times (or not at all), so the renderer is flushed and they are queued
+    /// again.
+    private func reconcile(with clock: LookaheadFrameSource, now: CFTimeInterval) {
+        let playhead = clock.itemTime(forHostTime: now).seconds
+        let windowEnd = clock.itemTime(forHostTime: now + lead).seconds
+        guard playhead.isFinite, windowEnd.isFinite else { return }
+        let rate = clock.playbackRate(hostTime: now) ?? 0
+        let previous = lastClockReading
+        lastClockReading = (now, playhead, rate)
+        // First, so the frame on screen is the last one whose time came.
+        prune(now: now)
+        let jumped = previous.map {
+            LookaheadClock.isJump(previous: $0.item, previousRate: $0.rate, elapsed: now - $0.host,
+                                  playhead: playhead, rate: rate)
+        } ?? false
+        if jumped || lastTakenSeconds.map({
+            LookaheadClock.isDiscontinuous(last: $0, playhead: playhead, windowEnd: windowEnd)
+        }) == true {
+            // Taken afresh from the playhead: the source has new frames there.
+            discardSchedule(now: now)
+            lastTakenSeconds = nil
             return
         }
+        for entry in schedule {
+            guard let queuedFor = entry.queuedFor, queuedFor > now else { continue }
+            let due = clock.dueHostTime(forItemTime: entry.frame.itemTime, at: now)
+            if LookaheadClock.needsRetime(queuedFor: queuedFor, due: due) {
+                videoRenderer.flush()
+                unqueueAll()
+                return
+            }
+        }
+    }
+
+    /// Take the frames due within `lead`, each in turn (a push source: its
+    /// one new frame). True when any frame came.
+    private func takeFrames(now: CFTimeInterval) -> Bool {
+        guard let clock else {
+            guard let frame = frameSource.nextFrame(hostTime: now) else { return false }
+            if schedule.filter({ $0.eyes == nil }).count >= Self.maxPushBacklog {
+                noteSourceFrame(itemSeconds: frame.itemTime.seconds)
+                return true
+            }
+            accept(frame, now: now)
+            return true
+        }
+        let playhead = clock.itemTime(forHostTime: now).seconds
+        let windowEnd = clock.itemTime(forHostTime: now + lead).seconds
+        guard playhead.isFinite, windowEnd.isFinite else { return false }
+        var took = false
+        for _ in 0 ..< Self.maxScheduled * 2 {
+            guard schedule.count < Self.maxScheduled else { break }
+            let target = LookaheadPull.target(last: lastTakenSeconds, spacing: delivery.sourceSpacing.seconds,
+                                              playhead: playhead, windowEnd: windowEnd)
+            // Nothing new can come at or before the last frame taken, and
+            // asking there would be answered with a frame already taken (the
+            // output hands out whatever differs from the last one it gave).
+            // A seek back starts over from the playhead (`reconcile`).
+            if let last = lastTakenSeconds, target <= last + 1e-6 { break }
+            guard let frame = clock.frame(atItemTime: CMTime(seconds: target, preferredTimescale: 600_000)) else {
+                break
+            }
+            took = true
+            accept(frame, now: now)
+        }
+        return took
+    }
+
+    /// One frame from the source: scheduled, with its depth asked for, or
+    /// left out (the frame-rate cap, a picture no warp can show).
+    private func accept(_ frame: PumpFrame, now: CFTimeInterval) {
         if !checkedPicture {
             checkedPicture = true
             if DolbyVisionFrames.needsSystemRenderer(frame.pixelBuffer) {
@@ -434,22 +652,152 @@ public final class StereoPump: @unchecked Sendable {
             }
         }
         if pictureUnshowable { return }
-        let itemSeconds = frame.itemTime.seconds
-        noteSourceFrame(itemSeconds: itemSeconds)
-        if depthSource?.limitsToSourceFrameRate == true,
-           !frameRateCap.admits(frameAt: itemSeconds, spacing: delivery.sourceSpacing.seconds,
-                                rate: frameSource.playbackRate(hostTime: hostTime) ?? 1) { return }
-        lastFrame = frame
+        let seconds = frame.itemTime.seconds
+        if let last = lastTakenSeconds, seconds.isFinite {
+            if abs(seconds - last) < 1e-6 { return }
+            // Back in time, or a jump forward: a seek or a loop. The frames
+            // taken for the old position would show before this one.
+            if seconds < last || seconds - last > LookaheadPull.maxStep { discardSchedule(now: now) }
+        }
+        noteSourceFrame(itemSeconds: seconds)
+        lastTakenSeconds = seconds.isFinite ? seconds : nil
+        guard frameRateCap.admits(
+            frameAt: seconds, spacing: delivery.sourceSpacing.seconds,
+            rate: frameSource.playbackRate(hostTime: now) ?? 1,
+            limitsToNormalSpeed: depthSource?.limitsToSourceFrameRate == true,
+            minimumInterval: clock == nil ? 0 : frameInterval
+        ) else { return }
         reportSizeIfNeeded(frame.pixelBuffer)
+        var request: PumpDepthRequest?
+        if let depthSource, depthSource.computesDepthAhead {
+            let shownAt = clock?.dueHostTime(forItemTime: frame.itemTime, at: now) ?? now
+            request = depthSource.requestDepth(for: frame, shownAt: shownAt, whenReady: depthReadyHandler)
+        }
+        schedule.append(ScheduledFrame(frame: frame, request: request, takenAt: now))
+    }
 
-        // Tag relative to the synchronizer's zero-based, host-driven timeline so
-        // the frame presents immediately and in order. Deliberately the host
-        // clock, not the frame's own itemTime: the renderer's synchronizer
-        // free-runs at rate 1 and only ever needs frames in order — the source's
-        // timeline governs audio and seeking, and stays with the source.
-        let pts = CMTime(seconds: hostTime - startHostTime, preferredTimescale: 90_000)
-        renderAndEnqueue(from: frame.pixelBuffer, itemTime: frame.itemTime, cache: textureCache, pts: pts)
-        noteDelivered(itemSeconds: frame.itemTime.seconds, height: CVPixelBufferGetHeight(frame.pixelBuffer), at: CACurrentMediaTime())
+    /// Runs on the inference queue when a map is ready.
+    private var depthReadyHandler: @Sendable () -> Void {
+        { [weak self] in self?.depthReady() }
+    }
+
+    private func depthReady() {
+        queue.async { [weak self] in
+            guard let self, !backgroundedNow else { return }
+            service(now: CACurrentMediaTime())
+        }
+    }
+
+    /// Draw what can be drawn, then queue what is drawn, in order.
+    private func service(now: CFTimeInterval) {
+        guard !stopped, !pictureUnshowable, let textureCache else { return }
+        if let reshow = pendingReshow, reshow.request?.isReady ?? true {
+            pendingReshow = nil
+            if videoRenderer.isReadyForMoreMediaData, let eyes = draw(reshow, cache: textureCache) {
+                reshow.eyes = eyes
+                reshow.delivered = true
+                enqueue(eyes, at: now)
+                reshow.queuedFor = now
+                shown = reshow
+            }
+        }
+        var index = 0
+        while index < schedule.count {
+            let entry = schedule[index]
+            if entry.eyes != nil { index += 1; continue }
+            // Maps come in order, so the first frame still waiting for one
+            // holds up the frames after it.
+            if let request = entry.request, !request.isReady { break }
+            guard let eyes = draw(entry, cache: textureCache) else {
+                schedule.remove(at: index)
+                continue
+            }
+            entry.eyes = eyes
+            index += 1
+        }
+        let drawn = CACurrentMediaTime()
+        queueDrawn(now: drawn)
+        prune(now: drawn)
+        logStageTimingIfDue(now: drawn)
+    }
+
+    /// Whether the frame's time has come: the clock's playhead has reached
+    /// it. A push source (no playhead) shows each frame once drawn.
+    private func isDue(_ entry: ScheduledFrame, playhead: Double?) -> Bool {
+        guard let playhead else { return false }
+        return entry.itemSeconds <= playhead + 0.001
+    }
+
+    /// Queue drawn frames in order, each for the host time it is due (now,
+    /// for a push source or a stopped clock). While paused only the frame at
+    /// the playhead goes in. A frame whose time has passed while a newer one
+    /// is drawn and due too is left out, rather than shown for an instant.
+    private func queueDrawn(now: CFTimeInterval) {
+        let playhead = clock.map { $0.itemTime(forHostTime: now).seconds }.flatMap { $0.isFinite ? $0 : nil }
+        let running = clock.map { ($0.playbackRate(hostTime: now) ?? 0) > 0.01 } ?? true
+        if needsRedisplay {
+            needsRedisplay = false
+            // Unless the next frame shows right away, the one that was on
+            // screen goes back in first (a flush may have cleared it).
+            let next = schedule.first { $0.queuedFor == nil }
+            let nextShowsNow = next.map { $0.eyes != nil && (clock == nil || isDue($0, playhead: playhead)) } ?? false
+            if !nextShowsNow, let shown, let eyes = shown.eyes, videoRenderer.isReadyForMoreMediaData {
+                enqueue(eyes, at: now)
+                shown.queuedFor = now
+            }
+        }
+        var index = 0
+        while index < schedule.count {
+            let entry = schedule[index]
+            if entry.queuedFor != nil { index += 1; continue }
+            guard let eyes = entry.eyes else { break }
+            let isDueNow = isDue(entry, playhead: playhead)
+            if isDueNow, index + 1 < schedule.count, schedule[index + 1].eyes != nil,
+               isDue(schedule[index + 1], playhead: playhead) {
+                schedule.remove(at: index)
+                continue
+            }
+            if clock != nil, !running, !isDueNow { break }
+            guard videoRenderer.isReadyForMoreMediaData else { break }
+            let dueAt = clock == nil
+                ? (entry.request != nil ? entry.takenAt + Self.pushDelay : nil)
+                : running ? clock?.dueHostTime(forItemTime: entry.frame.itemTime, at: now) : nil
+            let at = max(dueAt ?? now, now)
+            enqueue(eyes, at: at)
+            entry.queuedFor = at
+            if !entry.delivered {
+                entry.delivered = true
+                stageTiming.shown += 1
+                if let dueAt, dueAt < now - 0.002 { stageTiming.late += 1 }
+                noteDelivered(itemSeconds: entry.itemSeconds,
+                              height: CVPixelBufferGetHeight(entry.frame.pixelBuffer), at: now)
+            }
+            index += 1
+        }
+    }
+
+    /// Frames whose time on screen has come leave the schedule; the newest of
+    /// them is the frame on screen.
+    private func prune(now: CFTimeInterval) {
+        while let first = schedule.first, let queuedFor = first.queuedFor, queuedFor <= now {
+            shown = schedule.removeFirst()
+        }
+    }
+
+    /// The renderer was flushed: nothing is queued in it any more.
+    private func unqueueAll() {
+        for entry in schedule { entry.queuedFor = nil }
+        needsRedisplay = true
+    }
+
+    /// Drop every frame taken ahead (a seek, the app backgrounded), calling
+    /// off their depth, and flush what is queued for later. The frame on
+    /// screen stays until a new one replaces it.
+    private func discardSchedule(now: CFTimeInterval) {
+        if schedule.contains(where: { ($0.queuedFor ?? 0) > now }) { videoRenderer.flush() }
+        for entry in schedule { entry.request?.cancel() }
+        schedule = []
+        lastDrawnRequest = nil
     }
 
     /// Every frame taken from the source, shown or left out by the cap,
@@ -494,14 +842,46 @@ public final class StereoPump: @unchecked Sendable {
         onPerformance(report)
     }
 
-    /// Warp the mono frame into two BGRA eye render targets, convert each to a
-    /// 420v buffer (the compositor's native format) via VTPixelTransferSession,
-    /// then tag and enqueue. The 420v buffers come from a pool merged with
-    /// `recommendedPixelBufferAttributes` — the construction validated on-device.
-    /// `CVMutablePixelBuffer` is noncopyable, so the two eye buffers stay local:
-    /// borrowed by `transfer`, then consumed by `CVReadOnlyPixelBuffer`.
-    private func renderAndEnqueue(from src: CVPixelBuffer, itemTime: CMTime, cache: CVMetalTextureCache, pts: CMTime) {
-        let tickStart = CACurrentMediaTime()
+    /// Draw a scheduled frame, looking its depth up first if that hasn't
+    /// happened: the map it was given (worked out ahead, or shared with the
+    /// frame before), or for a looked-up source the frame's own by
+    /// presentation time. Either way image and depth match within the bound
+    /// `HeldDepthPolicy` keeps, never across a cut.
+    private func draw(_ entry: ScheduledFrame, cache: CVMetalTextureCache) -> Eyes? {
+        if !entry.hasDepth {
+            entry.hasDepth = true
+            if let request = entry.request {
+                entry.depth = request.depth
+                let id = ObjectIdentifier(request)
+                if id == lastDrawnRequest {
+                    stageTiming.reused += 1
+                } else {
+                    stageTiming.maps += 1
+                    stageTiming.mapSeconds += request.computeSeconds
+                }
+                lastDrawnRequest = id
+            } else if let depthSource {
+                StackHeadroom.check("StereoPump.draw")
+                let start = CACurrentMediaTime()
+                let depthState = signposter.beginInterval("pump-depth")
+                entry.depth = depthSource.frameDepth(itemTime: entry.frame.itemTime, frame: entry.frame.pixelBuffer)
+                signposter.endInterval("pump-depth", depthState)
+                stageTiming.lookup += CACurrentMediaTime() - start
+            }
+        }
+        return drawEyes(from: entry.frame.pixelBuffer, itemTime: entry.frame.itemTime, depth: entry.depth, cache: cache)
+    }
+
+    /// Warp the mono frame into two BGRA eye render targets and convert each
+    /// to a 420f buffer (the compositor's native format) via
+    /// VTPixelTransferSession, ready to queue. The 420f buffers come from a
+    /// pool merged with `recommendedPixelBufferAttributes` — the construction
+    /// validated on-device. `CVMutablePixelBuffer` is noncopyable, so the two
+    /// eye buffers stay local: borrowed by `transfer`, then consumed by
+    /// `CVReadOnlyPixelBuffer`.
+    private func drawEyes(from src: CVPixelBuffer, itemTime: CMTime, depth frameDepth: PumpFrameDepth?,
+                          cache: CVMetalTextureCache) -> Eyes? {
+        let drawStart = CACurrentMediaTime()
         let width = CVPixelBufferGetWidth(src)
         let height = CVPixelBufferGetHeight(src)
         // Eye buffers are one eye's display size: the frame itself when warping
@@ -514,7 +894,7 @@ public final class StereoPump: @unchecked Sendable {
         guard width > 0, height > 0, eyeWidth > 0, eyeHeight > 0,
               ensurePools(width: eyeWidth, height: eyeHeight),
               let bgraPool, let outPool,
-              let srcTexture = makeTexture(from: src, cache: cache) else { return }
+              let srcTexture = makeTexture(from: src, cache: cache) else { return nil }
 
         // 1. Warp into two BGRA eye render targets.
         var leftBGRA: CVPixelBuffer?
@@ -525,17 +905,8 @@ public final class StereoPump: @unchecked Sendable {
               let leftBGRA, let rightBGRA,
               let leftTex = makeTexture(from: leftBGRA, cache: cache),
               let rightTex = makeTexture(from: rightBGRA, cache: cache),
-              let cmdBuf = commandQueue.makeCommandBuffer() else { return }
-
-        // Depth matched to THIS exact frame: realtime inference blocks until the
-        // frame's own depth is ready (slow inference just yields fewer frames);
-        // cached mode looks the frame's depth up by presentation time. Either
-        // way, image and depth can never mismatch — no ghosting.
-        StackHeadroom.check("StereoPump.renderAndEnqueue")
-        let depthState = signposter.beginInterval("pump-depth")
-        let frameDepth = depthSource?.frameDepth(itemTime: itemTime, frame: src)
-        signposter.endInterval("pump-depth", depthState)
-        let depthDone = CACurrentMediaTime()
+              let cmdBuf = commandQueue.makeCommandBuffer() else { return nil }
+        StackHeadroom.check("StereoPump.drawEyes")
 
         var cfg = currentConfig()
         cfg.depthStrength *= max(0, min(1, cfg.depthScale))
@@ -587,58 +958,85 @@ public final class StereoPump: @unchecked Sendable {
         signposter.endInterval("pump-warp", warpState)
         let warpDone = CACurrentMediaTime()
 
-        // 2. Convert each BGRA eye → 420v from the recommended-attributes pool,
+        // 2. Convert each BGRA eye → 420f from the recommended-attributes pool,
         // carrying the source's color tags so the compositor reads gamma/range
         // correctly (untagged YCbCr was being misinterpreted = washed out).
         let transferState = signposter.beginInterval("pump-transfer")
         defer { signposter.endInterval("pump-transfer", transferState) }
-        guard let left = try? outPool.makeMutablePixelBuffer() else { return }
-        guard transfer(from: leftBGRA, to: left) else { return }
+        guard let left = try? outPool.makeMutablePixelBuffer() else { return nil }
+        guard transfer(from: leftBGRA, to: left) else { return nil }
         tagColor(left, from: src)
-        guard let right = try? outPool.makeMutablePixelBuffer() else { return }
-        guard transfer(from: rightBGRA, to: right) else { return }
+        guard let right = try? outPool.makeMutablePixelBuffer() else { return nil }
+        guard transfer(from: rightBGRA, to: right) else { return nil }
         tagColor(right, from: src)
+        let eyes = Eyes(left: CVReadOnlyPixelBuffer(left), right: CVReadOnlyPixelBuffer(right))
 
-        // 3. Tag, describe, enqueue. CVReadOnlyPixelBuffer(_:) consumes each
-        // mutable buffer (move), and the format description is built from the
-        // tagged group — both exactly as Apple's sample does. (Omitting the
-        // format description / using BGRA was a cause of the earlier GPU hang.)
-        let presentation = pts.isValid ? pts : .zero
+        stageTiming.warp += warpDone - drawStart
+        stageTiming.transfer += CACurrentMediaTime() - warpDone
+        stageTiming.drawn += 1
+        stageTiming.width = width
+        stageTiming.height = height
+        return eyes
+    }
+
+    /// Tag, describe and queue a frame's eyes for host time `hostTime`, on
+    /// the renderer's timeline: its synchronizer free-runs at rate 1 from
+    /// `startHostTime`, so the source's clock stays the only one governing
+    /// audio, pausing and seeking, and the pump translates it into host time
+    /// (`LookaheadFrameSource.dueHostTime`). The format description is built
+    /// from the tagged group, exactly as Apple's sample does. (Omitting the
+    /// format description / using BGRA was a cause of the earlier GPU hang.)
+    private func enqueue(_ eyes: Eyes, at hostTime: CFTimeInterval) {
+        let presentation = CMTime(seconds: hostTime - startHostTime, preferredTimescale: 90_000)
         let leftTags: [CMTag] = [.videoLayerID(0), .stereoView(.leftEye), .mediaType(.video)]
         let rightTags: [CMTag] = [.videoLayerID(1), .stereoView(.rightEye), .mediaType(.video)]
         let tagged: [CMTaggedDynamicBuffer] = [
-            CMTaggedDynamicBuffer(tags: leftTags, content: .pixelBuffer(CVReadOnlyPixelBuffer(left))),
-            CMTaggedDynamicBuffer(tags: rightTags, content: .pixelBuffer(CVReadOnlyPixelBuffer(right)))
+            CMTaggedDynamicBuffer(tags: leftTags, content: .pixelBuffer(eyes.left)),
+            CMTaggedDynamicBuffer(tags: rightTags, content: .pixelBuffer(eyes.right))
         ]
         let sample = CMReadySampleBuffer(
             taggedBuffers: tagged,
             formatDescription: CMTaggedBufferGroupFormatDescription(taggedBuffers: tagged),
-            presentationTimeStamp: presentation,
+            presentationTimeStamp: presentation.isValid ? presentation : .zero,
             duration: CMTime(value: 1, timescale: 90)
         )
         sample.withUnsafeSampleBuffer { videoRenderer.enqueue($0) }
+    }
 
-        let tickEnd = CACurrentMediaTime()
-        stageTiming.depth += depthDone - tickStart
-        stageTiming.warp += warpDone - depthDone
-        stageTiming.transfer += tickEnd - warpDone
-        stageTiming.tick += tickEnd - tickStart
-        stageTiming.frames += 1
-        let window = tickEnd - stageTiming.windowStart
-        if window >= stageTimingLogInterval {
-            // os_log interpolations are closures; pull the values into locals
-            // so they don't capture self.
-            let n = Double(stageTiming.frames)
-            let fps = n / window
-            let depthMs = stageTiming.depth / n * 1000
-            let warpMs = stageTiming.warp / n * 1000
-            let transferMs = stageTiming.transfer / n * 1000
-            let tickMs = stageTiming.tick / n * 1000
-            VergenceLog.pipeline.info(
-                "pump \(width)×\(height)\(self.packedLayout == nil ? "" : " packed", privacy: .public): \(fps, format: .fixed(precision: 1), privacy: .public) fps over \(window, format: .fixed(precision: 1), privacy: .public) s — depth \(depthMs, format: .fixed(precision: 1), privacy: .public) ms, warp \(warpMs, format: .fixed(precision: 1), privacy: .public) ms, transfer+enqueue \(transferMs, format: .fixed(precision: 1), privacy: .public) ms, tick \(tickMs, format: .fixed(precision: 1), privacy: .public) ms"
-            )
-            stageTiming = StageTiming()
+    /// One line per window, so the stages' cost on real content is readable
+    /// in the in-app console.
+    private func logStageTimingIfDue(now: CFTimeInterval) {
+        let window = now - stageTiming.windowStart
+        guard window >= stageTimingLogInterval else { return }
+        let timing = stageTiming
+        stageTiming = StageTiming()
+        // A paused picture drawn again (a menu fading it) shows no new frame.
+        guard timing.shown > 0, timing.drawn > 0 else { return }
+        // os_log interpolations are closures; pull the values into locals so
+        // they don't capture self.
+        let drawn = Double(timing.drawn)
+        let fps = Double(timing.shown) / window
+        let warpMs = timing.warp / drawn * 1000
+        let transferMs = timing.transfer / drawn * 1000
+        let width = timing.width, height = timing.height
+        let packed = packedLayout == nil ? "" : " packed"
+        let depth: String
+        if depthSource?.computesDepthAhead == true {
+            let mapMs = timing.maps > 0 ? timing.mapSeconds / Double(timing.maps) * 1000 : 0
+            let reusedShare = Double(timing.reused) / Double(max(timing.maps + timing.reused, 1)) * 100
+            depth = String(format: "depth %.1f ms a map, %.1f maps/s, %.0f%% of frames reuse the one before",
+                           mapMs, Double(timing.maps) / window, reusedShare)
+        } else if depthSource != nil {
+            depth = String(format: "depth %.1f ms", timing.lookup / drawn * 1000)
+        } else {
+            depth = "no depth"
         }
+        let schedule = clock == nil ? "shown as drawn"
+            : String(format: "%.0f ms ahead, %.0f%% late", lead * 1000,
+                     timing.shown > 0 ? Double(timing.late) / Double(timing.shown) * 100 : 0)
+        VergenceLog.pipeline.info(
+            "pump \(width)×\(height)\(packed, privacy: .public): \(fps, format: .fixed(precision: 1), privacy: .public) fps over \(window, format: .fixed(precision: 1), privacy: .public) s — \(depth, privacy: .public), warp \(warpMs, format: .fixed(precision: 1), privacy: .public) ms, transfer \(transferMs, format: .fixed(precision: 1), privacy: .public) ms, \(schedule, privacy: .public)"
+        )
     }
 
     private func transfer(from source: CVPixelBuffer, to dest: borrowing CVMutablePixelBuffer) -> Bool {
