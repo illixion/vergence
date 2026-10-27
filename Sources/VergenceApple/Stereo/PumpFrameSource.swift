@@ -79,6 +79,10 @@ public extension PumpFrameSource {
 /// source) gets each frame shown once drawn, or with real-time depth a fixed
 /// delay after it came (`StereoPump.pushDelay`).
 public protocol LookaheadFrameSource: PumpFrameSource {
+    /// End of the finite media timeline, to avoid refilling past EOF.
+    var endTime: Double? { get }
+    /// Changes after a flush, including a seek to the same position.
+    var sequence: Int { get }
     /// The source's item time at `hostTime`; at a future host time, where the
     /// clock will be if it keeps its current rate.
     func itemTime(forHostTime hostTime: CFTimeInterval) -> CMTime
@@ -90,14 +94,25 @@ public protocol LookaheadFrameSource: PumpFrameSource {
     func dueHostTime(forItemTime itemTime: CMTime, at hostTime: CFTimeInterval) -> CFTimeInterval?
 }
 
+public extension LookaheadFrameSource {
+    var endTime: Double? { nil }
+    var sequence: Int { 0 }
+}
+
 /// Pulls from an `AVPlayerItemVideoOutput` — the original Spatial Stash path,
 /// where AVPlayer stays the clock, the audio source and the transport, and only
 /// pixels are diverted. The output decodes well ahead of the playhead (0.5-1 s
 /// measured on device, `DepthPipelineBenchmark`), so frames can be taken early.
 public final class AVPlayerFrameSource: LookaheadFrameSource, @unchecked Sendable {
     private let output: AVPlayerItemVideoOutput
+    private weak var item: AVPlayerItem?
+    public var endTime: Double? {
+        guard let value = item?.duration.seconds, value.isFinite, value > 0 else { return nil }
+        return value
+    }
 
-    public init(output: AVPlayerItemVideoOutput) {
+    public init(output: AVPlayerItemVideoOutput, item: AVPlayerItem? = nil) {
+        self.item = item
         self.output = output
     }
 

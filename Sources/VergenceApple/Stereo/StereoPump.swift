@@ -199,6 +199,8 @@ public final class StereoPump: @unchecked Sendable {
     private let clock: LookaheadFrameSource?
     private var lead: Double
     private var processingHold = StereoProcessingHoldPolicy()
+    private var analysisRate = 1.0
+    private var sourceSequence: Int?
     /// Pump-queue only: frames taken and not yet on screen, in order.
     private var schedule: [ScheduledFrame] = []
     /// Pump-queue only: the frame on screen (the last one queued whose time
@@ -255,9 +257,10 @@ public final class StereoPump: @unchecked Sendable {
     /// behind them.
     private static let maxPushBacklog = 2
     /// Absolute frame bound; the per-size memory budget usually permits fewer.
-    /// Each retained frame holds its input and two compositor eye buffers.
-    private static let maxScheduled = 16
-    /// Input BGRA plus two retained 420f eyes, rounded up for alignment.
+    /// Each retained frame holds source RGB and depth; only near-due frames
+    /// also hold compositor eye buffers.
+    private static let maxScheduled = StereoLookaheadPolicy.maximumFrames
+    /// Source/depth reserve capacity after allowing for the short eye queue.
     /// The pools and the currently displayed frame have their own bounds.
     private var maxScheduledForSize = 8
     /// Pump-queue only. For a depth source that infers per frame
@@ -569,7 +572,18 @@ public final class StereoPump: @unchecked Sendable {
         if decoderRecovery?.checkRenderer() == true { return }
 
         let now = CACurrentMediaTime()
-        if let clock { reconcile(with: clock, now: now) }
+        if let clock {
+            if let sourceSequence, sourceSequence != clock.sequence {
+                discardSchedule(now: now)
+                lastTakenSeconds = nil
+                depthSource?.recomputeNextDepth()
+                let held = processingHold.isHolding
+                processingHold.reset()
+                if held { onProcessingBuffering?(false) }
+            }
+            sourceSequence = clock.sequence
+            reconcile(with: clock, now: now)
+        }
         let took = takeFrames(now: now)
         service(now: now)
         // A paused picture draws nothing new; a capture (debug server) gets
@@ -587,9 +601,9 @@ public final class StereoPump: @unchecked Sendable {
     /// again.
     private func reconcile(with clock: LookaheadFrameSource, now: CFTimeInterval) {
         let playhead = clock.itemTime(forHostTime: now).seconds
-        let windowEnd = clock.itemTime(forHostTime: now + lead).seconds
-        guard playhead.isFinite, windowEnd.isFinite else { return }
+        guard playhead.isFinite else { return }
         let rate = clock.playbackRate(hostTime: now) ?? 0
+        if rate > 0.01 { analysisRate = rate }
         let previous = lastClockReading
         lastClockReading = (now, playhead, rate)
         // First, so the frame on screen is the last one whose time came.
@@ -598,12 +612,18 @@ public final class StereoPump: @unchecked Sendable {
             LookaheadClock.isJump(previous: $0.item, previousRate: $0.rate, elapsed: now - $0.host,
                                   playhead: playhead, rate: rate)
         } ?? false
-        if jumped || lastTakenSeconds.map({
-            LookaheadClock.isDiscontinuous(last: $0, playhead: playhead, windowEnd: windowEnd)
-        }) == true {
+        // A slower rate or a pause can put prepared frames beyond the new
+        // window. Keep them: the film tap has already consumed those samples.
+        if jumped || lastTakenSeconds.map({ $0 < playhead - LookaheadPull.maxStep }) == true {
             // Taken afresh from the playhead: the source has new frames there.
             discardSchedule(now: now)
             lastTakenSeconds = nil
+            if jumped {
+                depthSource?.recomputeNextDepth()
+                let held = processingHold.isHolding
+                processingHold.reset()
+                if held { onProcessingBuffering?(false) }
+            }
             return
         }
         for entry in schedule {
@@ -630,21 +650,31 @@ public final class StereoPump: @unchecked Sendable {
             return true
         }
         let playhead = clock.itemTime(forHostTime: now).seconds
-        let windowEnd = clock.itemTime(forHostTime: now + lead).seconds
+        let windowEnd = playhead + lead * analysisRate
         guard playhead.isFinite, windowEnd.isFinite else { return false }
         var took = false
+        var bootstrapProbe: Double?
         for _ in 0 ..< Self.maxScheduled * 2 {
             guard schedule.count < maxScheduledForSize else { break }
-            let target = LookaheadPull.target(last: lastTakenSeconds, spacing: delivery.sourceSpacing.seconds,
-                                              playhead: playhead, windowEnd: windowEnd)
+            let spacing = delivery.sourceSpacing.seconds
+            let target = bootstrapProbe ?? LookaheadPull.target(last: lastTakenSeconds,
+                spacing: spacing.isFinite ? spacing : 1.0 / 60,
+                playhead: playhead, windowEnd: windowEnd)
             // Nothing new can come at or before the last frame taken, and
             // asking there would be answered with a frame already taken (the
             // output hands out whatever differs from the last one it gave).
             // A seek back starts over from the playhead (`reconcile`).
             if let last = lastTakenSeconds, target <= last + 1e-6 { break }
             guard let frame = clock.frame(atItemTime: CMTime(seconds: target, preferredTimescale: 600_000)) else {
+                // Learn actual PTS spacing from successive pictures, not one
+                // jump to the far end of the reserve at startup.
+                if !spacing.isFinite, target < windowEnd {
+                    bootstrapProbe = min(windowEnd, target + 1.0 / 60)
+                    continue
+                }
                 break
             }
+            bootstrapProbe = nil
             took = true
             accept(frame, now: now)
         }
@@ -673,16 +703,19 @@ public final class StereoPump: @unchecked Sendable {
         lastTakenSeconds = seconds.isFinite ? seconds : nil
         guard frameRateCap.admits(
             frameAt: seconds, spacing: delivery.sourceSpacing.seconds,
-            rate: frameSource.playbackRate(hostTime: now) ?? 1,
+            rate: clock == nil ? (frameSource.playbackRate(hostTime: now) ?? 1) : analysisRate,
             limitsToNormalSpeed: depthSource?.limitsToSourceFrameRate == true,
             minimumInterval: clock == nil ? 0 : frameInterval
         ) else { return }
         reportSizeIfNeeded(frame.pixelBuffer)
+        delivery.sourceHeight = CVPixelBufferGetHeight(frame.pixelBuffer)
         maxScheduledForSize = StereoLookaheadPolicy.capacity(width: CVPixelBufferGetWidth(frame.pixelBuffer),
                                                            height: CVPixelBufferGetHeight(frame.pixelBuffer))
         var request: PumpDepthRequest?
         if let depthSource, depthSource.computesDepthAhead {
-            let shownAt = clock?.dueHostTime(forItemTime: frame.itemTime, at: now) ?? now
+            // A stable virtual presentation timeline also works while paused;
+            // using wall time here would change depth reuse during refills.
+            let shownAt = clock == nil ? now : seconds / analysisRate
             request = depthSource.requestDepth(for: frame, shownAt: shownAt, whenReady: depthReadyHandler)
         }
         schedule.append(ScheduledFrame(frame: frame, request: request, takenAt: now))
@@ -720,6 +753,11 @@ public final class StereoPump: @unchecked Sendable {
             // Maps come in order, so the first frame still waiting for one
             // holds up the frames after it.
             if let request = entry.request, !request.isReady { break }
+            // Retain source + depth in the reserve; make stereo eyes only
+            // within the short rendering window, not for every future frame.
+            if let clock, entry.itemSeconds > clock.itemTime(forHostTime: now).seconds + Self.drawLead * analysisRate {
+                break
+            }
             guard let eyes = draw(entry, cache: textureCache) else {
                 schedule.remove(at: index)
                 continue
@@ -735,15 +773,37 @@ public final class StereoPump: @unchecked Sendable {
     }
 
     private func updateProcessingHold(now: CFTimeInterval) {
-        guard clock != nil, depthSource?.computesDepthAhead == true else { return }
-        let playhead = clock?.itemTime(forHostTime: now).seconds ?? 0
-        let running = (clock?.playbackRate(hostTime: now) ?? 0) > 0.01
-        let waitingSince = schedule.first {
-            $0.request != nil && !($0.request?.isReady ?? true) && $0.itemSeconds <= playhead + 0.02
-        }?.takenAt
+        guard let clock, depthSource?.computesDepthAhead == true else { return }
+        let playhead = clock.itemTime(forHostTime: now).seconds
+        guard playhead.isFinite else { return }
+        let running = (clock.playbackRate(hostTime: now) ?? 0) > 0.01
+        var frontier = playhead
+        for entry in schedule {
+            guard entry.request?.isReady ?? true else { break }
+            frontier = max(frontier, entry.itemSeconds)
+        }
+        let observedSpacing = delivery.sourceSpacing.seconds
+        let spacing = observedSpacing.isFinite ? observedSpacing : (1.0 / 30)
+        let capacityReserve = StereoLookaheadPolicy.reserve(capacity: maxScheduledForSize,
+            spacing: spacing, rate: analysisRate, lead: lead)
+        let remaining = clock.endTime.map { max(0, $0 - playhead - spacing) } ?? .infinity
+        let resume = min(capacityReserve * 0.8, remaining)
+        let low = min(0.12 * analysisRate, resume * 0.25)
         let wasHolding = processingHold.isHolding
-        let isHolding = processingHold.update(now: now, clockRunning: running, waitingSince: waitingSince)
+        let wasExhausted = processingHold.recoveryExhausted
+        let pendingAtPlayhead = schedule.first.map {
+            !($0.request?.isReady ?? true) && $0.itemSeconds <= playhead + spacing
+        } ?? false
+        let available = pendingAtPlayhead ? -0.01 : max(0, frontier - playhead)
+        let isHolding = processingHold.update(now: now, clockRunning: running,
+            readySeconds: available, resumeSeconds: resume, lowWaterSeconds: low)
         if wasHolding != isHolding { onProcessingBuffering?(isHolding) }
+        if !wasExhausted, processingHold.recoveryExhausted {
+            onPerformance?(.init(shownFramesPerSecond: 0,
+                sourceFramesPerSecond: 1 / spacing, deliveredFraction: 0,
+                playbackRate: analysisRate, sourceHeight: delivery.sourceHeight,
+                recoveryExhausted: true))
+        }
     }
 
     /// Whether the frame's time has come: the clock's playhead has reached
@@ -860,10 +920,11 @@ public final class StereoPump: @unchecked Sendable {
             delivery.windowStart = now
         }
         guard let onPerformance,
-              let report = StereoPerformance.measured(
+              var report = StereoPerformance.measured(
                 frames: delivery.frames, itemSpan: delivery.itemSpan, window: window,
                 spacing: delivery.sourceSpacing.seconds, maxShownPerSecond: 1 / frameInterval,
                 sourceHeight: delivery.sourceHeight) else { return }
+        report.isRecovering = processingHold.isHolding
         onPerformance(report)
     }
 
@@ -1394,18 +1455,23 @@ public struct StereoPerformance: Sendable, Equatable {
     /// whole height), so a host can tell what a lower stream would save.
     /// 0 when unknown.
     public var sourceHeight: Int
+    public var isRecovering: Bool
+    public var recoveryExhausted: Bool
 
     public init(shownFramesPerSecond: Double, sourceFramesPerSecond: Double,
-                deliveredFraction: Double, playbackRate: Double, sourceHeight: Int = 0) {
+                deliveredFraction: Double, playbackRate: Double, sourceHeight: Int = 0,
+                isRecovering: Bool = false, recoveryExhausted: Bool = false) {
         self.shownFramesPerSecond = shownFramesPerSecond
         self.sourceFramesPerSecond = sourceFramesPerSecond
         self.deliveredFraction = deliveredFraction
         self.playbackRate = playbackRate
         self.sourceHeight = sourceHeight
+        self.isRecovering = isRecovering
+        self.recoveryExhausted = recoveryExhausted
     }
 
     /// The conversion, not the source, is what's falling behind.
     public var isOverloaded: Bool {
-        deliveredFraction < 0.75 && playbackRate > 0.8
+        !isRecovering && (recoveryExhausted || (deliveredFraction < 0.75 && playbackRate > 0.8))
     }
 }

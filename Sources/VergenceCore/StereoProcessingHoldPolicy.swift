@@ -1,44 +1,61 @@
-/// Briefly holds a clocked player when real-time depth falls behind the
-/// playhead. The timeout and cooldown prevent a sustained overload from
-/// repeatedly stopping playback.
+/// Hysteresis over contiguous prepared depth on the media timeline. A pause
+/// keeps inference running until a reserve has refilled. Timeout releases the
+/// transport and reports sustained overload so a host can lower quality.
 public struct StereoProcessingHoldPolicy: Sendable {
-    public let triggerDelay: Double
     public let maximumHold: Double
     public let cooldown: Double
-    private(set) public var isHolding = false
+    public private(set) var isHolding = false
+    public private(set) var recoveryExhausted = false
     private var holdingSince: Double?
     private var cooldownUntil = 0.0
+    private var priming = true
+    private var recoveryWindowStart: Double?
+    private var recoverySpent = 0.0
+    private var recoveryCount = 0
 
-    public init(triggerDelay: Double = 0.12, maximumHold: Double = 2, cooldown: Double = 5) {
-        self.triggerDelay = triggerDelay
+    public init(maximumHold: Double = 8, cooldown: Double = 10) {
         self.maximumHold = maximumHold
         self.cooldown = cooldown
     }
 
-    /// `waitingSince` is the take time of the oldest unresolved frame that
-    /// should already be visible. Resolving inference releases the hold.
-    public mutating func update(now: Double, clockRunning: Bool, waitingSince: Double?) -> Bool {
+    public mutating func update(now: Double, clockRunning: Bool, readySeconds: Double,
+                                resumeSeconds: Double, lowWaterSeconds: Double) -> Bool {
         if isHolding {
-            if waitingSince == nil {
+            if readySeconds + 0.001 >= resumeSeconds {
                 isHolding = false
+                recordRecovery(now: now)
                 holdingSince = nil
+                priming = false
+                if recoveryCount >= 2, recoverySpent >= maximumHold {
+                    recoveryExhausted = true
+                    cooldownUntil = now + cooldown
+                }
             } else if let holdingSince, now - holdingSince >= maximumHold {
                 isHolding = false
                 self.holdingSince = nil
+                recoveryExhausted = true
+                priming = false
                 cooldownUntil = now + cooldown
             }
             return isHolding
         }
-        guard clockRunning, now >= cooldownUntil, let waitingSince,
-              now - waitingSince >= triggerDelay else { return false }
+        guard now >= cooldownUntil, (clockRunning || priming),
+              readySeconds + 0.001 < (priming ? resumeSeconds : lowWaterSeconds) else { return false }
+        if recoveryWindowStart.map({ now - $0 >= 30 }) ?? true {
+            recoveryWindowStart = now
+            recoverySpent = 0
+            recoveryCount = 0
+        }
+        recoveryExhausted = false
         isHolding = true
         holdingSince = now
         return true
     }
 
-    public mutating func reset() {
-        isHolding = false
-        holdingSince = nil
-        cooldownUntil = 0
+    private mutating func recordRecovery(now: Double) {
+        recoverySpent += max(0, now - (holdingSince ?? now))
+        recoveryCount += 1
     }
+
+    public mutating func reset() { self = Self(maximumHold: maximumHold, cooldown: cooldown) }
 }

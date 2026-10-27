@@ -119,6 +119,37 @@ import Testing
         #expect(source.decodeFailure == nil)
     }
 
+    @Test func pausedClockCanPrepareSeveralFutureFramesInOrder() async throws {
+        let clock = try clock(at: 0.1)
+        let source = SampleBufferFrameSource(timebase: clock, endTime: 1)
+        defer { source.invalidate() }
+        try await samples().forEach { source.submit($0) }
+        var times: [Double] = []
+        for target in stride(from: 0.1, through: 0.7, by: 1.0 / 30) {
+            if let frame = source.frame(atItemTime: CMTime(seconds: target, preferredTimescale: 600_000)) {
+                #expect(frame.itemTime.seconds <= target + 0.001)
+                times.append(frame.itemTime.seconds)
+            }
+        }
+        #expect(times.count > 12)
+        #expect(zip(times, times.dropFirst()).allSatisfy { $0 < $1 })
+        #expect(CMTimebaseGetTime(clock).seconds == 0.1)
+        #expect(source.playbackRate(hostTime: 0) == 0)
+        #expect(source.dueHostTime(forItemTime: CMTime(seconds: 0.6, preferredTimescale: 600), at: 0) == nil)
+        #expect(source.endTime == 1)
+    }
+
+    @Test func cancelledInferenceReleasesItsQueuedPictureImmediately() throws {
+        var pixels: CVPixelBuffer?
+        #expect(CVPixelBufferCreate(kCFAllocatorDefault, 64, 32, kCVPixelFormatType_32BGRA,
+                                    nil, &pixels) == kCVReturnSuccess)
+        let input = PendingDepthInput(.init(pixelBuffer: try #require(pixels), itemTime: .zero))
+        let request = PumpDepthRequest(onCancel: { input.clear() })
+        request.cancel()
+        #expect(input.take() == nil)
+        #expect(request.isCancelled)
+    }
+
     @Test func stoppedSourcesIgnoreLateSubmissions() async throws {
         let source = SampleBufferFrameSource(timebase: try clock(at: 0.35))
         source.invalidate()

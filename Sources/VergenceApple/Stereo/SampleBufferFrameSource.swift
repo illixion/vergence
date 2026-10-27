@@ -15,7 +15,7 @@ import VergenceCore
 /// leaking into the new timeline. BGRA is required by PumpFrameSource.
 /// A sample that already holds a picture (a host that decodes on its own,
 /// such as frame-packed MVC) is converted to BGRA rather than decoded.
-public final class SampleBufferFrameSource: PumpFrameSource, @unchecked Sendable {
+public final class SampleBufferFrameSource: LookaheadFrameSource, @unchecked Sendable {
     private let timebase: CMTimebase
     private let lock = NSLock()
     private var samples: [CMSampleBuffer] = []
@@ -36,7 +36,24 @@ public final class SampleBufferFrameSource: PumpFrameSource, @unchecked Sendable
     private var transferPool: CVPixelBufferPool?
     private var transferPoolSize = (width: 0, height: 0)
 
-    public init(timebase: CMTimebase) { self.timebase = timebase }
+    public var sequence: Int { lock.withLock { generation } }
+    public let endTime: Double?
+    public init(timebase: CMTimebase, endTime: Double? = nil) {
+        self.timebase = timebase
+        self.endTime = endTime
+    }
+
+    public func itemTime(forHostTime hostTime: CFTimeInterval) -> CMTime {
+        let time = CMTimebaseGetTime(timebase)
+        let rate = CMTimebaseGetRate(timebase)
+        return time + CMTime(seconds: (hostTime - CACurrentMediaTime()) * rate, preferredTimescale: 600_000)
+    }
+
+    public func dueHostTime(forItemTime itemTime: CMTime, at hostTime: CFTimeInterval) -> CFTimeInterval? {
+        let rate = CMTimebaseGetRate(timebase)
+        guard rate > 0.01 else { return nil }
+        return hostTime + (itemTime - self.itemTime(forHostTime: hostTime)).seconds / rate
+    }
 
     public var isFinished: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -73,7 +90,11 @@ public final class SampleBufferFrameSource: PumpFrameSource, @unchecked Sendable
     }
 
     public func nextFrame(hostTime: CFTimeInterval) -> PumpFrame? {
-        let now = CMTimebaseGetTime(timebase)
+        frame(atItemTime: CMTimebaseGetTime(timebase))
+    }
+
+    public func frame(atItemTime now: CMTime) -> PumpFrame? {
+        guard now.isNumeric else { return nil }
         // Enough decode-order lookahead for B-frame reordering. Future
         // pictures remain queued by PTS; none is shown before its film time.
         let decodeThrough = now.seconds + 0.1

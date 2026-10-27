@@ -2,26 +2,42 @@ import XCTest
 @testable import VergenceCore
 
 final class StereoProcessingHoldPolicyTests: XCTestCase {
-    func testHoldsForOverdueDepthAndReleasesWhenReady() {
+    func testStartupAndPauseRefillResumeOnlyWithReserve() {
         var policy = StereoProcessingHoldPolicy()
-        XCTAssertFalse(policy.update(now: 1.11, clockRunning: true, waitingSince: 1))
-        XCTAssertTrue(policy.update(now: 1.13, clockRunning: true, waitingSince: 1))
-        XCTAssertTrue(policy.update(now: 1.2, clockRunning: false, waitingSince: 1))
-        XCTAssertFalse(policy.update(now: 1.25, clockRunning: false, waitingSince: nil))
+        XCTAssertTrue(policy.update(now: 1, clockRunning: false, readySeconds: 0, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        // The overdue frame becoming ready is not enough to restart.
+        XCTAssertTrue(policy.update(now: 1.2, clockRunning: false, readySeconds: 0.1, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertFalse(policy.update(now: 1.5, clockRunning: false, readySeconds: 0.5, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertFalse(policy.update(now: 2, clockRunning: true, readySeconds: 0.2, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertTrue(policy.update(now: 3, clockRunning: true, readySeconds: 0.05, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertFalse(policy.update(now: 3.5, clockRunning: false, readySeconds: 0.5, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertFalse(policy.recoveryExhausted)
     }
 
-    func testTimedOutHoldUsesCooldownBeforeRetry() {
-        var policy = StereoProcessingHoldPolicy(triggerDelay: 0.1, maximumHold: 0.5, cooldown: 2)
-        XCTAssertTrue(policy.update(now: 1.2, clockRunning: true, waitingSince: 1))
-        XCTAssertFalse(policy.update(now: 1.71, clockRunning: false, waitingSince: 1))
-        XCTAssertFalse(policy.update(now: 2, clockRunning: true, waitingSince: 1.8))
-        XCTAssertTrue(policy.update(now: 3.8, clockRunning: true, waitingSince: 1.8))
+    func testSustainedOverloadTimesOutAndBacksOff() {
+        var policy = StereoProcessingHoldPolicy(maximumHold: 1, cooldown: 2)
+        XCTAssertTrue(policy.update(now: 1, clockRunning: true, readySeconds: 0, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertFalse(policy.update(now: 2.1, clockRunning: false, readySeconds: 0.1, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertTrue(policy.recoveryExhausted)
+        XCTAssertFalse(policy.update(now: 3, clockRunning: true, readySeconds: 0, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertTrue(policy.update(now: 4.2, clockRunning: true, readySeconds: 0, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertFalse(policy.recoveryExhausted)
     }
 
-    func testUserPauseDoesNotTriggerHoldAndResetClearsState() {
+    func testRepeatedRefillsEventuallyReportSustainedOverload() {
+        var policy = StereoProcessingHoldPolicy(maximumHold: 2, cooldown: 5)
+        XCTAssertTrue(policy.update(now: 0, clockRunning: true, readySeconds: 0, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertFalse(policy.update(now: 1.1, clockRunning: false, readySeconds: 0.5, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertFalse(policy.recoveryExhausted)
+        XCTAssertTrue(policy.update(now: 2, clockRunning: true, readySeconds: 0, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertFalse(policy.update(now: 3.1, clockRunning: false, readySeconds: 0.5, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+        XCTAssertTrue(policy.recoveryExhausted)
+        XCTAssertFalse(policy.update(now: 4, clockRunning: true, readySeconds: 0, resumeSeconds: 0.5, lowWaterSeconds: 0.1))
+    }
+
+    func testEndOfMediaDoesNotAskForAnImpossibleReserve() {
         var policy = StereoProcessingHoldPolicy()
-        XCTAssertFalse(policy.update(now: 3, clockRunning: false, waitingSince: 1))
-        XCTAssertTrue(policy.update(now: 3, clockRunning: true, waitingSince: 1))
+        XCTAssertFalse(policy.update(now: 1, clockRunning: true, readySeconds: 0, resumeSeconds: 0, lowWaterSeconds: 0))
         policy.reset()
         XCTAssertFalse(policy.isHolding)
     }

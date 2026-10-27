@@ -93,10 +93,12 @@ public final class PumpDepthRequest: @unchecked Sendable {
     private var cancelled = false
     private var seconds = 0.0
     private var whenReady: (@Sendable () -> Void)?
+    private var onCancel: (@Sendable () -> Void)?
 
     /// - Parameter whenReady: called once, on whatever thread resolves it.
-    public init(whenReady: (@Sendable () -> Void)? = nil) {
+    public init(whenReady: (@Sendable () -> Void)? = nil, onCancel: (@Sendable () -> Void)? = nil) {
         self.whenReady = whenReady
+        self.onCancel = onCancel
     }
 
     /// Already resolved: a source that looks depth up on the spot.
@@ -133,7 +135,10 @@ public final class PumpDepthRequest: @unchecked Sendable {
         lock.lock()
         cancelled = true
         whenReady = nil
+        let release = onCancel
+        onCancel = nil
         lock.unlock()
+        release?()
     }
 
     public func resolve(_ depth: PumpFrameDepth?, computeSeconds: Double) {
@@ -161,8 +166,9 @@ public protocol PumpDepthSource: AnyObject {
     /// as each frame is drawn (a lookup, such as cached depth).
     var computesDepthAhead: Bool { get }
     /// Start working out `frame`'s depth, in the order frames are shown.
-    /// `shownAt` is the host time it is due on screen (the time it is
-    /// taken, for a source with no clock). `whenReady` runs on any thread.
+    /// Differences in `shownAt` represent wall seconds at the intended
+    /// playback speed. A clocked reserve uses a media-derived reference so
+    /// pauses do not alter depth reuse. `whenReady` runs on any thread.
     func requestDepth(for frame: PumpFrame, shownAt: CFTimeInterval,
                       whenReady: @escaping @Sendable () -> Void) -> PumpDepthRequest
     /// True when missing depth should render FLAT (with the pump's strength
@@ -287,10 +293,14 @@ public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
             policy.forget()
             _ = policy.decide(seconds: seconds, shownAt: shownAt, signature: signature)
         }
-        let request = PumpDepthRequest(whenReady: whenReady)
+        // A canceled reserve must release its large source frames at once,
+        // even while an earlier inference is still blocking the serial queue.
+        let input = PendingDepthInput(frame)
+        let request = PumpDepthRequest(whenReady: whenReady, onCancel: { input.clear() })
         keyRequest = request
         inferenceQueue.async { [self] in
-            guard !request.isCancelled, !isInvalidated else {
+            guard !request.isCancelled, !isInvalidated, let frame = input.take() else {
+                input.clear()
                 request.resolve(nil, computeSeconds: 0)
                 return
             }
@@ -341,6 +351,21 @@ public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
         policy.forget()
         inferenceQueue.async { [provider] in provider.resetRefinement() }
     }
+}
+
+/// The queued inference closure retains this cell, not the full picture.
+/// Canceling a seek's queued work clears the picture before that closure runs.
+final class PendingDepthInput: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frame: PumpFrame?
+    init(_ frame: PumpFrame) { self.frame = frame }
+    func take() -> PumpFrame? {
+        lock.withLock {
+            defer { frame = nil }
+            return frame
+        }
+    }
+    func clear() { lock.withLock { frame = nil } }
 }
 
 /// Textures inferred maps are copied into, handed back when the last frame
