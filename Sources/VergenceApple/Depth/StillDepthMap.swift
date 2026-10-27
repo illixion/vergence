@@ -20,15 +20,26 @@ import Foundation
 import VergenceCore
 
 public struct StillDepthMap: Sendable {
+    public let id = UUID()
     public let width: Int
     public let height: Int
     /// Row-major, `width * height` bytes. 0 = far, 255 = near.
     public let values: [UInt8]
+    /// Full precision for photo rendering. Thumbnail caches store only bytes.
+    public let preciseValues: [Float]?
 
     public init(width: Int, height: Int, values: [UInt8]) {
         self.width = width
         self.height = height
         self.values = values
+        self.preciseValues = nil
+    }
+    public init(width: Int, height: Int, normalizedValues: [Float]) {
+        self.width = width
+        self.height = height
+        let normalized = normalizedValues.map { min(max($0.isFinite ? $0 : 0, 0), 1) }
+        self.preciseValues = normalized
+        self.values = normalized.map { UInt8(($0 * 255).rounded()) }
     }
 }
 
@@ -134,7 +145,7 @@ enum StillDepthExtraction {
     /// texel (a specular highlight read as very near) can't flatten the rest.
     static func normalizedMap(
         _ plane: (values: [Float], width: Int, height: Int),
-        imageWidth: Int, imageHeight: Int
+        imageWidth: Int, imageHeight: Int, preservePrecision: Bool = false
     ) -> StillDepthMap? {
         let uv = CoreMLDepthProvider.letterboxUVTransform(
             videoWidth: imageWidth, videoHeight: imageHeight,
@@ -177,6 +188,11 @@ enum StillDepthExtraction {
         let lo = percentile(0.02)
         let hi = max(percentile(0.98), lo + (maxV - minV) * 1e-3)
 
+        if preservePrecision {
+            return StillDepthMap(width: w, height: h, normalizedValues: cropped.map {
+                min(max(($0 - lo) / (hi - lo), 0), 1)
+            })
+        }
         var scale = 255 / (hi - lo)
         var bias = -lo * scale
         vDSP_vsmsa(cropped, 1, &scale, &bias, &cropped, 1, vDSP_Length(cropped.count))

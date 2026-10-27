@@ -741,7 +741,7 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
     /// Leaves the video stabilization state alone: that EMA would blend one
     /// image's depth into the next. Same threading rule as every other entry
     /// point — one caller at a time per provider.
-    public func stillDepth(for image: CGImage) -> StillDepthMap? {
+    public func stillDepth(for image: CGImage, preservePrecision: Bool = false) -> StillDepthMap? {
         let inferState = signposter.beginInterval("depth-inference-still")
         defer { signposter.endInterval("depth-inference-still", inferState) }
         let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
@@ -756,7 +756,7 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
             plane = nil
         }
         guard let plane else { return nil }
-        return StillDepthExtraction.normalizedMap(plane, imageWidth: image.width, imageHeight: image.height)
+        return StillDepthExtraction.normalizedMap(plane, imageWidth: image.width, imageHeight: image.height, preservePrecision: preservePrecision)
     }
 
     public func depth(for pixelBuffer: CVPixelBuffer) -> MTLTexture? {

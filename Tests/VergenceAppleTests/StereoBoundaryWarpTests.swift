@@ -74,9 +74,9 @@ struct StereoBoundaryWarpTests {
         }
 
         func render(eye: Float, strength: Float = 0.02, mirror: Bool = false,
-                    holes: Bool = false, uv: SIMD4<Float> = SIMD4(1, 1, 0, 0)) throws -> [UInt8] {
+                    holes: Bool = false, convergence: Float = 1, uv: SIMD4<Float> = SIMD4(1, 1, 0, 0)) throws -> [UInt8] {
             let command = try #require(queue.makeCommandBuffer())
-            let u = StereoBoundaryWarp.Uniforms(stereo: SIMD4(strength, 1, eye, mirror ? 1 : 0),
+            let u = StereoBoundaryWarp.Uniforms(stereo: SIMD4(strength, convergence, eye, mirror ? 1 : 0),
                 uv: uv, mapping: SIMD4(1, 0, 0, 1), adjustments: SIMD4(0, 1, 1, 0),
                 boundary: SIMD4(0.08, Float(width), 1 / 384, holes ? 1 : 0))
             #expect(warp.encode(source: source, depth: depth, destination: output,
@@ -124,6 +124,21 @@ struct StereoBoundaryWarpTests {
         #expect(reds.count >= 4 && reds.count <= 8)
     }
 
+    @Test func diagonalBoundaryHasAntialiasedCoverageWithoutBlackFringe() throws {
+        let f = try Fixture(depthValue: { x, y in abs(x - (300 + y / 3)) < 12 ? 1 : 0 },
+                            foreground: { x, y in abs(x - (300 + y / 3)) < 12 })
+        let out = try f.render(eye: 1, strength: 0.023, convergence: 0.5)
+        var partial = 0
+        for y in 20..<(height - 20) {
+            for x in (290 + y / 3)..<(335 + y / 3) {
+                let i = (y * width + x) * 4
+                if out[i] > 5 && out[i] < 250 { partial += 1 }
+                #expect(out[i] > 5 || out[i + 2] > 120)
+            }
+        }
+        #expect(partial > 50)
+    }
+
     @Test func zeroStrengthPreservesPictureAcrossDepthEdges() throws {
         let f = try Fixture(depthValue: { x, _ in (300..<460).contains(x) ? 1 : 0 },
                             foreground: { x, _ in (300..<460).contains(x) })
@@ -166,7 +181,7 @@ struct StereoBoundaryWarpTests {
         // Constant depth across rows: a scale/offset remap must not change
         // horizontal geometry, even when the model contains letterbox bars.
         let remapped = try f.render(eye: -1, mirror: true, uv: SIMD4(1, 0.6, 0, 0.2))
-        #expect(out == remapped)
+        #expect(zip(out, remapped).allSatisfy { $0 == $1 })
     }
 }
 #endif

@@ -67,24 +67,6 @@ struct PackedEyeUniforms {
     var regionOffset: SIMD2<Float>
 }
 
-struct VideoStereoUniforms {
-    var brightness: Float
-    var contrast: Float
-    var saturation: Float
-    var depthStrength: Float
-    var convergence: Float
-    var eyeSign: Float
-    var mirror: Float
-    var useDepth: Float
-    var depthUVScale: SIMD2<Float>
-    var depthUVOffset: SIMD2<Float>
-    var depthValueScale: Float
-    var depthValueBias: Float
-    var depthBudget: SIMD2<Float>
-    var edgeFill: Float = 0
-    var pad0: Float = 0
-}
-
 // MARK: - StereoPump (off-main: decode -> warp -> enqueue)
 
 /// Owns all per-frame GPU work on a dedicated background queue with its own
@@ -139,6 +121,7 @@ public final class StereoPump: @unchecked Sendable {
 
     private let videoRenderer: AVSampleBufferVideoRenderer
     private let frameSource: PumpFrameSource
+    private lazy var meshWarp = StereoMeshWarp(resources: warp)
     private let warp: StereoWarpResources
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -173,16 +156,6 @@ public final class StereoPump: @unchecked Sendable {
     private var outPool: CVMutablePixelBuffer.Pool?
     private var poolWidth = 0
     private var poolHeight = 0
-    /// Per-eye depth attachments for the occlusion-correct mesh warp ([0]=left,
-    /// [1]=right). Separate textures because both eyes render in one command
-    /// buffer; sharing one depth attachment let the right eye (2nd pass) test
-    /// against the left eye's geometry, warping it more than the left.
-    /// Multisampled + memoryless when MSAA is on (tile memory only, no backing).
-    private var eyeDepthTextures: [MTLTexture?] = [nil, nil]
-    /// Per-eye multisampled color targets for the MSAA mesh pass, resolved into
-    /// the eye buffer by the render pass. Memoryless — only the resolve output
-    /// (the eye buffer itself) is ever stored.
-    private var eyeMSAAColorTextures: [MTLTexture?] = [nil, nil]
     /// Converts the BGRA warp output into the compositor's native 420v format.
     private let transferSession: VTPixelTransferSession
     /// Per-frame depth: realtime inference or PTS-matched cached depth (nil →
@@ -473,9 +446,8 @@ public final class StereoPump: @unchecked Sendable {
             if let textureCache { CVMetalTextureCacheFlush(textureCache, 0) }
             self.bgraPool = nil
             self.outPool = nil
-            self.eyeDepthTextures = [nil, nil]
-            self.eyeMSAAColorTextures = [nil, nil]
             self.boundaryWarp = nil
+            self.meshWarp.reset()
         }
     }
 
@@ -1232,46 +1204,10 @@ public final class StereoPump: @unchecked Sendable {
                 indexCount: dense ? warp.denseGridIndexCount : warp.gridIndexCount,
                 uniforms: u, commandBuffer: commandBuffer) { return }
         }
-        if let depth, let depthAttachment = ensureDepthTexture(width: dest.width, height: dest.height, eye: eyeIndex) {
-            let desc = MTLRenderPassDescriptor()
-            // MSAA: rasterize into a memoryless multisampled target and resolve
-            // into the eye buffer — the mesh's occlusion boundaries are raster
-            // edges with no texture-side AA and stairstep without it. The
-            // pipeline is built at pseudo3DMSAASampleCount, so the attachments
-            // must match; if the transient MSAA target can't be made (never
-            // observed — memoryless has no memory backing), skip the frame.
-            if warp.msaaSampleCount > 1 {
-                guard let msaaColor = ensureMSAAColorTexture(width: dest.width, height: dest.height, eye: eyeIndex) else { return }
-                desc.colorAttachments[0].texture = msaaColor
-                desc.colorAttachments[0].resolveTexture = dest
-                desc.colorAttachments[0].storeAction = .multisampleResolve
-            } else {
-                desc.colorAttachments[0].texture = dest
-                desc.colorAttachments[0].storeAction = .store
-            }
-            desc.colorAttachments[0].loadAction = .clear
-            desc.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-            desc.depthAttachment.texture = depthAttachment
-            desc.depthAttachment.loadAction = .clear
-            desc.depthAttachment.clearDepth = 1.0
-            desc.depthAttachment.storeAction = .dontCare
-            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return }
-            // Grid density per depth source: dense for cached (edge-aware) depth,
-            // moderate for realtime — see PumpDepthSource.prefersDenseWarpGrid.
-            let dense = depthSource?.prefersDenseWarpGrid == true
-            encoder.setRenderPipelineState(warp.meshPipelineState)
-            encoder.setDepthStencilState(warp.meshDepthState)
-            encoder.setVertexBuffer(dense ? warp.denseGridPositions : warp.gridPositions, offset: 0, index: 0)
-            encoder.setVertexBytes(&uniforms, length: MemoryLayout<VideoStereoUniforms>.size, index: 1)
-            encoder.setVertexTexture(depth.texture, index: 0)
-            encoder.setFragmentTexture(source, index: 0)
-            encoder.setFragmentTexture(depth.texture, index: 1)
-            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VideoStereoUniforms>.size, index: 0)
-            encoder.drawIndexedPrimitives(
-                type: .triangle, indexCount: dense ? warp.denseGridIndexCount : warp.gridIndexCount,
-                indexType: .uint32, indexBuffer: dense ? warp.denseGridIndices : warp.gridIndices, indexBufferOffset: 0
-            )
-            encoder.endEncoding()
+        if let depth {
+            _ = meshWarp.encode(source: source, depth: depth.texture, destination: dest,
+                uniforms: uniforms, dense: depthSource?.prefersDenseWarpGrid == true,
+                eye: eyeIndex, commandBuffer: commandBuffer)
             return
         }
 
@@ -1339,51 +1275,6 @@ public final class StereoPump: @unchecked Sendable {
         encoder.endEncoding()
     }
 
-    private func ensureDepthTexture(width: Int, height: Int, eye: Int) -> MTLTexture? {
-        if let existing = eyeDepthTextures[eye], existing.width == width, existing.height == height {
-            return existing
-        }
-        let texture = device.makeTexture(descriptor: transientAttachmentDescriptor(
-            pixelFormat: .depth32Float, width: width, height: height
-        ))
-        eyeDepthTextures[eye] = texture
-        return texture
-    }
-
-    /// Multisampled color target for the MSAA mesh pass (resolved into the eye
-    /// buffer). Only called when pseudo3DMSAASampleCount > 1.
-    private func ensureMSAAColorTexture(width: Int, height: Int, eye: Int) -> MTLTexture? {
-        if let existing = eyeMSAAColorTextures[eye], existing.width == width, existing.height == height {
-            return existing
-        }
-        let texture = device.makeTexture(descriptor: transientAttachmentDescriptor(
-            pixelFormat: .bgra8Unorm, width: width, height: height
-        ))
-        eyeMSAAColorTextures[eye] = texture
-        return texture
-    }
-
-    /// Descriptor for a load-clear/store-discard render attachment: multisampled
-    /// at the mesh pipeline's sample count and memoryless (tile memory only —
-    /// contents never survive the pass, which is all the mesh pass needs from
-    /// its depth buffer and its pre-resolve color).
-    private func transientAttachmentDescriptor(pixelFormat: MTLPixelFormat, width: Int, height: Int) -> MTLTextureDescriptor {
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: pixelFormat, width: width, height: height, mipmapped: false
-        )
-        desc.usage = [.renderTarget]
-        let samples = warp.msaaSampleCount
-        if samples > 1 {
-            desc.textureType = .type2DMultisample
-            desc.sampleCount = samples
-            desc.storageMode = .memoryless
-        } else {
-            desc.storageMode = .private
-        }
-        return desc
-    }
-
-    // MARK: GPU helpers
 
     /// (Re)creates the BGRA warp pool and the 420v output pool for the current
     /// source dimensions. Returns false if either pool can't be made.

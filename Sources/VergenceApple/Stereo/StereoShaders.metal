@@ -95,7 +95,7 @@ struct VideoStereoUniforms {
     // 1 = fill the strips a near subject uncovers with the background beside
     // them (mesh warp only), 0 = stretch the image across them as before.
     float edgeFill;
-    float pad0;
+    float extendedRange;
 };
 
 // The depth budget: shot-space depth (unbounded once anchored) → 0…1, near
@@ -335,7 +335,7 @@ fragment float4 videoStereoMeshFragment(
     color.rgb = (color.rgb - 0.5) * u.contrast + 0.5;
     float luminance = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
     color.rgb = mix(float3(luminance), color.rgb, u.saturation);
-    color.rgb = clamp(color.rgb, 0.0, 1.0);
+    color.rgb = u.extendedRange > 0.5 ? max(color.rgb, 0.0) : clamp(color.rgb, 0.0, 1.0);
     color.a = 1.0;
     return color;
 }
@@ -352,7 +352,7 @@ struct BoundaryUniforms {
 
 struct BoundaryVertexOut {
     float4 position [[position]];
-    float2 uv;
+    float2 uv [[sample_perspective]];
     float depth;
     float reject [[flat]];
     float2 split [[flat]]; // midpoint depth, near(0)/far(1); midpoint -1 = continuous
@@ -395,15 +395,22 @@ vertex BoundaryVertexOut boundaryMeshVertex(
     return out;
 }
 
-fragment float4 boundaryMeshFragment(BoundaryVertexOut in [[stage_in]],
+struct BoundaryFragmentOut {
+    float4 surface [[color(0)]];
+    float coverage [[color(1)]];
+};
+
+fragment BoundaryFragmentOut boundaryMeshFragment(BoundaryVertexOut in [[stage_in]],
                                     texture2d<float> source [[texture(0)]],
                                     texture2d<float> depth [[texture(1)]],
-                                    constant BoundaryUniforms &u [[buffer(0)]]) {
+                                    constant BoundaryUniforms &u [[buffer(0)]], uint sampleID [[sample_id]]) {
     if (in.reject > 0.5) { discard_fragment(); }
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     constexpr sampler point(filter::nearest, address::clamp_to_edge);
     if (in.split.x >= 0) {
-        float d = pseudo3DDepthBudget(depth.sample(point, in.uv * u.uv.xy + u.uv.zw).r
+        const float2 depthSize = float2(depth.get_width(), depth.get_height());
+        const float2 depthUV = (floor((in.uv * u.uv.xy + u.uv.zw) * depthSize + 1e-4) + 0.5) / depthSize;
+        float d = pseudo3DDepthBudget(depth.sample(point, depthUV).r
                                      * u.mapping.x + u.mapping.y, u.mapping.zw);
         bool belongsNear = d >= in.split.x;
         if ((in.split.y < 0.5) != belongsNear) { discard_fragment(); }
@@ -411,20 +418,37 @@ fragment float4 boundaryMeshFragment(BoundaryVertexOut in [[stage_in]],
     // Across a split, bilinear colour sampling can mix a foreground texel
     // into the far surface even after depth clipping. The hole filler would
     // then reflect that contaminated sample across the uncovered strip.
-    float3 rgb = (in.split.x >= 0 ? source.sample(point, in.uv).rgb : source.sample(s, in.uv).rgb) + u.adjustments.x;
+    const float2 sampleOffset = float2(0.5) - get_sample_position(sampleID);
+    const float2 centerUV = in.uv + dfdx(in.uv) * sampleOffset.x + dfdy(in.uv) * sampleOffset.y;
+    const float2 sourceSize = float2(source.get_width(), source.get_height());
+    const float2 pointUV = (floor(in.uv * sourceSize + 1e-4) + 0.5) / sourceSize;
+    float3 rgb = (in.split.x >= 0 ? source.sample(point, pointUV).rgb : source.sample(s, centerUV).rgb) + u.adjustments.x;
     rgb = (rgb - 0.5) * u.adjustments.y + 0.5;
     rgb = mix(float3(dot(rgb, float3(0.2126, 0.7152, 0.0722))), rgb, u.adjustments.z);
-    return float4(clamp(rgb, 0.0, 1.0), 1 + in.depth);
+    const float3 color = (uint(u.boundary.w) & 2u) != 0 ? max(rgb, 0.0) : clamp(rgb, 0.0, 1.0);
+    return {float4(color, 1 + in.depth), 1};
+}
+
+static inline float4 boundaryCovered(texture2d<float, access::read> surfaces,
+                                     texture2d<float, access::read> coverage, uint2 p) {
+    float c = coverage.read(p).r;
+    // Never reflect an antialiased foreground/background mixture into a hole.
+    return c >= 0.999 ? surfaces.read(p) / c : float4(0);
 }
 
 kernel void boundaryHoleFill(texture2d<float, access::read> surfaces [[texture(0)]],
                              texture2d<float, access::write> output [[texture(1)]],
+                             texture2d<float, access::read> coverage [[texture(2)]],
                              constant BoundaryUniforms &u [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
     int width = int(output.get_width());
     if (p.x >= uint(width) || p.y >= output.get_height()) { return; }
-    float4 center = surfaces.read(p);
-    if (center.a >= 1) { output.write(float4(center.rgb, 1), p); return; }
-    if (u.boundary.w > 0.5) { output.write(float4(1, 0, 1, 1), p); return; }
+    const float4 packed = surfaces.read(p);
+    // A discarded surface has no colour/depth contribution. Limit coverage
+    // by the packed alpha too, including at clipped far-plane sample edges.
+    float covered = min(coverage.read(p).r, packed.a);
+    float4 center = packed / max(covered, 1e-6);
+    if (covered >= 0.999) { output.write(float4(center.rgb, 1), p); return; }
+    if ((uint(u.boundary.w) & 1u) != 0) { output.write(float4(1, 0, 1, 1), p); return; }
 
     // The hole is bounded by differential disparity plus the split cells.
     // Only holes pay for the scan. Never sample beyond the frame or use the
@@ -433,12 +457,12 @@ kernel void boundaryHoleFill(texture2d<float, access::read> surfaces [[texture(0
     int left = -1, right = -1;
     for (int distance = 1; distance <= reach; ++distance) {
         int lx = int(p.x) - distance, rx = int(p.x) + distance;
-        if (left < 0 && lx >= 0 && surfaces.read(uint2(lx, p.y)).a >= 1) { left = lx; }
-        if (right < 0 && rx < width && surfaces.read(uint2(rx, p.y)).a >= 1) { right = rx; }
+        if (left < 0 && lx >= 0 && boundaryCovered(surfaces, coverage, uint2(lx, p.y)).a >= 1) { left = lx; }
+        if (right < 0 && rx < width && boundaryCovered(surfaces, coverage, uint2(rx, p.y)).a >= 1) { right = rx; }
         if (left >= 0 && right >= 0) { break; }
     }
     int background = left;
-    if (left < 0 || (right >= 0 && surfaces.read(uint2(right, p.y)).a < surfaces.read(uint2(left, p.y)).a)) {
+    if (left < 0 || (right >= 0 && boundaryCovered(surfaces, coverage, uint2(right, p.y)).a < boundaryCovered(surfaces, coverage, uint2(left, p.y)).a)) {
         background = right;
     }
     if (background < 0) {
@@ -447,31 +471,31 @@ kernel void boundaryHoleFill(texture2d<float, access::read> surfaces [[texture(0
         int up = -1, down = -1;
         for (int distance = 1; distance <= reach; ++distance) {
             int uy = int(p.y) - distance, dy = int(p.y) + distance;
-            if (up < 0 && uy >= 0 && surfaces.read(uint2(p.x, uy)).a >= 1) { up = uy; }
-            if (down < 0 && dy < int(output.get_height()) && surfaces.read(uint2(p.x, dy)).a >= 1) { down = dy; }
+            if (up < 0 && uy >= 0 && boundaryCovered(surfaces, coverage, uint2(p.x, uy)).a >= 1) { up = uy; }
+            if (down < 0 && dy < int(output.get_height()) && boundaryCovered(surfaces, coverage, uint2(p.x, dy)).a >= 1) { down = dy; }
             if (up >= 0 && down >= 0) { break; }
         }
         int by = up;
-        if (up < 0 || (down >= 0 && surfaces.read(uint2(p.x, down)).a < surfaces.read(uint2(p.x, up)).a)) { by = down; }
+        if (up < 0 || (down >= 0 && boundaryCovered(surfaces, coverage, uint2(p.x, down)).a < boundaryCovered(surfaces, coverage, uint2(p.x, up)).a)) { by = down; }
         if (by < 0) { output.write(float4(0, 0, 0, 1), p); return; }
-        float4 far = surfaces.read(uint2(p.x, by));
+        float4 far = boundaryCovered(surfaces, coverage, uint2(p.x, by));
         int reflectedY = 2 * by - int(p.y);
         if (reflectedY >= 0 && reflectedY < int(output.get_height())) {
-            float4 candidate = surfaces.read(uint2(p.x, reflectedY));
+            float4 candidate = boundaryCovered(surfaces, coverage, uint2(p.x, reflectedY));
             if (candidate.a >= 1 && candidate.a <= far.a + 0.03) { far = candidate; }
         }
-        output.write(float4(far.rgb, 1), p);
+        output.write(float4(mix(far.rgb, center.rgb, covered), 1), p);
         return;
     }
-    float4 far = surfaces.read(uint2(background, p.y));
+    float4 far = boundaryCovered(surfaces, coverage, uint2(background, p.y));
     // Reflect texture into the hole from the far side. If the reflection hits
     // another hole or a nearer object (thin railing), keep the known far sample.
     int reflected = 2 * background - int(p.x);
     if (reflected >= 0 && reflected < width) {
-        float4 candidate = surfaces.read(uint2(reflected, p.y));
+        float4 candidate = boundaryCovered(surfaces, coverage, uint2(reflected, p.y));
         if (candidate.a >= 1 && candidate.a <= far.a + 0.03) { far = candidate; }
     }
-    output.write(float4(far.rgb, 1), p);
+    output.write(float4(mix(far.rgb, center.rgb, covered), 1), p);
 }
 
 // MARK: - Depth Stabilization (spatial band-limit + motion-adaptive temporal EMA)

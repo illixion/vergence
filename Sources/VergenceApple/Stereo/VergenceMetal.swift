@@ -137,10 +137,12 @@ public final class StereoWarpResources: Sendable {
     public nonisolated(unsafe) let denseGridIndices: MTLBuffer
     public let denseGridIndexCount: Int
 
-    private init?() {
+    private convenience init?() {
         guard let metal = VergenceMetal.shared else { return nil }
-        let device = metal.device
-        let library = metal.library
+        self.init(device: metal.device, library: metal.library)
+    }
+
+    init?(device: MTLDevice, library: MTLLibrary, pixelFormat: MTLPixelFormat = .bgra8Unorm) {
         self.device = device
 
         guard let vertexFunction = library.makeFunction(name: "stereoQuadVertex"),
@@ -199,7 +201,7 @@ public final class StereoWarpResources: Sendable {
             meshDesc.vertexFunction = meshVertexFn
             meshDesc.fragmentFunction = meshFragmentFn
             meshDesc.colorAttachments[0].isBlendingEnabled = false
-            meshDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            meshDesc.colorAttachments[0].pixelFormat = pixelFormat
             meshDesc.depthAttachmentPixelFormat = .depth32Float
             meshDesc.rasterSampleCount = msaa
             self.meshPipelineState = try device.makeRenderPipelineState(descriptor: meshDesc)

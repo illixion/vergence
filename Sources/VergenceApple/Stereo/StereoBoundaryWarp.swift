@@ -20,9 +20,14 @@ final class StereoBoundaryWarp {
     private let depthState: MTLDepthStencilState
     private(set) var surfaces: MTLTexture?
     private var zBuffer: MTLTexture?
+    private var coverage: MTLTexture?
+    private var multisampleColor: MTLTexture?
+    private var multisampleCoverage: MTLTexture?
+    private let samples: Int
 
     init?(device: MTLDevice, library: MTLLibrary) {
         self.device = device
+        samples = device.supportsTextureSampleCount(4) ? 4 : 1
         guard let vertex = library.makeFunction(name: "boundaryMeshVertex"),
               let fragment = library.makeFunction(name: "boundaryMeshFragment"),
               let fill = library.makeFunction(name: "boundaryHoleFill") else { return nil }
@@ -30,9 +35,11 @@ final class StereoBoundaryWarp {
         descriptor.vertexFunction = vertex
         descriptor.fragmentFunction = fragment
         // RGB + (1 + normalized depth). A zero alpha is an uncovered pixel.
-        // Single-sample deliberately: averaging coverage with depth would
-        // corrupt the depth used to choose the background. AA is a follow-up.
+        // Resolve coverage independently: packed depth / coverage recovers
+        // the surface depth without mistaking a partially covered edge for a hole.
         descriptor.colorAttachments[0].pixelFormat = .rgba16Float
+        descriptor.colorAttachments[1].pixelFormat = .r16Float
+        descriptor.rasterSampleCount = samples
         descriptor.depthAttachmentPixelFormat = .depth32Float
         let z = MTLDepthStencilDescriptor()
         z.depthCompareFunction = .lessEqual
@@ -58,17 +65,49 @@ final class StereoBoundaryWarp {
             let z = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
                 width: destination.width, height: destination.height, mipmapped: false)
             z.storageMode = .private
+            if samples > 1 {
+                z.textureType = .type2DMultisample
+                z.sampleCount = samples
+                #if os(iOS) || os(tvOS) || os(visionOS)
+                z.storageMode = .memoryless
+                #endif
+            }
             z.usage = [.renderTarget]
             surfaces = device.makeTexture(descriptor: color)
             zBuffer = device.makeTexture(descriptor: z)
+            let c = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float,
+                width: destination.width, height: destination.height, mipmapped: false)
+            c.storageMode = .private
+            c.usage = [.renderTarget, .shaderRead]
+            coverage = device.makeTexture(descriptor: c)
+            if samples > 1 {
+                z.pixelFormat = .rgba16Float
+                multisampleColor = device.makeTexture(descriptor: z)
+                z.pixelFormat = .r16Float
+                multisampleCoverage = device.makeTexture(descriptor: z)
+            }
         }
-        guard let surfaces, let zBuffer else { return false }
+        guard let surfaces, let zBuffer, let coverage else { return false }
         var uniforms = uniforms
         uniforms.adjustments.w = Float(indexCount)
         let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = surfaces
+        if samples > 1 {
+            guard let multisampleColor, let multisampleCoverage else { return false }
+            pass.colorAttachments[0].texture = multisampleColor
+            pass.colorAttachments[0].resolveTexture = surfaces
+            pass.colorAttachments[0].storeAction = .multisampleResolve
+            pass.colorAttachments[1].texture = multisampleCoverage
+            pass.colorAttachments[1].resolveTexture = coverage
+            pass.colorAttachments[1].storeAction = .multisampleResolve
+        } else {
+            pass.colorAttachments[0].texture = surfaces
+            pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[1].texture = coverage
+            pass.colorAttachments[1].storeAction = .store
+        }
+        pass.colorAttachments[1].loadAction = .clear
+        pass.colorAttachments[1].clearColor = MTLClearColorMake(0, 0, 0, 0)
         pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].storeAction = .store
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0)
         pass.depthAttachment.texture = zBuffer
         pass.depthAttachment.loadAction = .clear
@@ -94,6 +133,7 @@ final class StereoBoundaryWarp {
         fill.setComputePipelineState(fillPipeline)
         fill.setTexture(surfaces, index: 0)
         fill.setTexture(destination, index: 1)
+        fill.setTexture(coverage, index: 2)
         fill.setBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
         fill.dispatchThreads(MTLSize(width: destination.width, height: destination.height, depth: 1),
                              threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))

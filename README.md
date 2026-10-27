@@ -266,10 +266,11 @@ vertical fallback handles horizontal rails whose entire row is uncovered.
 Searches are bounded by disparity plus grid pitch and read only the original
 surface pass, so filling is deterministic and uses no stale frame history.
 
-`showsBoundaryHoles` highlights uncovered pixels in magenta. The prototype uses
-single-sample rasterization because depth and coverage cannot be averaged in its
-packed target. It still needs anti-aliasing, temporal/background reconstruction,
-and device performance validation before becoming the default. Sub-grid hair,
+`showsBoundaryHoles` highlights uncovered pixels in magenta. The prototype uses 4× MSAA where supported, resolving surface colour/depth and
+coverage separately before background fill. This avoids averaging depth into
+coverage, preserves partial foreground coverage, and reflects only fully covered
+background samples. It still needs temporal/background reconstruction and device
+quality/performance validation before becoming the default. Sub-grid hair,
 soft/incorrect depth boundaries and transparent pixels remain limitations.
 
 On-device comparison on the paused Movie A corral shot (2026-10-13) found noisy
@@ -290,6 +291,37 @@ runtime and executes the GPU passes, including BGRA output. It checks both eyes,
 vertical and horizontal rails, smooth slopes, zero disparity, mirror and depth
 UV remapping. These tests do not silently skip because a SwiftPM resource bundle
 is missing. A host app can capture the same movie frames before and after a change to compare them.
+
+## AI stereo stills
+
+`StillStereoRenderer` reuses the video's occlusion-tested mesh pass and dense grid,
+with nearest depth at zero parallax. It accepts full-precision `StillDepthMap`s,
+refines them with the shared joint-bilateral / guided upsample kernels (no temporal
+state), and returns linear extended-P3 half-float eye textures. The experimental
+separated-boundary mode also works on stills and retains extended colour range.
+Calls on one renderer must be serialized and run off the main thread.
+
+`StillStereoResolution` applies an additional 4096-pixel long-edge ceiling and a
+256 MiB estimated stereo working-set budget **after** the app's normal resolution
+policy. It is not a codec memory guarantee: ImageIO may fully decode a JXL before
+returning a small image. For an 8192×4608 input the working-set estimate currently
+selects at most 3454 pixels on the long edge. Keep originals; downscale only the
+presentation rendition.
+
+A repeatable Mac diagnostic (personal inputs/outputs stay outside the repo):
+
+```bash
+scripts/still-stereo-lab.sh /path/photo.jxl /path/model.mlmodelc /tmp/still-comparison 4096
+swift test --filter 'StillStereo|StereoBoundaryWarp|DepthArrayStride'
+```
+
+The lab runs the actual model and shaders, writes source, raw/refined depth, both
+eyes and anaglyphs for continuous and separated boundaries, and a JSON report of
+sizes, timing and whole-process peak RSS. It compiles the real Metal source even
+when SwiftPM doesn't build a metallib. Synthetic GPU tests always run; the personal
+image test runs only when the script supplies its environment. Passing these tests
+does not establish headset comfort or correct recognition of sub-model-resolution
+hair, transparent steam or low-contrast silhouettes.
 
 ## License
 
