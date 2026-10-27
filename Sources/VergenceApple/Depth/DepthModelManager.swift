@@ -161,7 +161,7 @@ public final class DepthModelManager {
             let expected = sizes[rel] ?? (rel.hasSuffix("weight.bin") ? effectiveTotal : 0)
             let base = completedBytes
             let denom = Double(effectiveTotal)
-            let downloader = FileDownloader(expectedBytes: expected) { [weak self] fraction in
+            let downloader = ModelFileDownloader(expectedBytes: expected) { [weak self] fraction in
                 let done = Double(base) + fraction * Double(max(expected, 0))
                 let overall = denom > 0 ? min(1.0, done / denom) : 0
                 Task { @MainActor in self?.setProgress(variant.name, overall) }
@@ -229,71 +229,4 @@ public final class DepthModelManager {
     }
 }
 
-// MARK: - FileDownloader
-
-/// Delegate-driven download with byte progress, wrapped in async/await. Uses the
-/// download-delegate's `didFinishDownloadingTo` (which fires while the temp file
-/// still exists) to relocate it and resume the continuation, so file ownership is
-/// unambiguous. `@unchecked Sendable`: the continuation is set before `resume()`
-/// and consumed once on the session's delegate queue.
-private final class FileDownloader: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
-    private let expectedBytes: Int64
-    private let onFraction: @Sendable (Double) -> Void
-    private var lastReported = -1.0
-    private var continuation: CheckedContinuation<URL, Error>?
-    private var session: URLSession!
-
-    init(expectedBytes: Int64, onFraction: @escaping @Sendable (Double) -> Void) {
-        self.expectedBytes = expectedBytes
-        self.onFraction = onFraction
-        super.init()
-        session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-    }
-
-    public func download(from url: URL) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
-            self.continuation = continuation
-            session.downloadTask(with: url).resume()
-        }
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
-                    totalBytesExpectedToWrite: Int64) {
-        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedBytes
-        guard total > 0 else { return }
-        let fraction = min(1.0, Double(totalBytesWritten) / Double(total))
-        // Throttle: forward only on ~1% steps (and always the final one).
-        if fraction - lastReported >= 0.01 || fraction >= 1.0 {
-            lastReported = fraction
-            onFraction(fraction)
-        }
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didFinishDownloadingTo location: URL) {
-        if let http = downloadTask.response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            continuation?.resume(throwing: URLError(.badServerResponse))
-            continuation = nil
-            return
-        }
-        // `location` is deleted once this returns — move it somewhere stable now.
-        let stable = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        do {
-            try FileManager.default.moveItem(at: location, to: stable)
-            continuation?.resume(returning: stable)
-        } catch {
-            continuation?.resume(throwing: error)
-        }
-        continuation = nil
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error, continuation != nil {
-            continuation?.resume(throwing: error)
-            continuation = nil
-        }
-        session.finishTasksAndInvalidate()
-    }
-}
 #endif

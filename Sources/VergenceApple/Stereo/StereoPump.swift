@@ -92,6 +92,9 @@ struct VideoStereoUniforms {
 /// objects it holds are documented thread-safe, config is lock-guarded, and all
 /// mutable state is touched only on `queue`.
 public final class StereoPump: @unchecked Sendable {
+    /// Called when real-time depth inference briefly holds/releases the media
+    /// clock. Set before `start`; invoked on the pump queue.
+    public var onProcessingBuffering: (@Sendable (Bool) -> Void)?
     public struct Config: Equatable {
         public var brightness: Float = 0
         public var contrast: Float = 1
@@ -194,7 +197,8 @@ public final class StereoPump: @unchecked Sendable {
     /// Set for a source that can hand frames out early; the pump then works
     /// `lead` seconds ahead of the display.
     private let clock: LookaheadFrameSource?
-    private let lead: Double
+    private var lead: Double
+    private var processingHold = StereoProcessingHoldPolicy()
     /// Pump-queue only: frames taken and not yet on screen, in order.
     private var schedule: [ScheduledFrame] = []
     /// Pump-queue only: the frame on screen (the last one queued whose time
@@ -238,7 +242,7 @@ public final class StereoPump: @unchecked Sendable {
     /// How far ahead of the display the pump works, for a clocked source:
     /// long enough for a frame's inference, warp and transfer with room for a
     /// slow one; a cached or packed picture only needs the warp.
-    private static let realtimeLead = 0.075
+    private static let realtimeLead = StereoLookaheadPolicy.minimumLead
     private static let drawLead = 0.04
     /// A push source can't hand frames out early, so with depth worked out
     /// ahead each frame shows this long after it came: a map and a draw fit
@@ -250,9 +254,12 @@ public final class StereoPump: @unchecked Sendable {
     /// model can't keep up, and a newer frame is let go rather than queued
     /// behind them.
     private static let maxPushBacklog = 2
-    /// Frames taken and not yet on screen, at most: 75 ms at 60 fps is about
-    /// five, and each holds a decoded frame and two eye buffers.
-    private static let maxScheduled = 8
+    /// Absolute frame bound; the per-size memory budget usually permits fewer.
+    /// Each retained frame holds its input and two compositor eye buffers.
+    private static let maxScheduled = 16
+    /// Input BGRA plus two retained 420f eyes, rounded up for alignment.
+    /// The pools and the currently displayed frame have their own bounds.
+    private var maxScheduledForSize = 8
     /// Pump-queue only. For a depth source that infers per frame
     /// (`PumpDepthSource.limitsToSourceFrameRate`): faster than normal speed,
     /// no more frames a second than the video has at normal speed. A frame
@@ -449,6 +456,9 @@ public final class StereoPump: @unchecked Sendable {
             pendingReshow?.request?.cancel()
             pendingReshow = nil
             depthSource?.invalidate()
+            let wasHolding = processingHold.isHolding
+            processingHold.reset()
+            if wasHolding { onProcessingBuffering?(false) }
             frameSource.invalidate()
             if let textureCache { CVMetalTextureCacheFlush(textureCache, 0) }
             self.bgraPool = nil
@@ -624,7 +634,7 @@ public final class StereoPump: @unchecked Sendable {
         guard playhead.isFinite, windowEnd.isFinite else { return false }
         var took = false
         for _ in 0 ..< Self.maxScheduled * 2 {
-            guard schedule.count < Self.maxScheduled else { break }
+            guard schedule.count < maxScheduledForSize else { break }
             let target = LookaheadPull.target(last: lastTakenSeconds, spacing: delivery.sourceSpacing.seconds,
                                               playhead: playhead, windowEnd: windowEnd)
             // Nothing new can come at or before the last frame taken, and
@@ -668,6 +678,8 @@ public final class StereoPump: @unchecked Sendable {
             minimumInterval: clock == nil ? 0 : frameInterval
         ) else { return }
         reportSizeIfNeeded(frame.pixelBuffer)
+        maxScheduledForSize = StereoLookaheadPolicy.capacity(width: CVPixelBufferGetWidth(frame.pixelBuffer),
+                                                           height: CVPixelBufferGetHeight(frame.pixelBuffer))
         var request: PumpDepthRequest?
         if let depthSource, depthSource.computesDepthAhead {
             let shownAt = clock?.dueHostTime(forItemTime: frame.itemTime, at: now) ?? now
@@ -716,9 +728,22 @@ public final class StereoPump: @unchecked Sendable {
             index += 1
         }
         let drawn = CACurrentMediaTime()
+        updateProcessingHold(now: drawn)
         queueDrawn(now: drawn)
         prune(now: drawn)
         logStageTimingIfDue(now: drawn)
+    }
+
+    private func updateProcessingHold(now: CFTimeInterval) {
+        guard clock != nil, depthSource?.computesDepthAhead == true else { return }
+        let playhead = clock?.itemTime(forHostTime: now).seconds ?? 0
+        let running = (clock?.playbackRate(hostTime: now) ?? 0) > 0.01
+        let waitingSince = schedule.first {
+            $0.request != nil && !($0.request?.isReady ?? true) && $0.itemSeconds <= playhead + 0.02
+        }?.takenAt
+        let wasHolding = processingHold.isHolding
+        let isHolding = processingHold.update(now: now, clockRunning: running, waitingSince: waitingSince)
+        if wasHolding != isHolding { onProcessingBuffering?(isHolding) }
     }
 
     /// Whether the frame's time has come: the clock's playhead has reached
@@ -1030,6 +1055,11 @@ public final class StereoPump: @unchecked Sendable {
             depth = String(format: "depth %.1f ms", timing.lookup / drawn * 1000)
         } else {
             depth = "no depth"
+        }
+        // Increase reserve promptly after late work, then release it slowly.
+        // No timestamp offset is applied: eyes still follow the audio clock.
+        if clock != nil, depthSource?.computesDepthAhead == true {
+            lead = StereoLookaheadPolicy.lead(after: lead, shown: timing.shown, late: timing.late)
         }
         let schedule = clock == nil ? "shown as drawn"
             : String(format: "%.0f ms ahead, %.0f%% late", lead * 1000,
