@@ -41,4 +41,33 @@ final class StereoProcessingHoldPolicyTests: XCTestCase {
         policy.reset()
         XCTAssertFalse(policy.isHolding)
     }
+
+    /// A paused AVPlayer can't fill the reserve: the hold ends once what it
+    /// could hand out has depth, rather than at the timeout.
+    func testSourceThatCannotRefillWhilePausedReleasesWhenExhausted() {
+        var policy = StereoProcessingHoldPolicy()
+        // Before the first frame: stopped with nothing to prepare, no hold.
+        XCTAssertFalse(policy.update(now: 0, clockRunning: false, readySeconds: 0, resumeSeconds: 0.6,
+                                     lowWaterSeconds: 0.12, sourceExhausted: true))
+        // The first frame waits for its depth at the playhead.
+        XCTAssertTrue(policy.update(now: 0.1, clockRunning: true, readySeconds: -0.01, resumeSeconds: 0.6,
+                                    lowWaterSeconds: 0.12))
+        XCTAssertTrue(policy.update(now: 0.12, clockRunning: false, readySeconds: -0.01, resumeSeconds: 0.6,
+                                    lowWaterSeconds: 0.12))
+        XCTAssertFalse(policy.update(now: 0.2, clockRunning: false, readySeconds: 0.04, resumeSeconds: 0.6,
+                                     lowWaterSeconds: 0.12, sourceExhausted: true))
+        XCTAssertFalse(policy.recoveryExhausted)
+    }
+
+    func testManyShortHoldsReportSustainedOverload() {
+        var policy = StereoProcessingHoldPolicy(maximumRecoveries: 3)
+        for index in 0 ..< 3 {
+            let start = Double(index)
+            XCTAssertTrue(policy.update(now: start, clockRunning: true, readySeconds: 0, resumeSeconds: 0.6,
+                                        lowWaterSeconds: 0.12))
+            XCTAssertFalse(policy.update(now: start + 0.1, clockRunning: false, readySeconds: 0.3,
+                                         resumeSeconds: 0.6, lowWaterSeconds: 0.12, sourceExhausted: true))
+        }
+        XCTAssertTrue(policy.recoveryExhausted)
+    }
 }

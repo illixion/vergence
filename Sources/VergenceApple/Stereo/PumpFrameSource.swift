@@ -83,6 +83,11 @@ public protocol LookaheadFrameSource: PumpFrameSource {
     var endTime: Double? { get }
     /// Changes after a flush, including a seek to the same position.
     var sequence: Int { get }
+    /// Whether frames ahead of the playhead keep coming while the clock is
+    /// stopped, so a paused clock can refill the pump's reserve. False holds
+    /// the clock only until what the source already has is ready
+    /// (`StereoProcessingHoldPolicy`).
+    var decodesAheadWhilePaused: Bool { get }
     /// The source's item time at `hostTime`; at a future host time, where the
     /// clock will be if it keeps its current rate.
     func itemTime(forHostTime hostTime: CFTimeInterval) -> CMTime
@@ -97,6 +102,7 @@ public protocol LookaheadFrameSource: PumpFrameSource {
 public extension LookaheadFrameSource {
     var endTime: Double? { nil }
     var sequence: Int { 0 }
+    var decodesAheadWhilePaused: Bool { true }
 }
 
 /// Pulls from an `AVPlayerItemVideoOutput` — the original Spatial Stash path,
@@ -104,6 +110,11 @@ public extension LookaheadFrameSource {
 /// pixels are diverted. The output decodes well ahead of the playhead (0.5-1 s
 /// measured on device, `DepthPipelineBenchmark`), so frames can be taken early.
 public final class AVPlayerFrameSource: LookaheadFrameSource, @unchecked Sendable {
+    /// A paused player decodes nothing new: the output then has the frame at
+    /// the playhead and whatever it decoded before the pause (about 0.4 s;
+    /// nothing ahead before the player first plays), measured on a Mac
+    /// 2026-10-27 with the same output settings.
+    public let decodesAheadWhilePaused = false
     private let output: AVPlayerItemVideoOutput
     private weak var item: AVPlayerItem?
     public var endTime: Double? {

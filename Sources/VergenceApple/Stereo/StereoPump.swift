@@ -95,6 +95,11 @@ public final class StereoPump: @unchecked Sendable {
     /// Called when real-time depth inference briefly holds/releases the media
     /// clock. Set before `start`; invoked on the pump queue.
     public var onProcessingBuffering: (@Sendable (Bool) -> Void)?
+    /// While holding: how much of what the hold waits for is ready, 0…1, in
+    /// steps of a twentieth. Set before `start`; invoked on the pump queue.
+    public var onProcessingProgress: (@Sendable (Double) -> Void)?
+    /// Pump-queue only: the last progress reported.
+    private var reportedProgress: Double?
     public struct Config: Equatable {
         public var brightness: Float = 0
         public var contrast: Float = 1
@@ -206,6 +211,10 @@ public final class StereoPump: @unchecked Sendable {
     /// Pump-queue only: the frame on screen (the last one queued whose time
     /// came), drawn again when a paused picture changes.
     private var shown: ScheduledFrame?
+    /// Pump-queue only: the last tick took a frame from the source, so it
+    /// may have more (see `updateProcessingHold`). Starts true: nothing is
+    /// known about the source before its first tick.
+    private var lastTakeFoundFrames = true
     /// Pump-queue only: the item time of the last frame taken from the source.
     private var lastTakenSeconds: Double?
     /// Pump-queue only: the clock as the last tick read it, to tell a seek.
@@ -585,6 +594,7 @@ public final class StereoPump: @unchecked Sendable {
             reconcile(with: clock, now: now)
         }
         let took = takeFrames(now: now)
+        lastTakeFoundFrames = took
         service(now: now)
         // A paused picture draws nothing new; a capture (debug server) gets
         // the frame on screen drawn again instead.
@@ -795,15 +805,39 @@ public final class StereoPump: @unchecked Sendable {
             !($0.request?.isReady ?? true) && $0.itemSeconds <= playhead + spacing
         } ?? false
         let available = pendingAtPlayhead ? -0.01 : max(0, frontier - playhead)
+        // A source that can't decode while stopped has given everything it
+        // can once a tick takes nothing new; the hold ends when that is ready.
+        let pending = schedule.filter { !($0.request?.isReady ?? true) }.count
+        let exhausted = !clock.decodesAheadWhilePaused && !running && !lastTakeFoundFrames && pending == 0
         let isHolding = processingHold.update(now: now, clockRunning: running,
-            readySeconds: available, resumeSeconds: resume, lowWaterSeconds: low)
+            readySeconds: available, resumeSeconds: resume, lowWaterSeconds: low,
+            sourceExhausted: exhausted)
         if wasHolding != isHolding { onProcessingBuffering?(isHolding) }
+        reportProcessingProgress(isHolding: isHolding, available: available, resume: resume, pending: pending)
         if !wasExhausted, processingHold.recoveryExhausted {
             onPerformance?(.init(shownFramesPerSecond: 0,
                 sourceFramesPerSecond: 1 / spacing, deliveredFraction: 0,
                 playbackRate: analysisRate, sourceHeight: delivery.sourceHeight,
                 recoveryExhausted: true))
         }
+    }
+
+    /// What a hold has ready: the reserve's share of what it waits for, or
+    /// for a source that can't refill while stopped, the share of the frames
+    /// taken whose depth is ready (whichever is further).
+    private func reportProcessingProgress(isHolding: Bool, available: Double, resume: Double, pending: Int) {
+        guard isHolding, let onProcessingProgress else {
+            reportedProgress = nil
+            return
+        }
+        var fraction = resume > 0 ? max(0, available) / resume : 1
+        if clock?.decodesAheadWhilePaused == false, !schedule.isEmpty {
+            fraction = max(fraction, Double(schedule.count - pending) / Double(schedule.count))
+        }
+        let stepped = (min(1, fraction) * 20).rounded(.down) / 20
+        guard stepped != reportedProgress else { return }
+        reportedProgress = stepped
+        onProcessingProgress(stepped)
     }
 
     /// Whether the frame's time has come: the clock's playhead has reached
