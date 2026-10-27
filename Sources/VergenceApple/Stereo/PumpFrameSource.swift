@@ -84,9 +84,9 @@ public protocol LookaheadFrameSource: PumpFrameSource {
     /// Changes after a flush, including a seek to the same position.
     var sequence: Int { get }
     /// Whether frames ahead of the playhead keep coming while the clock is
-    /// stopped, so a paused clock can refill the pump's reserve. False holds
-    /// the clock only until what the source already has is ready
-    /// (`StereoProcessingHoldPolicy`).
+    /// stopped, so a paused clock can refill the pump's reserve. False means
+    /// the pump never holds the clock for depth (see
+    /// `StereoPump.updateProcessingHold`).
     var decodesAheadWhilePaused: Bool { get }
     /// The source's item time at `hostTime`; at a future host time, where the
     /// clock will be if it keeps its current rate.

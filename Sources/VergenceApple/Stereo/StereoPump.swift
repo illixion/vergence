@@ -211,10 +211,6 @@ public final class StereoPump: @unchecked Sendable {
     /// Pump-queue only: the frame on screen (the last one queued whose time
     /// came), drawn again when a paused picture changes.
     private var shown: ScheduledFrame?
-    /// Pump-queue only: the last tick took a frame from the source, so it
-    /// may have more (see `updateProcessingHold`). Starts true: nothing is
-    /// known about the source before its first tick.
-    private var lastTakeFoundFrames = true
     /// Pump-queue only: the item time of the last frame taken from the source.
     private var lastTakenSeconds: Double?
     /// Pump-queue only: the clock as the last tick read it, to tell a seek.
@@ -331,6 +327,8 @@ public final class StereoPump: @unchecked Sendable {
         var shown = 0
         /// Queued after the time they were due (shown as soon as possible).
         var late = 0
+        /// Drawn but never shown: due together with a newer frame.
+        var dropped = 0
         /// The last frame drawn's size.
         var width = 0
         var height = 0
@@ -594,7 +592,6 @@ public final class StereoPump: @unchecked Sendable {
             reconcile(with: clock, now: now)
         }
         let took = takeFrames(now: now)
-        lastTakeFoundFrames = took
         service(now: now)
         // A paused picture draws nothing new; a capture (debug server) gets
         // the frame on screen drawn again instead.
@@ -784,6 +781,14 @@ public final class StereoPump: @unchecked Sendable {
 
     private func updateProcessingHold(now: CFTimeInterval) {
         guard let clock, depthSource?.computesDepthAhead == true else { return }
+        // Holding a source that decodes nothing while paused (an AVPlayer)
+        // gains no reserve, only a stutter: each hold ended either at its
+        // timeout (18 s before AI 3D started) or as soon as the frames it
+        // already had were ready, so it paused and resumed the player over
+        // and over, skipping frames after every resume (device, 2026-10-27).
+        // Such a source plays on; a frame shows when its depth is ready, and
+        // overload is the delivery report's to notice.
+        guard clock.decodesAheadWhilePaused else { return }
         let playhead = clock.itemTime(forHostTime: now).seconds
         guard playhead.isFinite else { return }
         let running = (clock.playbackRate(hostTime: now) ?? 0) > 0.01
@@ -805,15 +810,10 @@ public final class StereoPump: @unchecked Sendable {
             !($0.request?.isReady ?? true) && $0.itemSeconds <= playhead + spacing
         } ?? false
         let available = pendingAtPlayhead ? -0.01 : max(0, frontier - playhead)
-        // A source that can't decode while stopped has given everything it
-        // can once a tick takes nothing new; the hold ends when that is ready.
-        let pending = schedule.filter { !($0.request?.isReady ?? true) }.count
-        let exhausted = !clock.decodesAheadWhilePaused && !running && !lastTakeFoundFrames && pending == 0
         let isHolding = processingHold.update(now: now, clockRunning: running,
-            readySeconds: available, resumeSeconds: resume, lowWaterSeconds: low,
-            sourceExhausted: exhausted)
+            readySeconds: available, resumeSeconds: resume, lowWaterSeconds: low)
         if wasHolding != isHolding { onProcessingBuffering?(isHolding) }
-        reportProcessingProgress(isHolding: isHolding, available: available, resume: resume, pending: pending)
+        reportProcessingProgress(isHolding: isHolding, available: available, resume: resume)
         if !wasExhausted, processingHold.recoveryExhausted {
             onPerformance?(.init(shownFramesPerSecond: 0,
                 sourceFramesPerSecond: 1 / spacing, deliveredFraction: 0,
@@ -822,18 +822,13 @@ public final class StereoPump: @unchecked Sendable {
         }
     }
 
-    /// What a hold has ready: the reserve's share of what it waits for, or
-    /// for a source that can't refill while stopped, the share of the frames
-    /// taken whose depth is ready (whichever is further).
-    private func reportProcessingProgress(isHolding: Bool, available: Double, resume: Double, pending: Int) {
+    /// What a hold has ready: the reserve's share of what it waits for.
+    private func reportProcessingProgress(isHolding: Bool, available: Double, resume: Double) {
         guard isHolding, let onProcessingProgress else {
             reportedProgress = nil
             return
         }
-        var fraction = resume > 0 ? max(0, available) / resume : 1
-        if clock?.decodesAheadWhilePaused == false, !schedule.isEmpty {
-            fraction = max(fraction, Double(schedule.count - pending) / Double(schedule.count))
-        }
+        let fraction = resume > 0 ? max(0, available) / resume : 1
         let stepped = (min(1, fraction) * 20).rounded(.down) / 20
         guard stepped != reportedProgress else { return }
         reportedProgress = stepped
@@ -874,6 +869,7 @@ public final class StereoPump: @unchecked Sendable {
             if isDueNow, index + 1 < schedule.count, schedule[index + 1].eyes != nil,
                isDue(schedule[index + 1], playhead: playhead) {
                 schedule.remove(at: index)
+                stageTiming.dropped += 1
                 continue
             }
             if clock != nil, !running, !isDueNow { break }
@@ -1157,8 +1153,8 @@ public final class StereoPump: @unchecked Sendable {
             lead = StereoLookaheadPolicy.lead(after: lead, shown: timing.shown, late: timing.late)
         }
         let schedule = clock == nil ? "shown as drawn"
-            : String(format: "%.0f ms ahead, %.0f%% late", lead * 1000,
-                     timing.shown > 0 ? Double(timing.late) / Double(timing.shown) * 100 : 0)
+            : String(format: "%.0f ms ahead, %.0f%% late, %d dropped", lead * 1000,
+                     timing.shown > 0 ? Double(timing.late) / Double(timing.shown) * 100 : 0, timing.dropped)
         VergenceLog.pipeline.info(
             "pump \(width)×\(height)\(packed, privacy: .public): \(fps, format: .fixed(precision: 1), privacy: .public) fps over \(window, format: .fixed(precision: 1), privacy: .public) s — \(depth, privacy: .public), warp \(warpMs, format: .fixed(precision: 1), privacy: .public) ms, transfer \(transferMs, format: .fixed(precision: 1), privacy: .public) ms, \(schedule, privacy: .public)"
         )
