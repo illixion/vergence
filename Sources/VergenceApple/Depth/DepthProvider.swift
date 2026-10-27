@@ -449,6 +449,8 @@ struct DepthStabilizeParams {
 
 public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
     private let request: VNCoreMLRequest
+    /// Keeps the shared model alive for as long as this provider runs.
+    private let loadedModel: LoadedDepthModel
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var textureCache: CVMetalTextureCache?
@@ -524,16 +526,13 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
     /// preference-driven initializer cannot express.
     init?(device: MTLDevice, modelURL: URL) {
         guard let compiledURL = Self.compiledModelURL(for: modelURL),
-              let queue = device.makeCommandQueue() else { return nil }
-        let config = MLModelConfiguration()
-        config.computeUnits = .all
-        guard let mlModel = try? MLModel(contentsOf: compiledURL, configuration: config),
-              let vnModel = try? VNCoreMLModel(for: mlModel) else { return nil }
-
-        modelInputSize = mlModel.modelDescription.inputDescriptionsByName.values
-            .compactMap(\.imageConstraint).first
-            .map { (width: $0.pixelsWide, height: $0.pixelsHigh) }
-        let request = VNCoreMLRequest(model: vnModel)
+              let queue = device.makeCommandQueue(),
+              // Shared with the warmer and other providers: already loaded
+              // (and warm) when something expressed intent to use it.
+              let loaded = DepthModelCache.shared.model(for: compiledURL) else { return nil }
+        self.loadedModel = loaded
+        modelInputSize = loaded.inputSize
+        let request = VNCoreMLRequest(model: loaded.vnModel)
         // The model fixes its own (square) input size; Vision letterboxes the
         // frame into it, preserving aspect. `.scaleFill` stretched non-square
         // video, distorting depth — the warp remaps UVs into the content region
@@ -579,6 +578,9 @@ public final class CoreMLDepthProvider: DepthProvider, @unchecked Sendable {
         }
         return DepthModelStore.installedModelURLs().first
     }
+
+    /// The model file `init?` would load for `role` (before compiling).
+    static func modelURL(role: DepthModelRole) -> URL? { findModelURL(role: role) }
 
     /// Whether a depth model is available to load for `role`. Fake-3D needs
     /// one — the engine uses this to decline (fall back to 2D) rather than
