@@ -1049,7 +1049,15 @@ public final class StereoPump: @unchecked Sendable {
         if let capture {
             StereoEyeCapture.deliver(.init(
                 left: leftBGRA, right: rightBGRA, source: src, depth: capture.read(),
-                itemSeconds: itemTime.seconds, depthStrength: cfg.depthStrength, convergence: cfg.convergence
+                itemSeconds: itemTime.seconds, depthStrength: cfg.depthStrength, convergence: cfg.convergence,
+                warp: .init(uvScale: frameDepth?.uvScale ?? SIMD2(1, 1),
+                            uvOffset: frameDepth?.uvOffset ?? .zero,
+                            valueScale: frameDepth?.valueScale ?? 1, valueBias: frameDepth?.valueBias ?? 0,
+                            depthBudget: frameDepth?.budget.knees ?? DepthBudget.legacy.knees,
+                            denseGrid: depthSource?.prefersDenseWarpGrid == true, mirror: cfg.mirror,
+                            tone: SIMD3(cfg.brightness, cfg.contrast, cfg.saturation),
+                            layered: DepthRefinement.layersSilhouettes,
+                            separated: DepthRefinement.separatesBoundaries)
             ))
         }
         signposter.endInterval("pump-warp", warpState)

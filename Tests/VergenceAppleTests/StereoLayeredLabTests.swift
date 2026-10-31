@@ -51,19 +51,24 @@ struct StereoLayeredLabTests {
                 with: Data(contentsOf: capture.appendingPathComponent("depth.json"))) as? [String: Any] ?? [:]
             let strength = try #require((info["strength"] as? NSNumber)?.floatValue)
             let convergence = try #require((info["convergence"] as? NSNumber)?.floatValue)
+            let mirror = info["mirror"] as? Bool ?? false
+            let levels = info["tone"] as? [NSNumber]
+            let tone = levels?.count == 3
+                ? SIMD3(levels![0].floatValue, levels![1].floatValue, levels![2].floatValue) : SIMD3<Float>(0, 1, 1)
+            let frameDense = env["VERGENCE_LAYER_GRID"] == nil ? info["denseGrid"] as? Bool ?? dense : dense
             let folder = captures.count == 1 && input == capture ? output : output.appendingPathComponent(capture.lastPathComponent)
             try manager.createDirectory(at: folder, withIntermediateDirectories: true)
 
-            let layered = try bench.render(picture, strength: strength, convergence: convergence, layers: true,
-                                           dense: dense)
+            let layered = try bench.render(picture, strength: strength, convergence: convergence,
+                                           mirror: mirror, layers: true, dense: frameDense, tone: tone)
             try LayeredFiles.writePNG(bgra: layered.left, width: layered.width, height: layered.height,
                                       to: folder.appendingPathComponent("left.png"))
             try LayeredFiles.writePNG(bgra: layered.right, width: layered.width, height: layered.height,
                                       to: folder.appendingPathComponent("right.png"))
             var meshMilliseconds: Double?
             if writesMesh {
-                let mesh = try bench.render(picture, strength: strength, convergence: convergence, layers: false,
-                                            dense: dense)
+                let mesh = try bench.render(picture, strength: strength, convergence: convergence,
+                                            mirror: mirror, layers: false, dense: frameDense, tone: tone)
                 meshMilliseconds = mesh.gpuMilliseconds
                 try LayeredFiles.writePNG(bgra: mesh.left, width: mesh.width, height: mesh.height,
                                           to: folder.appendingPathComponent("mesh-left.png"))

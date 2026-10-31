@@ -203,7 +203,13 @@ enum LayeredFiles {
     /// A capture directory: `source.png`, `depth.f32` (little-endian float32, top-left origin) and
     /// the `depth.json` that describes how the pump held that depth.
     static func loadCapture(_ directory: URL) throws -> LayeredPicture {
-        let (width, height, bgra) = try loadPicture(directory.appendingPathComponent("source.png"))
+        let (width, height, preview) = try loadPicture(directory.appendingPathComponent("source.png"))
+        let rawSource = directory.appendingPathComponent("source.bgra")
+        let bgra = FileManager.default.fileExists(atPath: rawSource.path)
+            ? [UInt8](try Data(contentsOf: rawSource)) : preview
+        guard bgra.count == width * height * 4 else {
+            throw LayeredBenchError(description: "source.bgra has the wrong byte count")
+        }
         let info = try JSONSerialization.jsonObject(
             with: Data(contentsOf: directory.appendingPathComponent("depth.json"))) as? [String: Any] ?? [:]
         func number(_ key: String) throws -> Float {

@@ -15,6 +15,20 @@ import Metal
 import VergenceCore
 
 public enum StereoEyeCapture {
+    /// Everything needed to replay the retained depth without another inference.
+    public struct WarpMetadata: Codable, Sendable {
+        public let uvScale: SIMD2<Float>
+        public let uvOffset: SIMD2<Float>
+        public let valueScale: Float
+        public let valueBias: Float
+        public let depthBudget: SIMD2<Float>
+        public let denseGrid: Bool
+        public let mirror: Bool
+        public let tone: SIMD3<Float>
+        public let layered: Bool
+        public let separated: Bool
+    }
+
     public struct Frame: @unchecked Sendable {
         public let left: CVPixelBuffer
         public let right: CVPixelBuffer
@@ -25,6 +39,7 @@ public enum StereoEyeCapture {
         public let itemSeconds: Double
         public let depthStrength: Float
         public let convergence: Float
+        public let warp: WarpMetadata
     }
 
     private struct State {
@@ -74,7 +89,7 @@ public enum StereoEyeCapture {
     static func deliver(_ frame: Frame) {
         guard let left = copy(frame.left), let right = copy(frame.right), let source = copy(frame.source) else { return }
         let frame = Frame(left: left, right: right, source: source, depth: frame.depth, itemSeconds: frame.itemSeconds,
-                          depthStrength: frame.depthStrength, convergence: frame.convergence)
+                             depthStrength: frame.depthStrength, convergence: frame.convergence, warp: frame.warp)
         state.withLock {
             $0.latest = frame
             $0.generation += 1
