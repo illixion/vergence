@@ -179,7 +179,7 @@ final class StereoLayeredWarp {
     /// (the strongest disparity is a pixel or two) or a table couldn't be made; the mesh then
     /// draws alone.
     func prepare(source: MTLTexture, depth: PumpFrameDepth, strength: Float, convergence: Float,
-                 commandBuffer: MTLCommandBuffer) -> Bool {
+                 continuesBackground: Bool = false, commandBuffer: MTLCommandBuffer) -> Bool {
         frame = nil
         guard source.width > 0, source.height > 0 else { return false }
         let width = min(source.width, Self.maxWidth)
@@ -200,7 +200,7 @@ final class StereoLayeredWarp {
             sizes: SIMD4(Int32(width), Int32(height), Int32(layers.tableWidth), Int32(layers.tableHeight)),
             radii: SIMD4(Int32(seedRadius), Int32(3 * seedRadius), Int32((tuning.kernelSigmas * sigma).rounded(.up)),
                          Int32(((maxShift + 8) / 4).rounded(.up))),
-            shape: SIMD4(sigma, tuning.support.x, tuning.support.y, 0),
+            shape: SIMD4(sigma, tuning.support.x, tuning.support.y, continuesBackground ? 1 : 0),
             gates: SIMD4(tuning.seedSignificance.x, tuning.seedSignificance.y,
                          tuning.contrast.x, tuning.contrast.y),
             gates2: SIMD4(tuning.spread.x, tuning.spread.y, tuning.separation.x, tuning.separation.y))

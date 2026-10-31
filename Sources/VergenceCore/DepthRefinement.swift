@@ -86,6 +86,9 @@ public enum DepthRefinement {
     /// that outline in one eye and stretch it in the other. The mesh stays the result wherever
     /// the split isn't well founded. Opt in; not yet validated on a headset.
     nonisolated(unsafe) public static var layersSilhouettes = false
+    /// Continue far-layer texture along observed image structures, rather than averaging
+    /// stripes into a soft band. Experimental, requires layered silhouettes; off by default.
+    nonisolated(unsafe) public static var continuesBackgroundTexture = false
 }
 
 /// `y = a·x + b`.

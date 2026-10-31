@@ -531,7 +531,7 @@ struct LayerParams {
     float4 stereo;    // strength, convergence, pixels of disparity per unit depth, max shift (px)
     int4   sizes;     // picture width/height, table width/height
     int4   radii;     // seed radius, window radius, gaussian radius, dilation radius (table px)
-    float4 shape;     // gaussian sigma (table px), support lo/hi
+    float4 shape;     // gaussian sigma (table px), support lo/hi, directional continuation on
     float4 gates;     // seed significance lo/hi (px of disparity), contrast lo/hi
     float4 gates2;    // depth variance lo/hi, separation lo/hi (px of disparity)
 };
@@ -750,6 +750,59 @@ kernel void layerReachV(
 // the far layer with the trust weight, `layerZ` each layer's depth (near, far). Where one side
 // has no seeds in reach the picture is its own layer (opaque, both depths its own), which is
 // what the mesh would draw there.
+// Continue observed background texture along its local isophotes. Only samples consistent
+// with the far layer contribute; weak structure/support keeps the normalized-convolution fill.
+static inline float4 layerDirectionalBackground(texture2d<float> source, texture2d<float> depth,
+    float2 uv, float zf, float zn, constant LayerParams &p) {
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    const float2 pixel = 1.0 / float2(p.sizes.xy);
+    const float tolerance = max(0.025, (zn - zf) * 0.10);
+    float3 tensor = float3(0.0);
+    float mass = 0.0;
+    for (int j = -4; j <= 4; ++j) {
+        for (int i = -4; i <= 4; ++i) {
+            const float2 q = uv + float2(i, j) * 4.0 * pixel;
+            if (any(q < pixel * 2.0) || any(q > 1.0 - pixel * 2.0)) { continue; }
+            float lo = 1e9, hi = -1e9;
+            for (int d = 0; d < 5; ++d) {
+                const float2 offset = d == 0 ? float2(0.0) : d == 1 ? float2(2.0, 0.0)
+                    : d == 2 ? float2(-2.0, 0.0) : d == 3 ? float2(0.0, 2.0) : float2(0.0, -2.0);
+                const float z = layerDepth(depth.sample(s, (q + offset * pixel) * p.depthMap.xy + p.depthMap.zw).r, p);
+                lo = min(lo, z); hi = max(hi, z);
+            }
+            if (hi - lo > tolerance || abs((hi + lo) * 0.5 - zf) > tolerance) { continue; }
+            const float3 gx = source.sample(s, q + float2(2.0 * pixel.x, 0.0)).rgb
+                            - source.sample(s, q - float2(2.0 * pixel.x, 0.0)).rgb;
+            const float3 gy = source.sample(s, q + float2(0.0, 2.0 * pixel.y)).rgb
+                            - source.sample(s, q - float2(0.0, 2.0 * pixel.y)).rgb;
+            const float w = exp(-float(i * i + j * j) / 8.0);
+            tensor += w * float3(dot(gx, gx), dot(gy, gy), dot(gx, gy)); mass += w;
+        }
+    }
+    if (mass < 1e-4 || tensor.x + tensor.y < mass * 1e-5) { return float4(0.0); }
+    const float coherence = length(float2(tensor.x - tensor.y, 2.0 * tensor.z)) / max(tensor.x + tensor.y, 1e-8);
+    if (coherence <= 0.4) { return float4(0.0); }
+    const float angle = 0.5 * atan2(2.0 * tensor.z, tensor.x - tensor.y);
+    const float2 tangent = float2(-sin(angle), cos(angle));
+    // Transport reach scales with composition size; its direction comes only from observed texture.
+    const float transportScale = float(p.sizes.x) / 1920.0;
+    float3 color = float3(0.0); float support = 0.0, total = 0.0;
+    for (int delta = -160; delta <= 160; delta += 4) {
+        if (delta == 0) { continue; }
+        const float w = exp(-float(delta * delta) / 8192.0); total += w;
+        const float2 q = uv + float(delta) * transportScale * tangent * pixel;
+        if (any(q < 2.0 * pixel) || any(q > 1.0 - 2.0 * pixel)) { continue; }
+        const float z = layerDepth(depth.sample(s, q * p.depthMap.xy + p.depthMap.zw).r, p);
+        const float zl = layerDepth(depth.sample(s, (q - float2(2.0 * pixel.x, 0.0)) * p.depthMap.xy + p.depthMap.zw).r, p);
+        const float zr = layerDepth(depth.sample(s, (q + float2(2.0 * pixel.x, 0.0)) * p.depthMap.xy + p.depthMap.zw).r, p);
+        if (max(max(z, zl), zr) - min(min(z, zl), zr) > tolerance || abs(z - zf) > tolerance) { continue; }
+        color += w * source.sample(s, q).rgb; support += w;
+    }
+    if (support < 1e-6) { return float4(0.0); }
+    const float trust = smoothstep(0.003, 0.03, support / total) * smoothstep(0.4, 0.8, coherence);
+    return float4(color / support, trust);
+}
+
 kernel void layerCompose(
     texture2d<float> source [[texture(0)]],
     texture2d<float> depth [[texture(1)]],
@@ -781,7 +834,7 @@ kernel void layerCompose(
     const float4 f = layerTable(farSums, uv);
     if (n.a > 1e-9 && f.a > 1e-9) {
         const float3 fg = n.rgb / n.a;
-        const float3 bg = f.rgb / f.a;
+        float3 bg = f.rgb / f.a;
         const float4 m = layerTable(depthSums, uv);
         const float4 window = layerTable(ranges, uv);
         const float zn = m.x / n.a;
@@ -796,11 +849,24 @@ kernel void layerCompose(
         const float nearClean = 1.0 - smoothstep(0.2, 0.5, (zn - window.x) / separation);
         const float farClean = 1.0 - smoothstep(0.2, 0.5, (window.y - zf) / separation);
 
+        float continuation = 0.0;
+        if (p.shape.w > 0.5 && farClean < 0.999 && layerTable(trust, uv).x > 0.004) {
+            const float4 directional = layerDirectionalBackground(source, depth, uv, zf, zn, p);
+            bg = mix(bg, directional.rgb, directional.a); continuation = directional.a;
+        }
         const float3 line = fg - bg;
         alpha = clamp(dot(c - bg, line) / max(dot(line, line), 1e-6), 0.0, 1.0);
         alpha = mix(mix(alpha, 1.0, nearClean), 0.0, farClean);
         background = mix(bg, c, farClean);
         premultiplied = c - (1.0 - alpha) * background;
+        const float clear = 1.0 - alpha;
+        if (continuation > 0.0 && clear > 1e-5 && all(c >= 0.0) && all(c <= 1.0) && all(fg >= 0.0) && all(fg <= 1.0)
+            && all(background >= 0.0) && all(background <= 1.0)) {
+            const float3 valid = clamp(premultiplied, max(float3(0.0), c - clear), min(float3(alpha), c));
+            background = clamp(background + continuation * (premultiplied - valid) / clear, 0.0, 1.0);
+            premultiplied = c - clear * background;
+        }
+
         zNear = mix(zn, z, nearClean);
         zFar = mix(zf, z, farClean);
         k = layerTable(trust, uv).x;

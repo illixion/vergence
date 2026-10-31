@@ -27,6 +27,8 @@ public enum StereoEyeCapture {
         public let tone: SIMD3<Float>
         public let layered: Bool
         public let separated: Bool
+        /// Nil in captures made before directional continuation was added.
+        public let directional: Bool?
     }
 
     public struct Frame: @unchecked Sendable {

@@ -55,7 +55,8 @@ struct LayeredBench {
         self.queue = queue
         let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().appendingPathComponent("Sources/VergenceApple/Stereo/StereoShaders.metal")
-        let library = try device.makeLibrary(source: String(contentsOf: path, encoding: .utf8), options: nil)
+        let selected = ProcessInfo.processInfo.environment["VERGENCE_LAYER_SHADER"].map { URL(fileURLWithPath: $0) } ?? path
+        let library = try device.makeLibrary(source: String(contentsOf: selected, encoding: .utf8), options: nil)
         guard let resources = StereoWarpResources(device: device, library: library),
               let layered = StereoLayeredWarp(device: device, library: library, pixelFormat: .bgra8Unorm,
                                               sampleCount: resources.msaaSampleCount) else {
@@ -67,7 +68,7 @@ struct LayeredBench {
 
     func render(_ picture: LayeredPicture, strength: Float, convergence: Float = 1, mirror: Bool = false,
                 layers: Bool, dense: Bool = false,
-                tone: SIMD3<Float> = SIMD3(0, 1, 1)) throws -> LayeredEyes {
+                tone: SIMD3<Float> = SIMD3(0, 1, 1), directional: Bool = false) throws -> LayeredEyes {
         func texture(_ format: MTLPixelFormat, _ width: Int, _ height: Int,
                      usage: MTLTextureUsage) throws -> MTLTexture {
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width,
@@ -97,7 +98,7 @@ struct LayeredBench {
             throw LayeredBenchError(description: "no command buffer")
         }
         let split = layers && layered.prepare(source: source, depth: frameDepth, strength: strength,
-                                              convergence: convergence, commandBuffer: command)
+                                              convergence: convergence, continuesBackground: directional, commandBuffer: command)
         for (eye, sign) in [(0, Float(1)), (1, Float(-1))] {
             let uniforms = VideoStereoUniforms(
                 brightness: tone.x, contrast: tone.y, saturation: tone.z, depthStrength: strength,

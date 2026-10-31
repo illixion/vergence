@@ -1018,13 +1018,15 @@ public final class StereoPump: @unchecked Sendable {
             }
         }
 
+        let directionalContinuation = DepthRefinement.continuesBackgroundTexture
         let warpState = signposter.beginInterval("pump-warp")
         if let layout {
             encodePackedEye(.left, layout: layout, into: leftTex, source: srcTexture, config: cfg, commandBuffer: cmdBuf)
             encodePackedEye(cfg.isFlat ? .left : .right, layout: layout, into: rightTex, source: srcTexture,
                             config: cfg, commandBuffer: cmdBuf)
         } else {
-            let layers = prepareLayers(source: srcTexture, depth: frameDepth, config: cfg, commandBuffer: cmdBuf)
+            let layers = prepareLayers(source: srcTexture, depth: frameDepth, config: cfg,
+                                       continuesBackground: directionalContinuation, commandBuffer: cmdBuf)
             encodeEye(into: leftTex, source: srcTexture, depth: frameDepth, eyeSign: 1.0, config: cfg,
                       layers: layers, commandBuffer: cmdBuf)
             encodeEye(into: rightTex, source: srcTexture, depth: frameDepth, eyeSign: -1.0, config: cfg,
@@ -1057,7 +1059,8 @@ public final class StereoPump: @unchecked Sendable {
                             denseGrid: depthSource?.prefersDenseWarpGrid == true, mirror: cfg.mirror,
                             tone: SIMD3(cfg.brightness, cfg.contrast, cfg.saturation),
                             layered: DepthRefinement.layersSilhouettes,
-                            separated: DepthRefinement.separatesBoundaries)
+                            separated: DepthRefinement.separatesBoundaries,
+                            directional: directionalContinuation)
             ))
         }
         signposter.endInterval("pump-warp", warpState)
@@ -1180,11 +1183,13 @@ public final class StereoPump: @unchecked Sendable {
     /// off, the picture is flat or has no depth, or there is nothing wide enough to separate;
     /// the mesh then draws alone, as it always has.
     private func prepareLayers(source: MTLTexture, depth: PumpFrameDepth?, config: Config,
-                               commandBuffer: MTLCommandBuffer) -> StereoLayeredWarp? {
+                               continuesBackground: Bool, commandBuffer: MTLCommandBuffer) -> StereoLayeredWarp? {
         guard DepthRefinement.layersSilhouettes, !DepthRefinement.separatesBoundaries,
               let depth, !config.isFlat, let layeredWarp,
               layeredWarp.prepare(source: source, depth: depth, strength: config.depthStrength,
-                                  convergence: config.convergence, commandBuffer: commandBuffer)
+                                  convergence: config.convergence,
+                                  continuesBackground: continuesBackground,
+                                  commandBuffer: commandBuffer)
         else { return nil }
         return layeredWarp
     }

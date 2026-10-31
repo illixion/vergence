@@ -52,6 +52,8 @@ struct StereoLayeredLabTests {
             let strength = try #require((info["strength"] as? NSNumber)?.floatValue)
             let convergence = try #require((info["convergence"] as? NSNumber)?.floatValue)
             let mirror = info["mirror"] as? Bool ?? false
+            let directional = env["VERGENCE_LAYER_DIRECTIONAL"].map { $0 == "1" }
+                ?? (info["directional"] as? Bool ?? false)
             let levels = info["tone"] as? [NSNumber]
             let tone = levels?.count == 3
                 ? SIMD3(levels![0].floatValue, levels![1].floatValue, levels![2].floatValue) : SIMD3<Float>(0, 1, 1)
@@ -60,7 +62,7 @@ struct StereoLayeredLabTests {
             try manager.createDirectory(at: folder, withIntermediateDirectories: true)
 
             let layered = try bench.render(picture, strength: strength, convergence: convergence,
-                                           mirror: mirror, layers: true, dense: frameDense, tone: tone)
+                                           mirror: mirror, layers: true, dense: frameDense, tone: tone, directional: directional)
             try LayeredFiles.writePNG(bgra: layered.left, width: layered.width, height: layered.height,
                                       to: folder.appendingPathComponent("left.png"))
             try LayeredFiles.writePNG(bgra: layered.right, width: layered.width, height: layered.height,
