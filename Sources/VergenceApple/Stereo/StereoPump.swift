@@ -571,9 +571,10 @@ public final class StereoPump: @unchecked Sendable {
         let took = takeFrames(now: now)
         service(now: now)
         // A paused picture draws nothing new; a capture (debug server) gets
-        // the frame on screen drawn again instead.
+        // the frame on screen drawn again instead. Future reserve frames intentionally
+        // have no eyes until drawLead, so they must not block a paused capture.
         if !took, StereoEyeCapture.isRequested, !pictureUnshowable,
-           !schedule.contains(where: { $0.eyes == nil }) {
+           (clock?.playbackRate(hostTime: now) ?? 0) <= 0.01 {
             if StereoEyeCapture.recomputesDepth { recomputeShownDepth() } else { reshowLastFrame() }
         }
     }
