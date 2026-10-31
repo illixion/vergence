@@ -81,6 +81,11 @@ public enum DepthRefinement {
     nonisolated(unsafe) public static var separatesBoundaries = false
     /// Show only newly uncovered pixels in magenta (prototype renderer).
     nonisolated(unsafe) public static var showsBoundaryHoles = false
+    /// Draw a near subject's outline against a far background from two layers, one for each
+    /// side, over the connected mesh (`StereoLayeredWarp`), instead of letting the mesh fold
+    /// that outline in one eye and stretch it in the other. The mesh stays the result wherever
+    /// the split isn't well founded. Opt in; not yet validated on a headset.
+    nonisolated(unsafe) public static var layersSilhouettes = false
 }
 
 /// `y = a·x + b`.

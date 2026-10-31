@@ -292,6 +292,36 @@ vertical and horizontal rails, smooth slopes, zero disparity, mirror and depth
 UV remapping. These tests do not silently skip because a SwiftPM resource bundle
 is missing. A host app can capture the same movie frames before and after a change to compare them.
 
+## Layered silhouettes (experiment)
+
+`DepthRefinement.layersSilhouettes` opts the visionOS video pump into a local
+near/far decomposition around trustworthy depth discontinuities. It defaults to
+false. Interior seeds extend each side's colour and depth; colour-line coverage
+and a premultiplied residual preserve the soft source outline. Each eye ray-casts
+the layers and blends them over the connected mesh in its existing MSAA pass.
+Support, contrast, depth variance and separation gate the patch; ambiguous
+regions retain the mesh. The disconnected-boundary experiment takes precedence.
+
+Composition is capped at 2048 pixels wide. This is a local two-layer estimate,
+not general scene reconstruction: narrow background strips can take the next
+surface's colour, thin structures fall back to the mesh, and twice the normal
+strength can exceed the trusted band's reach. Only SDR captures at the normal
+strength have been reviewed. Headset appearance, motion, HDR and frame cost
+remain unvalidated; keep this opt-in.
+
+`swift test --filter StereoLayeredWarpTests` checks silhouette width, position,
+both orientations, the composition cap, inert cases and mirror symmetry using
+the real Metal shaders. The macOS replay lab accepts lossless depth captures:
+
+```sh
+VERGENCE_LAYER_LAB=/path/to/captures VERGENCE_LAYER_OUTPUT=/path/to/new-output \
+VERGENCE_LAYER_MESH=1 swift test --filter StereoLayeredLabTests/replayCaptures
+```
+
+Each capture contains `source.png`, `depth.f32` and `depth.json`. The Hypnos
+investigation `docs/investigations/ai-3d-coat-stairstepping-2026-10-29.md` records
+the coat sequence measurements, broader scene checks and remaining limits.
+
 ## AI stereo stills
 
 `StillStereoRenderer` reuses the video's occlusion-tested mesh pass and dense grid,

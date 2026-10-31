@@ -33,9 +33,12 @@ final class StereoMeshWarp {
         colors = [nil, nil]
     }
 
+    /// `overlay` draws more into the same pass, after the mesh, so a second renderer can blend
+    /// over its multisampled result without a round trip through memory.
     func encode(source: MTLTexture, depth: MTLTexture, destination: MTLTexture,
                 uniforms: VideoStereoUniforms, dense: Bool, eye: Int,
-                commandBuffer: MTLCommandBuffer) -> Bool {
+                commandBuffer: MTLCommandBuffer,
+                overlay: ((MTLRenderCommandEncoder) -> Void)? = nil) -> Bool {
         let samples = resources.msaaSampleCount
         func attachment(_ format: MTLPixelFormat, existing: MTLTexture?) -> MTLTexture? {
             if let existing, existing.width == destination.width, existing.height == destination.height,
@@ -86,6 +89,7 @@ final class StereoMeshWarp {
             indexCount: dense ? resources.denseGridIndexCount : resources.gridIndexCount,
             indexType: .uint32,
             indexBuffer: dense ? resources.denseGridIndices : resources.gridIndices, indexBufferOffset: 0)
+        overlay?(enc)
         enc.endEncoding()
         return true
     }

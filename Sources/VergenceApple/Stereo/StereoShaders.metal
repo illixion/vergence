@@ -498,6 +498,418 @@ kernel void boundaryHoleFill(texture2d<float, access::read> surfaces [[texture(0
     output.write(float4(mix(far.rgb, center.rgb, covered), 1), p);
 }
 
+// MARK: - Layered silhouettes (matte renderer over the mesh)
+//
+// The connected mesh folds the picture back on itself where a near subject's outline moves
+// over a far background in one eye, and stretches it over the strip the outline uncovers in
+// the other (docs/investigations/ai-3d-coat-stairstepping-2026-10-29.md). Anti-aliasing can't
+// fix that: there the picture is one surface being asked to be two.
+//
+// So each frame is split in two, once and for both eyes:
+//  - around a depth discontinuity, the near side and the far side each get a flat depth and a
+//    colour taken from their own interior (a normalized convolution of the pixels well clear of
+//    the outline); a pixel's alpha is the projection of its colour onto the line between the
+//    two;
+//  - the near layer is the picture with the background's share taken out (premultiplied, so it
+//    recomposes exactly at zero disparity); the far layer is the background, with the
+//    subject's share replaced by the extension of its own surroundings.
+// Each eye then ray-casts both layers across its own disparity, composites near over far, and
+// blends the result over the mesh with a trust weight that falls to zero wherever the split
+// isn't well founded (thin structures, several depths in one neighbourhood, little colour
+// contrast), so the mesh stays the exact fallback there.
+//
+// The decomposition runs on a table a quarter the size of the layers, which are the picture's
+// size up to `StereoLayeredWarp.maxWidth` (the extension is a low-pass anyway); the layers are
+// composed from it at their own size. The trust is then widened by the farthest a pixel can
+// move, which is how the per-eye pass knows where a trusted outline can matter. The tables are
+// 32-bit float and read with plain loads, so no filtering support is needed from the GPU. What
+// each threshold guards against is in `StereoLayeredWarp.Tuning`.
+
+struct LayerParams {
+    float4 depthMap;  // depth uv scale (xy), offset (zw)
+    float4 mapping;   // depth value scale, bias, budget knees (zw)
+    float4 stereo;    // strength, convergence, pixels of disparity per unit depth, max shift (px)
+    int4   sizes;     // picture width/height, table width/height
+    int4   radii;     // seed radius, window radius, gaussian radius, dilation radius (table px)
+    float4 shape;     // gaussian sigma (table px), support lo/hi
+    float4 gates;     // seed significance lo/hi (px of disparity), contrast lo/hi
+    float4 gates2;    // depth variance lo/hi, separation lo/hi (px of disparity)
+};
+
+static inline float layerDepth(float raw, constant LayerParams &p) {
+    return pseudo3DDepthBudget(raw * p.mapping.x + p.mapping.y, p.mapping.zw);
+}
+
+// Bilinear fetch from a table by normalized coordinate, with plain loads.
+static inline float4 layerTable(texture2d<float, access::read> table, float2 uv) {
+    const int2 hi = int2(table.get_width(), table.get_height()) - 1;
+    const float2 at = uv * float2(hi + 1) - 0.5;
+    const int2 base = int2(floor(at));
+    const float2 f = fract(at);
+    const float4 a = table.read(uint2(clamp(base, 0, hi)));
+    const float4 b = table.read(uint2(clamp(base + int2(1, 0), 0, hi)));
+    const float4 c = table.read(uint2(clamp(base + int2(0, 1), 0, hi)));
+    const float4 d = table.read(uint2(clamp(base + int2(1, 1), 0, hi)));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// How clearly a pixel is on the near (x) or far (y) side of a local depth discontinuity: its
+// whole neighbourhood lies above / below the midrange of the wider window, and that window's
+// depth range is worth separating (a slope is not). `ranges` is (min, max) of the small
+// window then of the wide one.
+static inline float2 layerSeeds(float4 ranges, constant LayerParams &p) {
+    const float mid = 0.5 * (ranges.z + ranges.w);
+    const float significance = smoothstep(p.gates.x, p.gates.y, (ranges.w - ranges.z) * p.stereo.z);
+    return significance * float2(smoothstep(0.0, 0.02, ranges.x - mid),
+                                 smoothstep(0.0, 0.02, mid - ranges.y));
+}
+
+// The picture and its budgeted depth, averaged over each table texel.
+kernel void layerDownsample(
+    texture2d<float> source [[texture(0)]],
+    texture2d<float> depth [[texture(1)]],
+    texture2d<float, access::write> table [[texture(2)]],
+    constant LayerParams &p [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.sizes.z || int(gid.y) >= p.sizes.w) { return; }
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    const float2 center = (float2(gid) + 0.5) / float2(p.sizes.zw);
+    const float2 tap = 1.0 / float2(p.sizes.xy);
+    float3 color = float3(0.0);
+    float z = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            const float2 uv = center + float2(i == 0 ? -1.0 : 1.0, j == 0 ? -1.0 : 1.0) * tap;
+            color += source.sample(s, uv, level(0)).rgb;
+            z += layerDepth(depth.sample(s, uv * p.depthMap.xy + p.depthMap.zw, level(0)).r, p);
+        }
+    }
+    table.write(float4(color * 0.25, z * 0.25), gid);
+}
+
+kernel void layerRangeH(
+    texture2d<float, access::read> table [[texture(0)]],
+    texture2d<float, access::write> ranges [[texture(1)]],
+    constant LayerParams &p [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.sizes.z || int(gid.y) >= p.sizes.w) { return; }
+    float4 r = float4(1e9, -1e9, 1e9, -1e9);
+    for (int d = -p.radii.y; d <= p.radii.y; ++d) {
+        const float z = table.read(uint2(uint(clamp(int(gid.x) + d, 0, p.sizes.z - 1)), gid.y)).a;
+        r.z = min(r.z, z);
+        r.w = max(r.w, z);
+        if (abs(d) <= p.radii.x) {
+            r.x = min(r.x, z);
+            r.y = max(r.y, z);
+        }
+    }
+    ranges.write(r, gid);
+}
+
+kernel void layerRangeV(
+    texture2d<float, access::read> rows [[texture(0)]],
+    texture2d<float, access::write> ranges [[texture(1)]],
+    texture2d<float, access::write> seeds [[texture(2)]],
+    constant LayerParams &p [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.sizes.z || int(gid.y) >= p.sizes.w) { return; }
+    float4 r = float4(1e9, -1e9, 1e9, -1e9);
+    for (int d = -p.radii.y; d <= p.radii.y; ++d) {
+        const float4 v = rows.read(uint2(gid.x, uint(clamp(int(gid.y) + d, 0, p.sizes.w - 1))));
+        r.z = min(r.z, v.z);
+        r.w = max(r.w, v.w);
+        if (abs(d) <= p.radii.x) {
+            r.x = min(r.x, v.x);
+            r.y = max(r.y, v.y);
+        }
+    }
+    ranges.write(r, gid);
+    seeds.write(float4(layerSeeds(r, p), 0.0, 0.0), gid);
+}
+
+// Gaussian-weighted sums over the seeds (a normalized convolution): colour × seed and seed for
+// each side, and depth and depth² × seed for each, for the plateau depths and their spread.
+kernel void layerSeedBlurH(
+    texture2d<float, access::read> table [[texture(0)]],
+    texture2d<float, access::read> seeds [[texture(1)]],
+    texture2d<float, access::write> nearSums [[texture(2)]],
+    texture2d<float, access::write> farSums [[texture(3)]],
+    texture2d<float, access::write> depthSums [[texture(4)]],
+    constant LayerParams &p [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.sizes.z || int(gid.y) >= p.sizes.w) { return; }
+    const float scale = -0.5 / (p.shape.x * p.shape.x);
+    float4 n = float4(0.0), f = float4(0.0), m = float4(0.0);
+    float total = 0.0;
+    for (int d = -p.radii.z; d <= p.radii.z; ++d) {
+        const float w = exp(float(d * d) * scale);
+        total += w;
+        const uint2 at = uint2(uint(clamp(int(gid.x) + d, 0, p.sizes.z - 1)), gid.y);
+        const float4 t = table.read(at);
+        const float2 s = seeds.read(at).xy;
+        n += w * float4(t.rgb * s.x, s.x);
+        f += w * float4(t.rgb * s.y, s.y);
+        m += w * float4(t.a * s.x, t.a * t.a * s.x, t.a * s.y, t.a * t.a * s.y);
+    }
+    nearSums.write(n / total, gid);
+    farSums.write(f / total, gid);
+    depthSums.write(m / total, gid);
+}
+
+kernel void layerSeedBlurV(
+    texture2d<float, access::read> nearRows [[texture(0)]],
+    texture2d<float, access::read> farRows [[texture(1)]],
+    texture2d<float, access::read> depthRows [[texture(2)]],
+    texture2d<float, access::write> nearSums [[texture(3)]],
+    texture2d<float, access::write> farSums [[texture(4)]],
+    texture2d<float, access::write> depthSums [[texture(5)]],
+    constant LayerParams &p [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.sizes.z || int(gid.y) >= p.sizes.w) { return; }
+    const float scale = -0.5 / (p.shape.x * p.shape.x);
+    float4 n = float4(0.0), f = float4(0.0), m = float4(0.0);
+    float total = 0.0;
+    for (int d = -p.radii.z; d <= p.radii.z; ++d) {
+        const float w = exp(float(d * d) * scale);
+        total += w;
+        const uint2 at = uint2(gid.x, uint(clamp(int(gid.y) + d, 0, p.sizes.w - 1)));
+        n += w * nearRows.read(at);
+        f += w * farRows.read(at);
+        m += w * depthRows.read(at);
+    }
+    nearSums.write(n / total, gid);
+    farSums.write(f / total, gid);
+    depthSums.write(m / total, gid);
+}
+
+// How far the split can be trusted at a table texel, 0…1: both sides have seeds in reach, their
+// colours differ enough to tell apart, each side is one depth rather than several, and the two
+// depths are far enough apart to matter. Smooth in each term, so the mesh and the layers
+// cross-fade rather than switch.
+kernel void layerTrust(
+    texture2d<float, access::read> nearSums [[texture(0)]],
+    texture2d<float, access::read> farSums [[texture(1)]],
+    texture2d<float, access::read> depthSums [[texture(2)]],
+    texture2d<float, access::write> trust [[texture(3)]],
+    constant LayerParams &p [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.sizes.z || int(gid.y) >= p.sizes.w) { return; }
+    const float4 n = nearSums.read(gid);
+    const float4 f = farSums.read(gid);
+    const float4 m = depthSums.read(gid);
+    float k = 0.0;
+    if (n.a > 0.0 && f.a > 0.0) {
+        const float zn = m.x / n.a;
+        const float zf = m.z / f.a;
+        const float spread = max(max(m.y / n.a - zn * zn, 0.0), max(m.w / f.a - zf * zf, 0.0));
+        k = smoothstep(p.shape.y, p.shape.z, min(n.a, f.a))
+            * smoothstep(p.gates.z, p.gates.w, length(n.rgb / n.a - f.rgb / f.a))
+            * (1.0 - smoothstep(p.gates2.x, p.gates2.y, spread))
+            * smoothstep(p.gates2.z, p.gates2.w, (zn - zf) * p.stereo.z);
+    }
+    trust.write(float4(k, 0.0, 0.0, 0.0), gid);
+}
+
+// Widens the trust by the farthest a pixel's disparity can reach, so the per-eye pass can skip
+// everything a trusted outline can't touch.
+kernel void layerReachH(
+    texture2d<float, access::read> trust [[texture(0)]],
+    texture2d<float, access::write> reach [[texture(1)]],
+    constant LayerParams &p [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.sizes.z || int(gid.y) >= p.sizes.w) { return; }
+    float k = 0.0;
+    for (int d = -p.radii.w; d <= p.radii.w; ++d) {
+        k = max(k, trust.read(uint2(uint(clamp(int(gid.x) + d, 0, p.sizes.z - 1)), gid.y)).x);
+    }
+    reach.write(float4(k, 0.0, 0.0, 0.0), gid);
+}
+
+kernel void layerReachV(
+    texture2d<float, access::read> rows [[texture(0)]],
+    texture2d<float, access::write> reach [[texture(1)]],
+    constant LayerParams &p [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.sizes.z || int(gid.y) >= p.sizes.w) { return; }
+    float k = 0.0;
+    for (int d = -p.radii.w; d <= p.radii.w; ++d) {
+        k = max(k, rows.read(uint2(gid.x, uint(clamp(int(gid.y) + d, 0, p.sizes.w - 1)))).x);
+    }
+    reach.write(float4(k, 0.0, 0.0, 0.0), gid);
+}
+
+// The layers at picture size. `layerP` is the near layer premultiplied with its alpha, `layerB`
+// the far layer with the trust weight, `layerZ` each layer's depth (near, far). Where one side
+// has no seeds in reach the picture is its own layer (opaque, both depths its own), which is
+// what the mesh would draw there.
+kernel void layerCompose(
+    texture2d<float> source [[texture(0)]],
+    texture2d<float> depth [[texture(1)]],
+    texture2d<float, access::read> nearSums [[texture(2)]],
+    texture2d<float, access::read> farSums [[texture(3)]],
+    texture2d<float, access::read> depthSums [[texture(4)]],
+    texture2d<float, access::read> ranges [[texture(5)]],
+    texture2d<float, access::read> trust [[texture(6)]],
+    texture2d<float, access::write> layerP [[texture(7)]],
+    texture2d<float, access::write> layerB [[texture(8)]],
+    texture2d<float, access::write> layerZ [[texture(9)]],
+    constant LayerParams &p [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.sizes.x || int(gid.y) >= p.sizes.y) { return; }
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    const float2 uv = (float2(gid) + 0.5) / float2(p.sizes.xy);
+    const float3 c = source.sample(s, uv, level(0)).rgb;
+    const float z = layerDepth(depth.sample(s, uv * p.depthMap.xy + p.depthMap.zw, level(0)).r, p);
+
+    float3 premultiplied = c;
+    float3 background = c;
+    float alpha = 1.0;
+    float zNear = z;
+    float zFar = z;
+    float k = 0.0;
+
+    const float4 n = layerTable(nearSums, uv);
+    const float4 f = layerTable(farSums, uv);
+    if (n.a > 1e-9 && f.a > 1e-9) {
+        const float3 fg = n.rgb / n.a;
+        const float3 bg = f.rgb / f.a;
+        const float4 m = layerTable(depthSums, uv);
+        const float4 window = layerTable(ranges, uv);
+        const float zn = m.x / n.a;
+        const float zf = m.z / f.a;
+
+        // A pixel is clean when everything within the small window is at its side's own
+        // depth, which keeps the outline's soft edge and chroma bleed (a few pixels either way
+        // of the depth step) out of it. Clean pixels are their own layer; the rest are the
+        // transition, which takes the extension for the far layer and the colour projection
+        // for its alpha.
+        const float separation = max(zn - zf, 1e-3);
+        const float nearClean = 1.0 - smoothstep(0.2, 0.5, (zn - window.x) / separation);
+        const float farClean = 1.0 - smoothstep(0.2, 0.5, (window.y - zf) / separation);
+
+        const float3 line = fg - bg;
+        alpha = clamp(dot(c - bg, line) / max(dot(line, line), 1e-6), 0.0, 1.0);
+        alpha = mix(mix(alpha, 1.0, nearClean), 0.0, farClean);
+        background = mix(bg, c, farClean);
+        premultiplied = c - (1.0 - alpha) * background;
+        zNear = mix(zn, z, nearClean);
+        zFar = mix(zf, z, farClean);
+        k = layerTable(trust, uv).x;
+    }
+    layerP.write(float4(premultiplied, alpha), gid);
+    layerB.write(float4(background, k), gid);
+    layerZ.write(float4(zNear, zFar, 0.0, 0.0), gid);
+}
+
+// MARK: Per-eye patch
+
+struct LayerPatchUniforms {
+    float4 stereo;  // eye sign (already mirror-adjusted), convergence, pixels per unit depth, mirror
+    int4   sizes;   // picture width/height, scan radius (px)
+    float4 tone;    // brightness, contrast, saturation, extended range
+};
+
+struct LayerPatchOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+// One oversized triangle over the whole eye.
+vertex LayerPatchOut layeredPatchVertex(uint vid [[vertex_id]]) {
+    const float2 corner = float2(float((vid << 1) & 2), float(vid & 2));
+    LayerPatchOut out;
+    out.position = float4(corner * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = float2(corner.x, 1.0 - corner.y);
+    return out;
+}
+
+// Whether the segment from one tap's displaced position to the next covers `target`, and if so
+// where along it and how near; the nearest hit wins. `best` is (depth, column), the depth
+// negative while nothing has hit.
+static inline float2 layerHit(
+    float target, float d0, float z0, float d1, float z1, float first, float2 best
+) {
+    if (target < min(d0, d1) || target > max(d0, d1)) { return best; }
+    const float span = d1 - d0;
+    const float t = abs(span) > 1e-5 ? (target - d0) / span : 0.5;
+    const float z = mix(z0, z1, t);
+    return z > best.x ? float2(z, first + t) : best;
+}
+
+// Draws over the mesh, in the same pass: for each pixel, the source column each layer shows
+// there once displaced (the nearest of the columns that land on it, like the mesh's depth
+// test), the near layer over the far, blended by the trust weight at the columns used.
+// Pixels no trusted outline can reach are discarded and keep the mesh's result.
+fragment float4 layeredPatchFragment(
+    LayerPatchOut in [[stage_in]],
+    texture2d<float, access::read> layerZ [[texture(0)]],
+    texture2d<float> layerP [[texture(1)]],
+    texture2d<float> layerB [[texture(2)]],
+    texture2d<float, access::read> reach [[texture(3)]],
+    constant LayerPatchUniforms &u [[buffer(0)]]
+) {
+    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    const float width = float(u.sizes.x);
+    const float height = float(u.sizes.y);
+    // The eye's pixel in the source's own orientation, which is how the layers are stored.
+    const float x = u.stereo.w > 0.5 ? 1.0 - in.uv.x : in.uv.x;
+
+    const uint2 gate = uint2(min(uint(x * float(reach.get_width())), reach.get_width() - 1),
+                             min(uint(in.uv.y * float(reach.get_height())), reach.get_height() - 1));
+    if (reach.read(gate).x < 0.004) { discard_fragment(); }
+
+    const float target = x * width - 0.5;
+    const int row = clamp(int(in.uv.y * height), 0, u.sizes.y - 1);
+    const int radius = u.sizes.z;
+    const int first = int(round(target)) - radius;
+    float2 frontHit = float2(-1.0, 0.0);
+    float2 backHit = float2(-1.0, 0.0);
+    float2 previousDest = float2(0.0);
+    float2 previousZ = float2(0.0);
+    for (int i = first; i <= first + 2 * radius + 1; ++i) {
+        const int column = clamp(i, 0, u.sizes.x - 1);
+        const float2 z = layerZ.read(uint2(uint(column), uint(row))).xy;
+        const float feather = pseudo3DEdgeFeather((float(column) + 0.5) / width);
+        const float2 dest = float(i) + u.stereo.x * u.stereo.z * (z - u.stereo.y) * feather;
+        if (i > first) {
+            frontHit = layerHit(target, previousDest.x, previousZ.x, dest.x, z.x, float(i - 1), frontHit);
+            backHit = layerHit(target, previousDest.y, previousZ.y, dest.y, z.y, float(i - 1), backHit);
+        }
+        previousDest = dest;
+        previousZ = z;
+    }
+    if (frontHit.x < 0.0) { discard_fragment(); }
+
+    const float2 frontUV = float2((frontHit.y + 0.5) / width, in.uv.y);
+    const float4 front = layerP.sample(s, frontUV);
+    const float frontTrust = layerB.sample(s, frontUV).a;
+    float3 color = front.rgb;
+    float weight = frontTrust;
+    const float clear = 1.0 - front.a;
+    if (clear > 0.004) {
+        if (backHit.x < 0.0) { discard_fragment(); }
+        const float4 back = layerB.sample(s, float2((backHit.y + 0.5) / width, in.uv.y));
+        color += clear * back.rgb;
+        weight = mix(back.a, frontTrust, front.a);
+    }
+
+    color += u.tone.x;
+    color = (color - 0.5) * u.tone.y + 0.5;
+    const float luminance = dot(color, float3(0.2126, 0.7152, 0.0722));
+    color = mix(float3(luminance), color, u.tone.z);
+    color = u.tone.w > 0.5 ? max(color, 0.0) : clamp(color, 0.0, 1.0);
+    return float4(color, weight);
+}
+
 // MARK: - Depth Stabilization (spatial band-limit + motion-adaptive temporal EMA)
 //
 // Two depth artifacts feed the warp:

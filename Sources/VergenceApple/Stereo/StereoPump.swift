@@ -128,6 +128,10 @@ public final class StereoPump: @unchecked Sendable {
     private lazy var boundaryWarp = VergenceMetal.shared.flatMap {
         StereoBoundaryWarp(device: device, library: $0.library)
     }
+    private lazy var layeredWarp = VergenceMetal.shared.flatMap {
+        StereoLayeredWarp(device: device, library: $0.library, pixelFormat: .bgra8Unorm,
+                          sampleCount: warp.msaaSampleCount)
+    }
     private let startHostTime: CFTimeInterval
     private let onVideoSizeKnown: @Sendable (CGSize) -> Void
 
@@ -447,6 +451,7 @@ public final class StereoPump: @unchecked Sendable {
             self.bgraPool = nil
             self.outPool = nil
             self.boundaryWarp = nil
+            self.layeredWarp = nil
             self.meshWarp.reset()
         }
     }
@@ -1018,8 +1023,11 @@ public final class StereoPump: @unchecked Sendable {
             encodePackedEye(cfg.isFlat ? .left : .right, layout: layout, into: rightTex, source: srcTexture,
                             config: cfg, commandBuffer: cmdBuf)
         } else {
-            encodeEye(into: leftTex, source: srcTexture, depth: frameDepth, eyeSign: 1.0, config: cfg, commandBuffer: cmdBuf)
-            encodeEye(into: rightTex, source: srcTexture, depth: frameDepth, eyeSign: -1.0, config: cfg, commandBuffer: cmdBuf)
+            let layers = prepareLayers(source: srcTexture, depth: frameDepth, config: cfg, commandBuffer: cmdBuf)
+            encodeEye(into: leftTex, source: srcTexture, depth: frameDepth, eyeSign: 1.0, config: cfg,
+                      layers: layers, commandBuffer: cmdBuf)
+            encodeEye(into: rightTex, source: srcTexture, depth: frameDepth, eyeSign: -1.0, config: cfg,
+                      layers: layers, commandBuffer: cmdBuf)
         }
         // The depth budget keeps depth inside [0, 1], so no warped pixel shifts further than
         // (1 - convergence) × strength; the margin in front of that keeps the
@@ -1159,12 +1167,26 @@ public final class StereoPump: @unchecked Sendable {
         }
     }
 
+    /// Splits this frame into its silhouette layers for both eyes, or nil when that renderer is
+    /// off, the picture is flat or has no depth, or there is nothing wide enough to separate;
+    /// the mesh then draws alone, as it always has.
+    private func prepareLayers(source: MTLTexture, depth: PumpFrameDepth?, config: Config,
+                               commandBuffer: MTLCommandBuffer) -> StereoLayeredWarp? {
+        guard DepthRefinement.layersSilhouettes, !DepthRefinement.separatesBoundaries,
+              let depth, !config.isFlat, let layeredWarp,
+              layeredWarp.prepare(source: source, depth: depth, strength: config.depthStrength,
+                                  convergence: config.convergence, commandBuffer: commandBuffer)
+        else { return nil }
+        return layeredWarp
+    }
+
     private func encodeEye(
         into dest: MTLTexture,
         source: MTLTexture,
         depth: PumpFrameDepth?,
         eyeSign: Float,
         config: Config,
+        layers: StereoLayeredWarp? = nil,
         commandBuffer: MTLCommandBuffer
     ) {
         var uniforms = VideoStereoUniforms(
@@ -1207,7 +1229,15 @@ public final class StereoPump: @unchecked Sendable {
         if let depth {
             _ = meshWarp.encode(source: source, depth: depth.texture, destination: dest,
                 uniforms: uniforms, dense: depthSource?.prefersDenseWarpGrid == true,
-                eye: eyeIndex, commandBuffer: commandBuffer)
+                eye: eyeIndex, commandBuffer: commandBuffer,
+                overlay: layers.map { layers in
+                    { encoder in
+                        layers.encodePatch(into: encoder, eyeSign: eyeSign, mirror: config.mirror,
+                                           brightness: config.brightness, contrast: config.contrast,
+                                           saturation: config.saturation,
+                                           extendedRange: uniforms.extendedRange > 0.5)
+                    }
+                })
             return
         }
 
