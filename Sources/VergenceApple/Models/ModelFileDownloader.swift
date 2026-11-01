@@ -1,3 +1,6 @@
+// URLSession's delegate download API is Apple's (Linux has it only in FoundationNetworking, and
+// nothing there downloads models).
+#if canImport(Darwin)
 import Foundation
 
 /// Downloads large model assets to disk without holding them in memory.
@@ -68,3 +71,4 @@ public final class ModelFileDownloader: NSObject, URLSessionDownloadDelegate, @u
         session.finishTasksAndInvalidate()
     }
 }
+#endif

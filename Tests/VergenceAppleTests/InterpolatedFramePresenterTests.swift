@@ -1,3 +1,4 @@
+#if canImport(CoreMedia)
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -103,3 +104,4 @@ struct InterpolatedFramePresenterTests {
         #expect(steps.allSatisfy { abs($0 - 1.0 / 24) < 0.001 })
     }
 }
+#endif

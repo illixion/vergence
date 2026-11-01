@@ -27,6 +27,7 @@
  is already in memory.
  */
 
+#if canImport(CoreML)
 import CoreML
 import CoreVideo
 import Foundation
@@ -260,3 +261,4 @@ public final class DepthModelWarmer: @unchecked Sendable {
         pressureHoldUntil = Date().addingTimeInterval(60)
     }
 }
+#endif

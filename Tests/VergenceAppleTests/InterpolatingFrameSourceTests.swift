@@ -1,3 +1,4 @@
+#if canImport(CoreMedia)
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -279,3 +280,4 @@ struct InterpolationGovernorTests {
         #expect(governor.isPaused)
     }
 }
+#endif

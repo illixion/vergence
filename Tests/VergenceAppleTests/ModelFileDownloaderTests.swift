@@ -1,3 +1,4 @@
+#if canImport(Darwin)
 import Foundation
 import Testing
 @testable import VergenceApple
@@ -16,3 +17,4 @@ struct ModelFileDownloaderTests {
         catch { #expect(error is CancellationError) }
     }
 }
+#endif
