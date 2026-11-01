@@ -48,6 +48,14 @@ public struct SharedFields: Sendable {
 /// one call at a time.
 public protocol SharedFieldProvider: AnyObject, Sendable {
     func fields(from start: Double, to end: Double) -> SharedFields?
+    /// The source's frame rate as the fields were made at, when known. A
+    /// player whose own measure is rough (HLS reads ~24 for 23.976) can state
+    /// the display rate from this.
+    var frameRate: Double? { get }
+}
+
+extension SharedFieldProvider {
+    public var frameRate: Double? { nil }
 }
 
 /// Fields from an analysis track held in memory (a `.vgat` file, mapped).
@@ -65,6 +73,7 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
     /// The last disparity decoded: a pair's second frame is the next pair's first.
     private var lastDisparity: (time: AnalysisTime, values: [Float], width: Int, height: Int)?
     public private(set) var misses = 0
+    public let frameRate: Double?
 
     /// - Parameter inflate: raw DEFLATE, as `AnalysisRecord.inflated(using:)` takes it.
     public init(index: AnalysisTrackIndex, timeOffset: Double = 0,
@@ -72,6 +81,26 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
         self.index = index
         self.timeOffset = timeOffset
         self.inflate = inflate
+        self.frameRate = Self.frameRate(of: index)
+    }
+
+    /// The track's first pairs' mean spacing, as a rate: each pair's own
+    /// spacing is rounded to the timescale (3753 or 3754 at 90 kHz for
+    /// 23.976), which the span averages out. Gaps (no pair) don't count.
+    static func frameRate(of index: AnalysisTrackIndex) -> Double? {
+        var total = 0.0, count = 0
+        var previousEnd: AnalysisTime?
+        for entry in index.entries where entry.kind == .flowPair {
+            let spacing = entry.endTime.seconds - entry.time.seconds
+            // Only back-to-back pairs: a cut's missing pair would read as one long spacing.
+            if spacing > 0, previousEnd == nil || previousEnd == entry.time {
+                total += spacing
+                count += 1
+            }
+            previousEnd = entry.endTime
+            if count == 240 { break }
+        }
+        return count > 0 ? Double(count) / total : nil
     }
 
     public func fields(from start: Double, to end: Double) -> SharedFields? {

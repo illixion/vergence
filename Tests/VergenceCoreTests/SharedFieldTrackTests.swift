@@ -50,6 +50,12 @@ struct SharedFieldTrackTests {
         #expect(provider.misses == 3)
     }
 
+    @Test func theTrackSaysItsFrameRate() throws {
+        // 23.976, which a player measuring HLS reads as ~24.
+        let rate = try #require(AnalysisTrackFieldProvider(index: try Self.track(), inflate: AnalysisTrackTests.identity).frameRate)
+        #expect(abs(rate - Self.rate) < 0.001)
+    }
+
     @Test func anOffsetMovesThePlayersTimelineOntoTheTracks() throws {
         // A disc's track at its own times (600 s in); the player counts from 0.
         let index = try Self.track(start: 600)
