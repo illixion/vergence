@@ -79,6 +79,7 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
         defer { lock.unlock() }
         guard let fields = lookUp(start + timeOffset, end + timeOffset) else {
             misses += 1
+            if misses == 1 || misses % 240 == 0 { reportMiss(start + timeOffset, end + timeOffset) }
             return nil
         }
         return fields
@@ -98,6 +99,16 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
         return SharedFields(flow: pair.values(), flowWidth: pair.width, flowHeight: pair.height,
                             disparity0: d0.values, disparity1: d1.values,
                             disparityWidth: d0.width, disparityHeight: d0.height)
+    }
+
+    /// Says how far the nearest pair is, so a player whose clock starts
+    /// somewhere other than the track's shows it in the first miss's line
+    /// (`timeOffset` is then that distance).
+    private func reportMiss(_ start: Double, _ end: Double) {
+        let nearest = index.nearest(.flowPair, to: AnalysisTime(seconds: start), within: 5)
+        let offset = nearest.map { ($0.time.seconds - start) * 1000 }
+        VergenceLog.pipeline.notice(
+            "Smooth Motion track: no fields for \(start, format: .fixed(precision: 3), privacy: .public)-\(end, format: .fixed(precision: 3), privacy: .public) s (miss \(self.misses, privacy: .public)); nearest pair \(offset.map { String(format: "%+.1f ms away", $0) } ?? "over 5 s away", privacy: .public)")
     }
 
     private func disparity(at time: AnalysisTime, within tolerance: Double)
