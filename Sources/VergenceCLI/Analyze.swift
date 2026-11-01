@@ -215,9 +215,11 @@ func forEachAnalysisFrame(_ o: Options, _ body: (AnalysisInputFrame) throws -> B
             func planes(_ views: [PlaneView]) -> [AnalysisPlane] {
                 views.map { AnalysisPlane(base: $0.base, width: $0.width, height: $0.height, stride: $0.stride) }
             }
-            return try body(AnalysisInputFrame(left: planes(frame.left), right: frame.right.map(planes),
-                                               time: AnalysisTime(value: (frame.pts ?? 0) + source.timeOrigin,
-                                                                  timescale: 90_000)))
+            return try autoreleasepool {
+                try body(AnalysisInputFrame(left: planes(frame.left), right: frame.right.map(planes),
+                                            time: AnalysisTime(value: (frame.pts ?? 0) + source.timeOrigin,
+                                                               timescale: 90_000)))
+            }
         }
         log("vergence: \(source.summary())")
         return
@@ -229,7 +231,15 @@ func forEachAnalysisFrame(_ o: Options, _ body: (AnalysisInputFrame) throws -> B
     let lumaBytes = w * 2 * h, chromaBytes = (w / 2) * h
     let frameBytes = lumaBytes + 2 * chromaBytes
     var index: Int64 = 0
-    while true {
+    // A pool per frame: the chunks FileHandle reads, and Core ML's outputs,
+    // are autoreleased, and nothing else drains them. Without it a film ran
+    // out of memory 38,000 frames in (3.1 MB a frame, the frame itself).
+    var more = true
+    while more {
+        more = try autoreleasepool { try nextRawFrame() }
+    }
+
+    func nextRawFrame() throws -> Bool {
         var data = Data()
         while data.count < frameBytes {
             guard let chunk = try input.read(upToCount: frameBytes - data.count), !chunk.isEmpty else { break }
@@ -237,11 +247,11 @@ func forEachAnalysisFrame(_ o: Options, _ body: (AnalysisInputFrame) throws -> B
         }
         guard data.count == frameBytes else {
             if !data.isEmpty { log("vergence: ignored a partial frame at the end (\(data.count) bytes)") }
-            return
+            return false
         }
         let time = AnalysisTime(value: index * Int64(o.rate.denominator), timescale: Int32(o.rate.numerator))
         index += 1
-        let more = try data.withUnsafeBytes { raw -> Bool in
+        return try data.withUnsafeBytes { raw -> Bool in
             let base = raw.bindMemory(to: UInt8.self).baseAddress!
             func eye(_ e: Int) -> [AnalysisPlane] {
                 [AnalysisPlane(base: base + e * w * h, width: w, height: h, stride: w),
@@ -251,6 +261,12 @@ func forEachAnalysisFrame(_ o: Options, _ body: (AnalysisInputFrame) throws -> B
             }
             return try body(AnalysisInputFrame(left: eye(0), right: eye(1), time: time))
         }
-        if !more { return }
     }
 }
+
+#if !canImport(ObjectiveC)
+/// Linux has no autorelease pools: nothing to drain.
+func autoreleasepool<Result>(invoking body: () throws -> Result) rethrows -> Result {
+    try body()
+}
+#endif

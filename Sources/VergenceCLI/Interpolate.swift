@@ -48,13 +48,14 @@ func interpolate(_ o: Options) throws {
     var k: Int64 = 0, made = 0, missed = 0
     var gpuMs: [Double] = []
     let zeros = Data(count: frameBytes)
-    while k < Int64(min(o.frames, Int(Int32.max))) {
+    // A pool per frame, as in analyze: FileHandle's chunks are autoreleased.
+    while k < Int64(min(o.frames, Int(Int32.max))), try autoreleasepool(invoking: { () throws -> Bool in
         var data = Data()
         while data.count < frameBytes {
             guard let chunk = try input.read(upToCount: frameBytes - data.count), !chunk.isEmpty else { break }
             data.append(chunk)
         }
-        guard data.count == frameBytes else { break }
+        guard data.count == frameBytes else { return false }
         let time = Double(k) * Double(o.rate.denominator) / Double(o.rate.numerator)
         k += 1
         let buffer = try bgraBuffer(data, width: w, height: h)
@@ -71,7 +72,8 @@ func interpolate(_ o: Options) throws {
             }
         }
         previous = (buffer, time)
-    }
+        return true
+    }) {}
     let median = gpuMs.isEmpty ? .nan : gpuMs.sorted()[gpuMs.count / 2]
     log(String(format: "vergence: %d in-between frames, %d pairs without fields; %.1f ms median a frame (lookup, upload, pass)",
                made, missed, median))
