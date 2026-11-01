@@ -252,6 +252,18 @@ GPU, side by side), faster than the film plays. `VERGENCE_COMPUTE_UNITS=ane|gpu|
 where Core ML runs them. A disc's track is timed on the playlist's own clock (the first clip's
 in-time plus each frame's PTS), the clock players show.
 
+A side-by-side file is stacked first, at the size its eyes are stored (a half-SBS 1080p film's
+eyes are 960×1080; the player scales fields to whatever its eyes are). If ffmpeg fails every
+filter with "File exists" (-17) on such a file, its H.264 frame-packing SEI is the cause (seen
+with ffmpeg 8.1.2): copy the video without SEI first.
+
+```sh
+ffmpeg -i film.mkv -map 0:v:0 -bsf:v filter_units=remove_types=6 -c:v copy -f matroska - \
+  | ffmpeg -i - -filter_complex "[0:v:0]split[a][b];[a]crop=iw/2:ih:0:0[l];[b]crop=iw/2:ih:iw/2:0[r];[l][r]vstack[out]" \
+      -map "[out]" -f rawvideo -pix_fmt yuv420p - \
+  | .build/release/vergence analyze --raw 960x1080 - --models MODELS -o film.vgat
+```
+
 The player's half is `SharedFieldInterpolator` (VergenceApple): one Metal pass that makes both
 in-between eyes of a packed pair from a pair's records, plugged into `InterpolatingFrameSource`
 with a `SharedFieldProvider` (`AnalysisTrackFieldProvider` reads a track file). `vergence
