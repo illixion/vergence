@@ -212,7 +212,7 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
             : skipReason(before: before, beforeSignature: beforeSignature, real: real, signature: signature) {
             stats.skipped[reason, default: 0] += 1
             stats.passed += 1
-            return real
+            return reason.leavesOutMidFrame ? real.standingIn : real
         }
         inFlight = true
         let requestGeneration = generation
@@ -234,7 +234,7 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
                         self.recentMs.append(totalMs)
                         if self.recentMs.count > Self.timingWindow { self.recentMs.removeFirst() }
                     } else {
-                        self.ready = [real]
+                        self.ready = [real.standingIn]
                         self.stats.failed += 1
                     }
                 }
@@ -250,12 +250,20 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
         return spacing
     }
 
-    enum SkipReason: String { case notReady = "not ready", fast = "fast source", gap, cut, speed, size, backedOff = "backed off" }
+    enum SkipReason: String {
+        case learning = "learning rate", notReady = "not ready", fast = "fast source", gap, cut, speed, size,
+             backedOff = "backed off"
+
+        /// A pair that would have had an in-between frame. A source whose
+        /// rate isn't known yet, or a fast one, has none to leave out, and a
+        /// gap is frames lost before here.
+        var leavesOutMidFrame: Bool { self != .learning && self != .fast && self != .gap }
+    }
 
     private func skipReason(before: PumpFrame, beforeSignature: [Float]?, real: PumpFrame,
                             signature: [Float]?) -> SkipReason? {
         guard let spacing = eligibleSpacing else {
-            return realSpacing.seconds.isFinite ? .fast : .notReady
+            return realSpacing.seconds.isFinite ? .fast : .learning
         }
         let gap = real.itemTime.seconds - before.itemTime.seconds
         guard gap > 0, gap < 1.5 * spacing else { return .gap }
@@ -646,4 +654,11 @@ private func fourCC(_ value: OSType) -> String {
     return String(bytes: bytes, encoding: .ascii) ?? "\(value)"
 }
 #endif
+private extension PumpFrame {
+    var standingIn: PumpFrame {
+        var frame = self
+        frame.standsInForMidFrame = true
+        return frame
+    }
+}
 #endif

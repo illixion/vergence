@@ -14,10 +14,17 @@ public struct PumpFrame: @unchecked Sendable {
     /// source matches its baked depth against, and what a realtime source uses
     /// to decide whether a held map may be reused. Not the renderer timeline.
     public let itemTime: CMTime
+    /// A real frame from a doubling source (`InterpolatingFrameSource`) that
+    /// came without the in-between frame before it, by design: a cut, a pair
+    /// the interpolator backed off from or had no fields for. The pump
+    /// counts it as both frames when it reports how many it showed, so
+    /// passing frames through doesn't read as the pump falling behind.
+    public var standsInForMidFrame = false
 
-    public init(pixelBuffer: CVPixelBuffer, itemTime: CMTime) {
+    public init(pixelBuffer: CVPixelBuffer, itemTime: CMTime, standsInForMidFrame: Bool = false) {
         self.pixelBuffer = pixelBuffer
         self.itemTime = itemTime
+        self.standsInForMidFrame = standsInForMidFrame
     }
 }
 

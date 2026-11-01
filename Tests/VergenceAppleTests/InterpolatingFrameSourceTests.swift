@@ -66,6 +66,7 @@ struct InterpolatingFrameSourceTests {
     struct Taken {
         let seconds: Double
         let luma: UInt8
+        var standsIn = false
     }
 
     /// Plays `from`..<`to` seconds of item time, one 60 Hz tick at a time,
@@ -86,7 +87,8 @@ struct InterpolatingFrameSourceTests {
                 let seconds = frame.itemTime.seconds
                 if let last { spacing.note(gap: seconds - last) }
                 last = seconds
-                taken.append(Taken(seconds: seconds, luma: firstByte(frame.pixelBuffer)))
+                taken.append(Taken(seconds: seconds, luma: firstByte(frame.pixelBuffer),
+                                   standsIn: frame.standsInForMidFrame))
             }
             Thread.sleep(forTimeInterval: 0.002)
             playhead += 1.0 / 60
@@ -130,6 +132,10 @@ struct InterpolatingFrameSourceTests {
         #expect(before.map { abs($0.seconds - 29.0 / 24) < 1e-6 } == true)
         #expect(at.map { abs($0.seconds - cut) < 1e-6 && $0.luma == 200 } == true)
         #expect(!taken.contains { $0.luma != 60 && $0.luma != 200 })
+        // The frame after the cut came without its in-between frame, by
+        // design, and says so; the doubled frames around it don't.
+        #expect(at?.standsIn == true)
+        #expect(taken.filter { $0.seconds > 0.5 && $0.standsIn }.count == 1)
     }
 
     @Test("a 60 fps source passes through untouched")
@@ -141,6 +147,7 @@ struct InterpolatingFrameSourceTests {
         #expect(interpolator.made == 0)
         let steps = zip(taken, taken.dropFirst()).map { $1.seconds - $0.seconds }
         #expect(steps.allSatisfy { abs($0 - 1.0 / 60) < 0.001 })
+        #expect(!taken.contains { $0.standsIn })
     }
 
     @Test("after a seek no frame from before it comes out")

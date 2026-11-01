@@ -54,6 +54,18 @@ struct SourceFrameSpacing {
     }
 }
 
+extension SourceFrameSpacing {
+    /// How many frames a shown frame counts for in a delivery report: one,
+    /// or two for a frame that stands in for the in-between frame left out
+    /// before it (`PumpFrame.standsInForMidFrame`) when its gap is two of
+    /// the doubled `spacing`. Never more than the gap holds, so a source
+    /// whose spacing was learned before it doubled isn't counted twice.
+    static func framesShown(gap: Double, spacing: Double, standsInForMidFrame: Bool) -> Int {
+        guard standsInForMidFrame, spacing.isFinite, spacing > 0 else { return 1 }
+        return min(2, max(1, Int((gap / spacing).rounded())))
+    }
+}
+
 /// Which frames a pump shows at a faster speed, so that it shows no more
 /// frames a second than the video has at normal speed, evenly spaced: a
 /// frame is shown once the video has moved on by what normal speed plays

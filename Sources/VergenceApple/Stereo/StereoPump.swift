@@ -863,7 +863,8 @@ public final class StereoPump: @unchecked Sendable {
                 stageTiming.shown += 1
                 if let dueAt, dueAt < now - 0.002 { stageTiming.late += 1 }
                 noteDelivered(itemSeconds: entry.itemSeconds,
-                              height: CVPixelBufferGetHeight(entry.frame.pixelBuffer), at: now)
+                              height: CVPixelBufferGetHeight(entry.frame.pixelBuffer),
+                              standsInForMidFrame: entry.frame.standsInForMidFrame, at: now)
             }
             index += 1
         }
@@ -908,7 +909,8 @@ public final class StereoPump: @unchecked Sendable {
     /// the frame's own presentation time: the time the tick asked for would
     /// make the gaps the ticks' spacing instead (a 24 fps film read as 59 or
     /// 120 fps, so every report said it was overloaded).
-    private func noteDelivered(itemSeconds: Double, height: Int, at now: CFTimeInterval) {
+    private func noteDelivered(itemSeconds: Double, height: Int, standsInForMidFrame: Bool = false,
+                               at now: CFTimeInterval) {
         guard itemSeconds.isFinite else { return }
         delivery.sourceHeight = height
         if let last = delivery.lastItemSeconds {
@@ -916,7 +918,8 @@ public final class StereoPump: @unchecked Sendable {
             // A seek, a loop or a pause/resume isn't a run of dropped frames.
             if SourceFrameSpacing.range.contains(gap) {
                 delivery.itemSpan += gap
-                delivery.frames += 1
+                delivery.frames += SourceFrameSpacing.framesShown(gap: gap, spacing: delivery.sourceSpacing.seconds,
+                                                                  standsInForMidFrame: standsInForMidFrame)
             }
         }
         delivery.lastItemSeconds = itemSeconds

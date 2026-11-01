@@ -334,4 +334,15 @@ struct StereoPacingTests {
         let thirty = Self.runPipeline(fps: 30, seconds: 10, inference: 0.028, draw: 0.007)
         #expect(thirty.late == 0 && thirty.held == 0, "\(thirty)")
     }
+
+    @Test func aFramePassedThroughAtACutCountsForTheFrameLeftOut() {
+        let doubled = 1.0 / 48
+        #expect(SourceFrameSpacing.framesShown(gap: 2 * doubled, spacing: doubled, standsInForMidFrame: true) == 2)
+        #expect(SourceFrameSpacing.framesShown(gap: 2 * doubled, spacing: doubled, standsInForMidFrame: false) == 1)
+        // Spacing still the source's own (it never doubled): one frame.
+        #expect(SourceFrameSpacing.framesShown(gap: 1.0 / 24, spacing: 1.0 / 24, standsInForMidFrame: true) == 1)
+        // A real drop before it as well still counts as missing.
+        #expect(SourceFrameSpacing.framesShown(gap: 4 * doubled, spacing: doubled, standsInForMidFrame: true) == 2)
+        #expect(SourceFrameSpacing.framesShown(gap: doubled, spacing: .infinity, standsInForMidFrame: true) == 1)
+    }
 }
