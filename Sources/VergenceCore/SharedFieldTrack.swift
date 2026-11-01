@@ -7,7 +7,8 @@
  frame. To make the in-between pair, the player needs three of them: the
  pair's flow and mask, and the disparity at each end. `SharedFields` is those
  three decoded; a `SharedFieldProvider` finds them by the player's frame times,
- from a file now and from a paired Mac's live channel later.
+ from a file, a server's chunks (`StreamingAnalysisTrack`), or a paired
+ Mac's live channel later.
 
  Foundation only: a Quest or a server reads tracks the same way.
  */
@@ -58,7 +59,35 @@ extension SharedFieldProvider {
     public var frameRate: Double? { nil }
 }
 
-/// Fields from an analysis track held in memory (a `.vgat` file, mapped).
+/// Where a provider finds its records: a whole track in memory
+/// (`AnalysisTrackIndex`), or the chunks of one fetched as it plays
+/// (`StreamingAnalysisTrack`).
+public protocol AnalysisRecordLookup: Sendable {
+    /// The record of `kind` and `eye` nearest `time`, within `tolerance`
+    /// seconds, and the index holding it.
+    func nearestRecord(_ kind: AnalysisKind, eye: AnalysisEye, to time: AnalysisTime,
+                       within tolerance: Double) -> (index: AnalysisTrackIndex, entry: AnalysisTrackIndex.Entry)?
+    /// The player is about to ask for `seconds` (on the track's timeline).
+    func noteDemand(at seconds: Double)
+    /// Whether the records around `seconds` are at hand, so a miss there
+    /// means the track has none (not that they haven't arrived).
+    func holdsRecords(at seconds: Double) -> Bool
+}
+
+extension AnalysisRecordLookup {
+    public func noteDemand(at seconds: Double) {}
+    public func holdsRecords(at seconds: Double) -> Bool { true }
+}
+
+extension AnalysisTrackIndex: AnalysisRecordLookup {
+    public func nearestRecord(_ kind: AnalysisKind, eye: AnalysisEye, to time: AnalysisTime,
+                              within tolerance: Double) -> (index: AnalysisTrackIndex, entry: Entry)? {
+        nearest(kind, eye: eye, to: time, within: tolerance).map { (self, $0) }
+    }
+}
+
+/// Fields from an analysis track: a `.vgat` file, mapped, or one streamed in
+/// chunks (`StreamingAnalysisTrack`).
 ///
 /// Frames are matched to records by time, within a quarter of the pair's
 /// spacing, so a track made at the source's own times (90 kHz for a disc)
@@ -66,7 +95,7 @@ extension SharedFieldProvider {
 /// to the player's times first, for a player whose timeline starts somewhere
 /// other than the source's.
 public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked Sendable {
-    public let index: AnalysisTrackIndex
+    public let lookup: any AnalysisRecordLookup
     public let timeOffset: Double
     private let inflate: (Data, Int) throws -> Data
     private let lock = NSLock()
@@ -76,12 +105,18 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
     public let frameRate: Double?
 
     /// - Parameter inflate: raw DEFLATE, as `AnalysisRecord.inflated(using:)` takes it.
-    public init(index: AnalysisTrackIndex, timeOffset: Double = 0,
+    public convenience init(index: AnalysisTrackIndex, timeOffset: Double = 0,
+                            inflate: @escaping (Data, Int) throws -> Data) {
+        self.init(lookup: index, frameRate: Self.frameRate(of: index), timeOffset: timeOffset, inflate: inflate)
+    }
+
+    /// - Parameter frameRate: the rate the track was made at, when its producer says so.
+    public init(lookup: any AnalysisRecordLookup, frameRate: Double?, timeOffset: Double = 0,
                 inflate: @escaping (Data, Int) throws -> Data) {
-        self.index = index
+        self.lookup = lookup
         self.timeOffset = timeOffset
         self.inflate = inflate
-        self.frameRate = Self.frameRate(of: index)
+        self.frameRate = frameRate
     }
 
     /// The track's first pairs' mean spacing, as a rate: each pair's own
@@ -106,9 +141,12 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
     public func fields(from start: Double, to end: Double) -> SharedFields? {
         lock.lock()
         defer { lock.unlock() }
+        lookup.noteDemand(at: start + timeOffset)
         guard let fields = lookUp(start + timeOffset, end + timeOffset) else {
             misses += 1
-            if misses == 1 || misses % 240 == 0 { reportMiss(start + timeOffset, end + timeOffset) }
+            if (misses == 1 || misses % 240 == 0), lookup.holdsRecords(at: start + timeOffset) {
+                reportMiss(start + timeOffset, end + timeOffset)
+            }
             return nil
         }
         return fields
@@ -118,7 +156,7 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
         guard end > start else { return nil }
         let tolerance = (end - start) / 4
         let t0 = AnalysisTime(seconds: start), t1 = AnalysisTime(seconds: end)
-        guard let pairEntry = index.nearest(.flowPair, to: t0, within: tolerance),
+        guard let (index, pairEntry) = lookup.nearestRecord(.flowPair, eye: .mono, to: t0, within: tolerance),
               abs(pairEntry.endTime.seconds - end) <= tolerance,
               let pair = try? index.record(pairEntry).inflated(using: inflate),
               pair.channels == 5,
@@ -134,15 +172,15 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
     /// somewhere other than the track's shows it in the first miss's line
     /// (`timeOffset` is then that distance).
     private func reportMiss(_ start: Double, _ end: Double) {
-        let nearest = index.nearest(.flowPair, to: AnalysisTime(seconds: start), within: 5)
-        let offset = nearest.map { ($0.time.seconds - start) * 1000 }
+        let nearest = lookup.nearestRecord(.flowPair, eye: .mono, to: AnalysisTime(seconds: start), within: 5)
+        let offset = nearest.map { ($0.entry.time.seconds - start) * 1000 }
         VergenceLog.pipeline.notice(
             "Smooth Motion track: no fields for \(start, format: .fixed(precision: 3), privacy: .public)-\(end, format: .fixed(precision: 3), privacy: .public) s (miss \(self.misses, privacy: .public)); nearest pair \(offset.map { String(format: "%+.1f ms away", $0) } ?? "over 5 s away", privacy: .public)")
     }
 
     private func disparity(at time: AnalysisTime, within tolerance: Double)
         -> (values: [Float], width: Int, height: Int)? {
-        guard let entry = index.nearest(.disparity, eye: .right, to: time, within: tolerance) else { return nil }
+        guard let (index, entry) = lookup.nearestRecord(.disparity, eye: .right, to: time, within: tolerance) else { return nil }
         if let last = lastDisparity, last.time == entry.time { return (last.values, last.width, last.height) }
         guard let record = try? index.record(entry).inflated(using: inflate), record.channels == 1 else { return nil }
         let values = record.values()
