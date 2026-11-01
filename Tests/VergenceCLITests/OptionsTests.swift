@@ -198,4 +198,9 @@ import VergenceDisc
         #expect(throws: UsageError.self) { _ = try parse(["analyze", "--raw", "1921x1080"]) }
         #expect(throws: UsageError.self) { _ = try parse(["analyze", "--rate", "0/1"]) }
     }
+
+    @Test func interpolateTakesATrack() throws {
+        let o = try parse(["interpolate", "--raw", "1920x1080", "in.bgra", "--fields", "t.vgat", "-o", "mid.bgra"])
+        #expect(o.fields == "t.vgat" && o.output == "mid.bgra" && o.positional == ["in.bgra"])
+    }
 }

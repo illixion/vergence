@@ -18,6 +18,7 @@
    vergence audio DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames SECONDS] --output FILE.wav
    vergence analyze DISC|BASE.m2ts [DEPENDENT.m2ts] --models DIR [--seek S] [--frames N] [--output FILE.vgat]
    vergence analyze --raw WxH [--rate N/D] FILE|- --models DIR --output FILE.vgat
+   vergence interpolate --raw WxH [--rate N/D] FILE|- --fields FILE.vgat --output FILE.bgra
 
    options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N
             --output FILE|-
@@ -97,6 +98,9 @@
  eye's motion between each pair of frames and each frame's disparity, small
  fields the headset turns into in-between frames for both eyes (see
  Analyze.swift). --raw reads packed top/bottom I420 frames (one eye's size).
+ interpolate is the player's half, for checking it on a Mac: packed top/bottom
+ BGRA frames in, the in-between frame of each pair out, made from the track
+ by the same Metal pass the headset runs (see Interpolate.swift).
 
  inspect says what a file is and, for spatial video, what a player would
  miss; for a frame-packed file, which layout it looks like.
@@ -136,6 +140,7 @@ func usage(_ problem: String? = nil) -> Never {
            vergence cat DISC PATH [--start BYTE] [--frames BYTES]
            vergence analyze DISC|BASE.m2ts [DEPENDENT.m2ts] --models DIR [--seek S] [--frames N] [--output FILE.vgat]
            vergence analyze --raw WxH [--rate N/D] FILE|- --models DIR --output FILE.vgat
+           vergence interpolate --raw WxH [--rate N/D] FILE|- --fields FILE.vgat --output FILE.bgra
     options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
              --header "Name: value" (for an http(s) DISC)
              a value follows its option or an "=": --adjust -0.02, --adjust=-0.02
@@ -180,6 +185,10 @@ struct FrameSource {
     /// Decodes, calling the closure per frame until it returns false.
     var run: (_ output: (StereoFrame) throws -> Bool) throws -> Void
     var summary: () -> String
+    /// Added to each frame's PTS for the playlist's own clock: a disc's PTS
+    /// counts from its first clip's in-time, which players show as time zero
+    /// plus that in-time (Convolution's `MVCPictureSource`). 0 for clips.
+    var timeOrigin: Int64 = 0
 }
 
 func frameSource(_ o: Options) throws -> FrameSource {
@@ -190,7 +199,7 @@ func frameSource(_ o: Options) throws -> FrameSource {
         if let seek = o.seek { try decoder.seek(to: seek) }
         return FrameSource(run: { try decoder.decode(output: $0) }, summary: {
             "\(decoder.unpairedBaseCount) unpaired AUs, \(decoder.resyncCount) damaged spots skipped, \(decoder.corruptNALCount) corrupt NALs, \(decoder.unsupportedNALCount) unsupported NALs"
-        })
+        }, timeOrigin: playlist.items.first?.inPTS ?? 0)
     }
     guard (1 ... 2).contains(o.positional.count), o.seek == nil else { usage() }
     let reader = StereoStreamReader(
@@ -447,6 +456,7 @@ do {
     case "inspect": try await inspect(options)
     case "sbs", "quest": try await sideBySide(options)
     case "analyze": try await analyze(options)
+    case "interpolate": try interpolate(options)
     default: usage("unknown command \(options.command)")
     }
 } catch let error as LocalizedError where error.errorDescription != nil {

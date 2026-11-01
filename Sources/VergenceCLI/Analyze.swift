@@ -20,8 +20,10 @@
 
    ffmpeg -i clip.mkv -f rawvideo -pix_fmt yuv420p - | vergence analyze --raw 1920x1080 - --models M -o clip.vgat
 
- Times are the source's (90 kHz for a disc, frame index / --rate for raw), so
- a player matches records to frames by presentation time.
+ Times are the source's (90 kHz for a disc, on the playlist's own clock:
+ the first clip's in-time plus the PTS, as Convolution's film player counts;
+ frame index / --rate for raw), so a player matches records to frames by
+ presentation time.
  */
 
 #if canImport(CoreML)
@@ -214,7 +216,8 @@ func forEachAnalysisFrame(_ o: Options, _ body: (AnalysisInputFrame) throws -> B
                 views.map { AnalysisPlane(base: $0.base, width: $0.width, height: $0.height, stride: $0.stride) }
             }
             return try body(AnalysisInputFrame(left: planes(frame.left), right: frame.right.map(planes),
-                                               time: AnalysisTime(value: frame.pts ?? 0, timescale: 90_000)))
+                                               time: AnalysisTime(value: (frame.pts ?? 0) + source.timeOrigin,
+                                                                  timescale: 90_000)))
         }
         log("vergence: \(source.summary())")
         return

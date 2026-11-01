@@ -53,6 +53,8 @@ public struct Options: Equatable, Sendable {
     public var rate = FrameRate(numerator: 24000, denominator: 1001)
     /// `analyze --models DIR`: the Core ML flow and disparity models.
     public var models: String?
+    /// `interpolate --fields FILE.vgat`: the analysis track to make in-between frames from.
+    public var fields: String?
 
     public init() {}
 }
@@ -193,6 +195,7 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
             }
             o.rate = FrameRate(numerator: parts[0], denominator: parts.count == 2 ? parts[1] : 1)
         case "--models": o.models = try value()
+        case "--fields": o.fields = try value()
         default: throw UsageError("unknown option \(name)")
         }
     }

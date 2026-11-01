@@ -249,7 +249,19 @@ ffmpeg -i clip.mkv -f rawvideo -pix_fmt yuv420p - \
 (default 24000/1001), which is what `decode` writes and what ffmpeg makes of any stereo file.
 On an M2 Max it runs at about 35 frames a second (RIFE on the Neural Engine and NeuFlow on the
 GPU, side by side), faster than the film plays. `VERGENCE_COMPUTE_UNITS=ane|gpu|cpu|all` overrides
-where Core ML runs them.
+where Core ML runs them. A disc's track is timed on the playlist's own clock (the first clip's
+in-time plus each frame's PTS), the clock players show.
+
+The player's half is `SharedFieldInterpolator` (VergenceApple): one Metal pass that makes both
+in-between eyes of a packed pair from a pair's records, plugged into `InterpolatingFrameSource`
+with a `SharedFieldProvider` (`AnalysisTrackFieldProvider` reads a track file). `vergence
+interpolate` runs that same pass on a Mac, packed top/bottom BGRA in and in-between frames out,
+for checking it against the PyTorch reference; about 2 ms a 1080p pair on an M2 Max.
+
+```sh
+ffmpeg -i clip.mkv -f rawvideo -pix_fmt bgra - \
+  | .build/release/vergence interpolate --raw 1920x1080 - --fields clip.vgat -o clip-mid.bgra
+```
 
 ## Library
 

@@ -432,6 +432,14 @@ public struct AnalysisTrackIndex: Sendable {
     /// In file order.
     public let entries: [Entry]
     private let data: Data
+    /// Per kind and eye, indices into `entries` sorted by time, so a lookup is
+    /// a binary search (a two-hour film holds about 340,000 records).
+    private let byKey: [Key: [Int]]
+
+    private struct Key: Hashable {
+        let kind: AnalysisKind
+        let eye: AnalysisEye
+    }
 
     public init(_ data: Data) throws {
         var rest = data
@@ -454,14 +462,53 @@ public struct AnalysisTrackIndex: Sendable {
         self.header = header
         self.entries = entries
         self.data = data
+        var byKey: [Key: [Int]] = [:]
+        for (i, entry) in entries.enumerated() { byKey[Key(kind: entry.kind, eye: entry.eye), default: []].append(i) }
+        // Stable: of two records at one time, the later in the file stays later.
+        self.byKey = byKey.mapValues { indices in
+            indices.enumerated().sorted { a, b in
+                let ta = entries[a.element].time, tb = entries[b.element].time
+                return ta == tb ? a.offset < b.offset : ta < tb
+            }.map(\.element)
+        }
+    }
+
+    /// Of `kind` and `eye`, how many records start at or before `time`.
+    private func countAtOrBefore(_ indices: [Int], _ time: AnalysisTime) -> Int {
+        var low = 0, high = indices.count
+        while low < high {
+            let mid = (low + high) / 2
+            if time < entries[indices[mid]].time { high = mid } else { low = mid + 1 }
+        }
+        return low
     }
 
     /// The record of `kind` and `eye` whose span holds `time` (for pair kinds)
     /// or whose time is nearest at or before it (otherwise).
     public func entry(_ kind: AnalysisKind, eye: AnalysisEye = .mono, at time: AnalysisTime) -> Entry? {
-        let candidates = entries.filter { $0.kind == kind && $0.eye == eye }
-        if let pair = candidates.last(where: { $0.time <= time && time < $0.endTime }) { return pair }
-        return candidates.last { $0.time <= time }
+        guard let indices = byKey[Key(kind: kind, eye: eye)] else { return nil }
+        let count = countAtOrBefore(indices, time)
+        guard count > 0 else { return nil }
+        let latest = entries[indices[count - 1]]
+        // A pair record is found by its span; spans don't overlap, so the latest start is the one.
+        return latest
+    }
+
+    /// The record of `kind` and `eye` whose time is nearest `time`, if it is
+    /// within `tolerance` seconds of it.
+    public func nearest(_ kind: AnalysisKind, eye: AnalysisEye = .mono, to time: AnalysisTime,
+                        within tolerance: Double) -> Entry? {
+        guard let indices = byKey[Key(kind: kind, eye: eye)] else { return nil }
+        let count = countAtOrBefore(indices, time)
+        var best: Entry?
+        for i in [count - 1, count] where indices.indices.contains(i) {
+            let entry = entries[indices[i]]
+            let distance = abs(entry.time.seconds - time.seconds)
+            if distance <= tolerance, best.map({ distance < abs($0.time.seconds - time.seconds) }) ?? true {
+                best = entry
+            }
+        }
+        return best
     }
 
     public func record(_ entry: Entry) throws -> AnalysisRecord {

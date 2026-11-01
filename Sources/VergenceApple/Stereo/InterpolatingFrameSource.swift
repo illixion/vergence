@@ -18,6 +18,20 @@ public protocol MidFrameInterpolator: AnyObject, Sendable {
     /// `processMs` is the interpolation itself, without the format conversions.
     func midFrame(between previous: CVPixelBuffer, and current: CVPixelBuffer,
                   completion: @escaping @Sendable (_ frame: CVPixelBuffer?, _ processMs: Double) -> Void)
+    /// The same, for an interpolator that needs to know which frames these
+    /// are (one reading fields computed ahead, by presentation time in
+    /// seconds). Defaults to the untimed call.
+    func midFrame(between previous: CVPixelBuffer, at previousTime: Double, and current: CVPixelBuffer,
+                  at currentTime: Double,
+                  completion: @escaping @Sendable (_ frame: CVPixelBuffer?, _ processMs: Double) -> Void)
+}
+
+extension MidFrameInterpolator {
+    public func midFrame(between previous: CVPixelBuffer, at previousTime: Double, and current: CVPixelBuffer,
+                         at currentTime: Double,
+                         completion: @escaping @Sendable (_ frame: CVPixelBuffer?, _ processMs: Double) -> Void) {
+        midFrame(between: previous, and: current, completion: completion)
+    }
 }
 
 /// Doubles a low-frame-rate source (24, 25, 30 fps) for the stereo pump by
@@ -205,8 +219,10 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
         let midSeconds = (before.itemTime.seconds + seconds) / 2
         let midTime = CMTime(seconds: midSeconds, preferredTimescale: 600_000)
         let submitted = CACurrentMediaTime()
+        let beforeSeconds = before.itemTime.seconds
         work.async { [weak self, interpolator] in
-            interpolator.midFrame(between: before.pixelBuffer, and: real.pixelBuffer) { [weak self] mid, processMs in
+            interpolator.midFrame(between: before.pixelBuffer, at: beforeSeconds, and: real.pixelBuffer,
+                                  at: seconds) { [weak self] mid, processMs in
                 guard let self else { return }
                 let totalMs = (CACurrentMediaTime() - submitted) * 1000
                 self.lock.withLock {
