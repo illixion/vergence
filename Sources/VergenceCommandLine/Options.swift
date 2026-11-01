@@ -47,8 +47,32 @@ public struct Options: Equatable, Sendable {
     public var firstSegment = 0
     public var lastSegment: Int?
     public var info = false
+    /// `analyze --raw WxH`: packed top/bottom I420 frames, each eye W×H.
+    public var raw: EyeSize?
+    /// `analyze --rate N/D`: frames per second of raw input.
+    public var rate = FrameRate(numerator: 24000, denominator: 1001)
+    /// `analyze --models DIR`: the Core ML flow and disparity models.
+    public var models: String?
 
     public init() {}
+}
+
+public struct EyeSize: Equatable, Sendable {
+    public var width: Int
+    public var height: Int
+    public init(width: Int, height: Int) {
+        self.width = width
+        self.height = height
+    }
+}
+
+public struct FrameRate: Equatable, Sendable {
+    public var numerator: Int
+    public var denominator: Int
+    public init(numerator: Int, denominator: Int) {
+        self.numerator = numerator
+        self.denominator = denominator
+    }
 }
 
 /// A command line that can't run: what's wrong with it, if there is more to
@@ -155,6 +179,20 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
         case "--first": o.firstSegment = try integer(value())
         case "--last": o.lastSegment = try integer(value())
         case "--info": try flag(); o.info = true
+        case "--raw":
+            let parts = try value().lowercased().split(separator: "x").compactMap { Int($0) }
+            guard parts.count == 2, parts.allSatisfy({ $0 > 0 && $0 % 2 == 0 }) else {
+                throw UsageError("--raw takes the size of one eye, e.g. 1920x1080")
+            }
+            o.raw = EyeSize(width: parts[0], height: parts[1])
+        case "--rate":
+            let text = try value()
+            let parts = text.split(separator: "/").compactMap { Int($0) }
+            guard (1 ... 2).contains(parts.count), parts.allSatisfy({ $0 > 0 }) else {
+                throw UsageError("--rate takes frames per second as N or N/D, not \"\(text)\"")
+            }
+            o.rate = FrameRate(numerator: parts[0], denominator: parts.count == 2 ? parts[1] : 1)
+        case "--models": o.models = try value()
         default: throw UsageError("unknown option \(name)")
         }
     }

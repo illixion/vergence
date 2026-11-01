@@ -16,6 +16,8 @@
    vergence streams DISC [--playlist NNNNN]
    vergence subtitles DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames N] [--output DIR]
    vergence audio DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames SECONDS] --output FILE.wav
+   vergence analyze DISC|BASE.m2ts [DEPENDENT.m2ts] --models DIR [--seek S] [--frames N] [--output FILE.vgat]
+   vergence analyze --raw WxH [--rate N/D] FILE|- --models DIR --output FILE.vgat
 
    options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N
             --output FILE|-
@@ -91,6 +93,11 @@
  headsets take; needs ffmpeg) or as a float WAV. --bitrate in kbps
  (ambisonics default to 64 per channel).
 
+ analyze writes Smooth Motion's analysis track for a stereo video: the left
+ eye's motion between each pair of frames and each frame's disparity, small
+ fields the headset turns into in-between frames for both eyes (see
+ Analyze.swift). --raw reads packed top/bottom I420 frames (one eye's size).
+
  inspect says what a file is and, for spatial video, what a player would
  miss; for a frame-packed file, which layout it looks like.
 
@@ -127,6 +134,8 @@ func usage(_ problem: String? = nil) -> Never {
            vergence audio DISC --pid PID [--playlist NNNNN] [--seek SECONDS] [--frames SECONDS] --output FILE.wav
            vergence audio VIDEO [--track N] [--bitrate KBPS] --output FILE.opus|.ogg|.mka|.webm|.mp4|.wav
            vergence cat DISC PATH [--start BYTE] [--frames BYTES]
+           vergence analyze DISC|BASE.m2ts [DEPENDENT.m2ts] --models DIR [--seek S] [--frames N] [--output FILE.vgat]
+           vergence analyze --raw WxH [--rate N/D] FILE|- --models DIR --output FILE.vgat
     options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
              --header "Name: value" (for an http(s) DISC)
              a value follows its option or an "=": --adjust -0.02, --adjust=-0.02
@@ -437,6 +446,7 @@ do {
     case "make": try await make(options)
     case "inspect": try await inspect(options)
     case "sbs", "quest": try await sideBySide(options)
+    case "analyze": try await analyze(options)
     default: usage("unknown command \(options.command)")
     }
 } catch let error as LocalizedError where error.errorDescription != nil {

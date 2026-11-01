@@ -119,6 +119,41 @@ struct AnalysisTrackTests {
         #expect(throws: AnalysisTrackError.truncated) { _ = try AnalysisTrackIndex(data.prefix(data.count - 3)) }
     }
 
+    /// A stand-in for DEFLATE: the delta coding and framing are what this file owns.
+    static func identity(_ data: Data) -> Data { data }
+    static func identity(_ data: Data, _ size: Int) -> Data { data }
+
+    @Test(arguments: [AnalysisEncoding.float16, .int16, .uint8])
+    func deltaCodedRecordsSurviveATrack(_ encoding: AnalysisEncoding) throws {
+        let values = Self.flow(width: 24, height: 10, channels: 2).map { encoding == .uint8 ? abs($0) / 50 : $0 }
+        let plain = AnalysisRecord.encoding(values, kind: .flowPair, as: encoding, channels: 2, width: 24, height: 10,
+                                            time: AnalysisTime(seconds: 3))
+        let packed = plain.deflated(using: Self.identity)
+        #expect(packed.isDeflated && packed.payload != plain.payload)
+        var parser = AnalysisTrackParser()
+        let read = try parser.append(try AnalysisTrack.header(Self.header) + AnalysisTrack.record(packed))
+        #expect(read == [packed])
+        #expect(try read[0].inflated(using: Self.identity) == plain)
+        let index = try AnalysisTrackIndex(try AnalysisTrack.header(Self.header) + AnalysisTrack.record(packed))
+        #expect(try index.record(index.entries[0]) == packed)
+    }
+
+    @Test func aWrongInflatedSizeIsAnError() {
+        let record = AnalysisRecord.encoding([1, 2, 3, 4], kind: .depth, as: .int16, channels: 1, width: 2, height: 2,
+                                             time: AnalysisTime(seconds: 0)).deflated(using: Self.identity)
+        #expect(throws: AnalysisTrackError.payloadSize) {
+            _ = try record.inflated { data, _ in data.prefix(2) }
+        }
+    }
+
+    @Test func aModelsNaNIsStoredAsZero() {
+        let record = AnalysisRecord.encoding([.nan, 2, -.infinity, .infinity], kind: .depth, as: .int16, channels: 1,
+                                             width: 2, height: 2, time: AnalysisTime(seconds: 0))
+        let back = record.values()
+        #expect(back[0] == 0 && abs(back[1] - 2) < 1e-3 && back[2] < 0 && back[3] > 0)
+        #expect(record.scale > 0 && record.scale.isFinite)
+    }
+
     @Test func timesCompareAcrossTimescales() {
         #expect(AnalysisTime(value: 1001, timescale: 24000) < AnalysisTime(value: 3754, timescale: 90000))
         #expect(!(AnalysisTime(value: 1, timescale: 2) < AnalysisTime(value: 45000, timescale: 90000)))

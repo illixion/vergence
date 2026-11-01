@@ -22,6 +22,15 @@
  offset`, where raw is a half float (`float16`, scale 1 offset 0), a signed
  16-bit integer or an unsigned byte. Samples are planar: channel by channel,
  rows top to bottom.
+
+ The encoding byte's top bit (0x80) marks a deflated payload: each row's raw
+ samples are stored as differences from the sample before them in the row
+ (wrapping, in the raw integer type; the first against 0), then the whole
+ payload is compressed with raw DEFLATE (RFC 1951, no zlib header). Flow
+ fields are smooth, so this takes a 120×72 five-channel flow pair from 86 KB
+ to about 20 KB at a half-pixel step. DEFLATE itself comes from the platform
+ (`deflated(using:)` and `inflated(using:)` take it), so this file stays
+ Foundation only.
  */
 
 import Foundation
@@ -32,11 +41,17 @@ public enum AnalysisKind: UInt8, Sendable, Codable, CaseIterable {
     /// is frame 0's, `endTime` frame 1's. An optional fifth channel is frame
     /// 0's blend weight at the midpoint (RIFE's mask), 0…1. A producer running
     /// a timestep network (RIFE) once at t = ½ stores F0→1 ≈ 2·F½→1 and
-    /// F1→0 ≈ 2·F½→0, so every consumer does the same flow reversal.
+    /// F1→0 ≈ 2·F½→0, so every consumer does the same flow reversal. The
+    /// mask channel says that is what happened: halving the two flows then
+    /// gives the network's own F½→1 and F½→0, which a consumer should use as
+    /// they are at t = ½ (they carry its occlusion handling; the reversal
+    /// assumes straight-line motion).
     case flowPair = 1
-    /// Disparity between the eyes of one real pair: channel 0 is the left
-    /// eye's horizontal offset to the right eye in pixels (channel 1, if
-    /// present, the vertical one).
+    /// Disparity between the eyes of one real pair, laid out on the record's
+    /// `eye`: channel 0 is the horizontal offset from that eye's pixel to the
+    /// matching pixel in the other eye, in pixels of the record's width
+    /// (channel 1, if present, the vertical one). `.left` is left→right,
+    /// `.right` right→left (what Smooth Motion's shared field reads).
     case disparity = 2
     /// Relative inverse depth, near = high, 0…1.
     case depth = 3
@@ -98,10 +113,13 @@ public struct AnalysisRecord: Sendable, Equatable {
     public var scale: Float
     public var offset: Float
     public var payload: Data
+    /// The payload is row-delta coded and DEFLATE-compressed (see the file
+    /// header); `values()` needs `inflated(using:)` first.
+    public var isDeflated: Bool
 
     public init(kind: AnalysisKind, eye: AnalysisEye = .mono, encoding: AnalysisEncoding, channels: Int,
                 width: Int, height: Int, time: AnalysisTime, endTime: AnalysisTime? = nil,
-                scale: Float = 1, offset: Float = 0, payload: Data) {
+                scale: Float = 1, offset: Float = 0, payload: Data, isDeflated: Bool = false) {
         self.kind = kind
         self.eye = eye
         self.encoding = encoding
@@ -113,9 +131,76 @@ public struct AnalysisRecord: Sendable, Equatable {
         self.scale = scale
         self.offset = offset
         self.payload = payload
+        self.isDeflated = isDeflated
     }
 
     public var sampleCount: Int { channels * width * height }
+    public var rawByteCount: Int { sampleCount * encoding.bytesPerSample }
+
+    /// The record with its payload delta coded and compressed by `deflate`
+    /// (raw DEFLATE). Already deflated: unchanged.
+    public func deflated(using deflate: (Data) throws -> Data) rethrows -> AnalysisRecord {
+        guard !isDeflated else { return self }
+        var copy = self
+        copy.payload = try deflate(rowDeltas(payload, encode: true))
+        copy.isDeflated = true
+        return copy
+    }
+
+    /// The record with a plain payload, `inflate` undoing raw DEFLATE given
+    /// the size it must come to. Throws `payloadSize` if it doesn't.
+    public func inflated(using inflate: (Data, Int) throws -> Data) throws -> AnalysisRecord {
+        guard isDeflated else { return self }
+        let plain = try inflate(payload, rawByteCount)
+        guard plain.count == rawByteCount else { throw AnalysisTrackError.payloadSize }
+        var copy = self
+        copy.payload = rowDeltas(plain, encode: false)
+        copy.isDeflated = false
+        return copy
+    }
+
+    /// Row-wise differences (encode) or their running sums (decode), wrapping
+    /// in the raw integer type. Half floats are differenced as bit patterns.
+    private func rowDeltas(_ data: Data, encode: Bool) -> Data {
+        var out = data
+        let rows = channels * height
+        out.withUnsafeMutableBytes { raw in
+            if encoding.bytesPerSample == 2 {
+                let samples = raw.bindMemory(to: UInt16.self)
+                for row in 0 ..< rows {
+                    var previous: UInt16 = 0
+                    for x in 0 ..< width {
+                        let i = row * width + x
+                        let value = UInt16(littleEndian: samples[i])
+                        if encode {
+                            samples[i] = (value &- previous).littleEndian
+                            previous = value
+                        } else {
+                            previous = value &+ previous
+                            samples[i] = previous.littleEndian
+                        }
+                    }
+                }
+            } else {
+                let samples = raw.bindMemory(to: UInt8.self)
+                for row in 0 ..< rows {
+                    var previous: UInt8 = 0
+                    for x in 0 ..< width {
+                        let i = row * width + x
+                        let value = samples[i]
+                        if encode {
+                            samples[i] = value &- previous
+                            previous = value
+                        } else {
+                            previous = value &+ previous
+                            samples[i] = previous
+                        }
+                    }
+                }
+            }
+        }
+        return out
+    }
 
     /// Encodes planar float samples. `int16` picks a scale from the largest
     /// magnitude (`maxMagnitude`, or the data's own) so the full range is used;
@@ -132,17 +217,18 @@ public struct AnalysisRecord: Sendable, Equatable {
         case .float16:
             for value in values { payload.appendLittleEndian(HalfFloat.bits(from: value)) }
         case .int16:
-            let limit = maxMagnitude ?? max(values.map(abs).max() ?? 0, 1e-6)
+            let limit = maxMagnitude ?? max(values.lazy.filter(\.isFinite).map(abs).max() ?? 0, 1e-6)
             scale = limit / Float(Int16.max)
             for value in values {
-                let raw = (value / scale).rounded().clamped(to: Float(-Int16.max) ... Float(Int16.max))
+                // A model's NaN (an fp16 overflow) must not take the producer down: store 0.
+                let raw = value.isNaN ? 0 : (value / scale).rounded().clamped(to: Float(-Int16.max) ... Float(Int16.max))
                 payload.appendLittleEndian(UInt16(bitPattern: Int16(raw)))
             }
         case .uint8:
             offset = range.lowerBound
             scale = max(range.upperBound - range.lowerBound, 1e-12) / 255
             for value in values {
-                payload.append(UInt8(((value - offset) / scale).rounded().clamped(to: 0 ... 255)))
+                payload.append(value.isNaN ? 0 : UInt8(((value - offset) / scale).rounded().clamped(to: 0 ... 255)))
             }
         }
         return AnalysisRecord(kind: kind, eye: eye, encoding: encoding, channels: channels, width: width,
@@ -150,8 +236,9 @@ public struct AnalysisRecord: Sendable, Equatable {
                               payload: payload)
     }
 
-    /// The samples as floats, planar.
+    /// The samples as floats, planar. A deflated record must be inflated first.
     public func values() -> [Float] {
+        precondition(!isDeflated, "inflate the record first")
         var out = [Float]()
         out.reserveCapacity(sampleCount)
         payload.withUnsafeBytes { raw in
@@ -177,7 +264,7 @@ public struct AnalysisRecord: Sendable, Equatable {
         var body = Data(capacity: Self.headerBytes + payload.count)
         body.append(kind.rawValue)
         body.append(eye.rawValue)
-        body.append(encoding.rawValue)
+        body.append(encoding.rawValue | (isDeflated ? 0x80 : 0))
         body.append(UInt8(channels))
         body.appendLittleEndian(UInt16(width))
         body.appendLittleEndian(UInt16(height))
@@ -201,7 +288,8 @@ public struct AnalysisRecord: Sendable, Equatable {
         let length = declaredLength ?? body.count
         return try body.withUnsafeBytes { raw in
             guard let kind = AnalysisKind(rawValue: raw[0]), let eye = AnalysisEye(rawValue: raw[1]),
-                  let encoding = AnalysisEncoding(rawValue: raw[2]) else { throw AnalysisTrackError.unknownValue }
+                  let encoding = AnalysisEncoding(rawValue: raw[2] & 0x7F) else { throw AnalysisTrackError.unknownValue }
+            let isDeflated = raw[2] & 0x80 != 0
             let channels = Int(raw[3])
             let width = Int(raw.loadLittleEndian(UInt16.self, at: 4))
             let height = Int(raw.loadLittleEndian(UInt16.self, at: 6))
@@ -212,12 +300,14 @@ public struct AnalysisRecord: Sendable, Equatable {
             let offset = Float(bitPattern: raw.loadLittleEndian(UInt32.self, at: 32))
             guard timescale > 0 else { throw AnalysisTrackError.unknownValue }
             let expected = channels * width * height * encoding.bytesPerSample
-            guard length - headerBytes == expected else { throw AnalysisTrackError.payloadSize }
+            guard isDeflated ? length > headerBytes : length - headerBytes == expected else {
+                throw AnalysisTrackError.payloadSize
+            }
             let payload = declaredLength == nil ? Data(body[(body.startIndex + headerBytes)...]) : Data()
             return AnalysisRecord(kind: kind, eye: eye, encoding: encoding, channels: channels, width: width,
                                   height: height, time: AnalysisTime(value: value, timescale: timescale),
                                   endTime: AnalysisTime(value: end, timescale: timescale), scale: scale,
-                                  offset: offset, payload: payload)
+                                  offset: offset, payload: payload, isDeflated: isDeflated)
         }
     }
 }
@@ -382,8 +472,8 @@ public struct AnalysisTrackIndex: Sendable {
 // MARK: - Half floats and little-endian helpers
 
 /// IEEE 754 binary16 by hand: `Float16` doesn't exist on Intel Macs.
-enum HalfFloat {
-    static func bits(from value: Float) -> UInt16 {
+public enum HalfFloat {
+    public static func bits(from value: Float) -> UInt16 {
         let f = value.bitPattern
         let sign = UInt16((f >> 16) & 0x8000)
         let exponent = Int((f >> 23) & 0xFF) - 127 + 15
@@ -403,7 +493,7 @@ enum HalfFloat {
         return half
     }
 
-    static func value(from bits: UInt16) -> Float {
+    public static func value(from bits: UInt16) -> Float {
         let sign = UInt32(bits & 0x8000) << 16
         let exponent = Int((bits >> 10) & 0x1F)
         let mantissa = UInt32(bits & 0x3FF)

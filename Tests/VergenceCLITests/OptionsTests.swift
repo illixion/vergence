@@ -188,4 +188,14 @@ import VergenceDisc
         #expect(OutputNames.segmentDirectory(info).standardizedFileURL.path
             == URL(fileURLWithPath: FileManager.default.currentDirectoryPath).standardizedFileURL.path)
     }
+
+    @Test func analyzeTakesARawEyeSizeAndRate() throws {
+        let o = try parse(["analyze", "--raw", "1920x1080", "-", "--rate", "25", "--models", "/m", "-o", "a.vgat"])
+        #expect(o.raw == EyeSize(width: 1920, height: 1080) && o.rate == FrameRate(numerator: 25, denominator: 1))
+        #expect(o.models == "/m" && o.positional == ["-"])
+        #expect(try parse(["analyze", "x"]).rate == FrameRate(numerator: 24000, denominator: 1001))
+        #expect(throws: UsageError.self) { _ = try parse(["analyze", "--raw", "1920"]) }
+        #expect(throws: UsageError.self) { _ = try parse(["analyze", "--raw", "1921x1080"]) }
+        #expect(throws: UsageError.self) { _ = try parse(["analyze", "--rate", "0/1"]) }
+    }
 }

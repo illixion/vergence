@@ -19,9 +19,9 @@ It contains no AACS or BD+ code.
 
 | Module | What | Builds on |
 | --- | --- | --- |
-| `VergenceCore` | Stereo layouts (`PackedStereoLayout`) and telling them from a file name or picture (`StereoLayoutDetector`), spatial-video camera metadata and presets (`SpatialCameraMetadata`, `SpatialPreset`), bitrates (`SpatialBitrate`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
+| `VergenceCore` | Stereo layouts (`PackedStereoLayout`) and telling them from a file name or picture (`StereoLayoutDetector`), spatial-video camera metadata and presets (`SpatialCameraMetadata`, `SpatialPreset`), bitrates (`SpatialBitrate`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Analysis tracks (`AnalysisTrack`: flow, disparity and depth fields keyed by media time, made on one machine for another) and the producer's half of stereo Smooth Motion (`SharedFieldAnalysis`). Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
 | `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
-| `VergenceApple` | The Apple-framework half: spatial video making and inspection (`SpatialVideoMaker`, `SpatialVideoInspector`), realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox. Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
+| `VergenceApple` | The Apple-framework half: spatial video making and inspection (`SpatialVideoMaker`, `SpatialVideoInspector`), realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox, Smooth Motion (frame interpolation, and `StereoFlowAnalyzer`: the flow and disparity models with Core ML). Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
 | `vergence` | The command line tool. | macOS, Linux (disc commands only, without PNG or audio output) |
 | `VergenceCommandLine` | The tool's option parsing and output names, apart from the executable so its tests can import them (not a product). Foundation only. | Apple platforms, Linux (tested) |
 
@@ -226,6 +226,30 @@ or E-AC-3 track, or the AC-3 core of a TrueHD track, through Apple's decoder to 
 does. Against ffmpeg's decode of the same core it lines up within 32 samples, and
 the channels correlate at 0.996 or better. ffmpeg comes out about 2 dB quieter
 because it applies the stream's dynamic range compression.
+
+### Smooth Motion analysis tracks
+
+`vergence analyze` computes what a headset needs to make in-between frames for both eyes of a
+3D film without running a network itself: for every pair of real frames the left eye's motion
+(RIFE 4.25 lite at 480×288), and for every frame the right eye's disparity to the left
+(NeuFlow v2 at 512×288), stored at a quarter of that size, row-delta coded and deflated, about
+25 KB a frame. The design and its measurements are in Convolution's
+`docs/plans/blu-ray-3d-smooth-motion.md`, and the models are converted by its
+`scripts/convert-interp-model.py` (RIFE `--size 480x288 --scales 8 4 2 1 1`; NeuFlow
+`--size 512x288 --iters 4 --one-way --precision fp32`, since the fp16 conversion overflows to
+NaN on a Mac GPU and runs 100 ms on its Neural Engine).
+
+```sh
+.build/release/vergence analyze /Volumes/DISC --models MODELS --output film.vgat
+ffmpeg -i clip.mkv -f rawvideo -pix_fmt yuv420p - \
+  | .build/release/vergence analyze --raw 1920x1080 - --models MODELS -o clip.vgat
+```
+
+`--raw WxH` reads packed top/bottom I420 (left on top, one eye's size given) at `--rate`
+(default 24000/1001), which is what `decode` writes and what ffmpeg makes of any stereo file.
+On an M2 Max it runs at about 35 frames a second (RIFE on the Neural Engine and NeuFlow on the
+GPU, side by side), faster than the film plays. `VERGENCE_COMPUTE_UNITS=ane|gpu|cpu|all` overrides
+where Core ML runs them.
 
 ## Library
 
