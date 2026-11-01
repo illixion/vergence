@@ -216,13 +216,16 @@ public final class StereoPump: @unchecked Sendable {
 
     private let signposter = VergenceLog.signposter
 
-    /// Tick rate: 60fps in both modes — the warp is only a few ms, so the pump
-    /// follows the source up to 60 (and no faster: a 120 fps video shows every
-    /// other frame). Cached mode looks depth up by PTS; realtime mode infers
-    /// at ~30Hz and holds the map for the in-between frame (see
-    /// RealtimeDepthSource); a frame whose map isn't ready waits for it, so a
-    /// slow model shows fewer frames, never older depth.
-    private let frameInterval: Double
+    /// Tick rate: 60fps in both modes at normal speed — the warp is only a
+    /// few ms, so the pump follows the source up to 60 (and no faster: a
+    /// 120 fps video shows every other frame). A faster speed ticks faster
+    /// (`setFrameInterval`, `PlaybackFrameRate.drawRate`), so a 60 fps video
+    /// at 2× shows all 120 frames a second. Cached mode looks depth up by
+    /// PTS; realtime mode infers at ~30Hz and holds the map for the frames
+    /// shown within its interval (see RealtimeDepthSource); a frame whose map
+    /// isn't ready waits for it, so a slow model shows fewer frames, never
+    /// older depth. Read and written on `queue`.
+    private var frameInterval: Double
     /// How far ahead of the display the pump works, for a clocked source:
     /// long enough for a frame's inference, warp and transfer with room for a
     /// slow one; a cached or packed picture only needs the warp.
@@ -425,6 +428,16 @@ public final class StereoPump: @unchecked Sendable {
         timer.setEventHandler { [weak self] in self?.tick() }
         self.timer = timer
         timer.resume()
+    }
+
+    /// Ticks every `interval` seconds from now on (a speed change).
+    public func setFrameInterval(_ interval: Double) {
+        guard interval.isFinite, interval > 0 else { return }
+        queue.async { [weak self] in
+            guard let self, abs(self.frameInterval - interval) > 1e-9 else { return }
+            self.frameInterval = interval
+            self.timer?.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(2))
+        }
     }
 
     public func stop() {
@@ -934,6 +947,7 @@ public final class StereoPump: @unchecked Sendable {
               var report = StereoPerformance.measured(
                 frames: delivery.frames, itemSpan: delivery.itemSpan, window: window,
                 spacing: delivery.sourceSpacing.seconds, maxShownPerSecond: 1 / frameInterval,
+                limitsToNormalSpeed: depthSource?.limitsToSourceFrameRate == true,
                 sourceHeight: delivery.sourceHeight) else { return }
         report.isRecovering = processingHold.isHolding
         onPerformance(report)
@@ -1411,9 +1425,8 @@ public struct StereoPerformance: Sendable, Equatable {
     /// The source's own frame rate, from the shortest gap between frames.
     public var sourceFramesPerSecond: Double
     /// Of the source frames the playhead passed, the share that was shown
-    /// (1 = every frame); faster than normal speed, of the frames the video
-    /// has at normal speed in that time, as no more can be asked of the
-    /// conversion (`StereoPerformance.measured`). Below ~0.75 the picture
+    /// (1 = every frame, up to what the pump's ticks can show; a faster
+    /// speed ticks faster) (`StereoPerformance.measured`). Below ~0.75 the picture
     /// visibly stutters.
     public var deliveredFraction: Double
     /// Source seconds per wall second; well under 1 means the player itself

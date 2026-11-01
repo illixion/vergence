@@ -275,7 +275,11 @@ public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
     /// silhouettes would stairstep. Unrefined depth keeps the moderate grid
     /// (its residual detail rendered as per-vertex wobble on the dense one).
     public var prefersDenseWarpGrid: Bool { refined }
-    public let limitsToSourceFrameRate = true
+    /// Faster than normal speed it shows every frame the pump's tick allows
+    /// (a 60 fps video at 2×, 120 a second): speed changes the frame rate.
+    /// The held map's interval is wall time, so the inference rate doesn't
+    /// follow the speed; more frames share each map instead.
+    public let limitsToSourceFrameRate = false
     public let computesDepthAhead = true
 
     public func requestDepth(for frame: PumpFrame, shownAt: CFTimeInterval,

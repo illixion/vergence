@@ -8,15 +8,17 @@
 
  - `SourceFrameSpacing`: the source's own frame rate, read from the gaps
    between the presentation times of frames shown.
- - `FrameRateCap`: at a faster speed, a pump whose every depth map is an
-   inference shows no more frames a second than the video has at normal
+ - `FrameRateCap`: at a faster speed, a pump held to normal speed's frames
+   (no depth source ships held since 2026-11-01: speed changes the frame
+   rate, `PlaybackFrameRate`) shows no more frames a second than the video has at normal
    speed, evenly spaced, instead of as many as the inference manages (it
    would take every other frame, then every third, unevenly). It counts on
    the video's timeline: a wall-clock allowance can't be even, since a tick
    comes either when the last one's work ends or on the next 60 Hz beat.
  - `StereoPerformance.measured`: what share of the frames it could have shown
-   it did show. "Could have" is the frames the video has at normal speed in
-   that wall time, so a 2× video showing all of its 1× frame rate keeps up.
+   it did show. "Could have" is every frame the playhead passed, up to the
+   pump's ticks (which a faster speed raises), or for a pump held by
+   `FrameRateCap` the frames the video has at normal speed in that time.
  - `LookaheadPull` / `LookaheadClock`: a pump fed by a clocked source takes
    each frame a little before it is due, so the frame's depth and warp are
    done by then and the renderer shows it on time. These say which frame to
@@ -66,7 +68,9 @@ extension SourceFrameSpacing {
     }
 }
 
-/// Which frames a pump shows at a faster speed, so that it shows no more
+/// Which frames a pump held to normal speed's frame count (a depth source
+/// with `limitsToSourceFrameRate`; none ships one since speed changes the
+/// frame rate, 2026-11-01) shows at a faster speed, so that it shows no more
 /// frames a second than the video has at normal speed, evenly spaced: a
 /// frame is shown once the video has moved on by what normal speed plays
 /// between two frames (two frames on at 2×, 2, 1, 2, 1 at 1.5×), on the
@@ -243,14 +247,18 @@ extension StereoPerformance {
     /// covering `itemSpan` seconds of the source, whose frames are `spacing`
     /// apart, by a pump that can show at most `maxShownPerSecond`. Nil when
     /// too little was shown to judge.
+    /// - Parameter limitsToNormalSpeed: the pump holds a faster speed to the
+    ///   frames the video has at normal speed (`FrameRateCap`), so that many
+    ///   is keeping up.
     static func measured(frames: Int, itemSpan: Double, window: Double, spacing: Double,
-                         maxShownPerSecond: Double, sourceHeight: Int) -> StereoPerformance? {
+                         maxShownPerSecond: Double, limitsToNormalSpeed: Bool = false,
+                         sourceHeight: Int) -> StereoPerformance? {
         guard frames >= 4, spacing.isFinite, spacing > 0, itemSpan > 0, window > 0 else { return nil }
-        // Every frame the playhead passed; at a faster speed no more than the
-        // video has at normal speed in the same time (a 60 fps video at 2×
-        // passes 120 a second, and showing 60 of them is keeping up); never
-        // more than the pump's ticks.
-        let expected = min(itemSpan / spacing, window / spacing, window * maxShownPerSecond)
+        // Every frame the playhead passed (a 60 fps video at 2× passes 120 a
+        // second: speed changes the frame rate); never more than the pump's
+        // ticks, nor, for a pump held to normal speed's frames, than those.
+        var expected = min(itemSpan / spacing, window * maxShownPerSecond)
+        if limitsToNormalSpeed { expected = min(expected, window / spacing) }
         return StereoPerformance(
             shownFramesPerSecond: Double(frames) / window,
             sourceFramesPerSecond: 1 / spacing,

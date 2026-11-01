@@ -46,7 +46,8 @@ struct StereoPacingTests {
             if now - window.start >= 2 {
                 if let report = StereoPerformance.measured(
                     frames: window.frames, itemSpan: window.span, window: now - window.start,
-                    spacing: run.spacing.seconds, maxShownPerSecond: 60, sourceHeight: 1080) {
+                    spacing: run.spacing.seconds, maxShownPerSecond: 60, limitsToNormalSpeed: capped,
+                    sourceHeight: 1080) {
                     run.reports.append(report)
                 }
                 window = (now, 0, 0)
@@ -175,6 +176,26 @@ struct StereoPacingTests {
         #expect(zip(sixty, sixty.dropFirst()).allSatisfy { $1 - $0 == 2 })
         // 24 fps at 2× is 48 a second, under the ticks: every frame.
         #expect(Self.admitted(fps: 24, speed: 2, limits: false, minimumInterval: 1.0 / 60, frames: 96).count == 96)
+    }
+
+    @Test func atTwiceSpeedAPumpTickingTwiceAsFastShowsEveryFrame() {
+        // Speed changes the frame rate: 60 fps at 2× ticks at 120 and shows all 120.
+        let interval = 1 / PlaybackFrameRate.drawRate(speed: 2)
+        #expect(abs(interval - 1.0 / 120) < 1e-12)
+        #expect(Self.admitted(fps: 60, speed: 2, limits: false, minimumInterval: interval, frames: 240).count == 240)
+        // Past the display's fastest, evenly every other frame: 60 fps at 4× shows 120 of 240.
+        let four = Self.admitted(fps: 60, speed: 4, limits: false, minimumInterval: 1 / PlaybackFrameRate.drawRate(speed: 4), frames: 240)
+        #expect(zip(four, four.dropFirst()).allSatisfy { $1 - $0 == 2 })
+    }
+
+    @Test func showingHalfOfTwiceSpeedIsNotKeepingUp() {
+        // 60 fps at 2× with ticks for 120: 60 shown a second is half.
+        let half = StereoPerformance.measured(frames: 120, itemSpan: 4, window: 2, spacing: 1.0 / 60,
+                                              maxShownPerSecond: 120, sourceHeight: 1080)
+        #expect(half.map { abs($0.deliveredFraction - 0.5) < 0.01 } == true)
+        let all = StereoPerformance.measured(frames: 240, itemSpan: 4, window: 2, spacing: 1.0 / 60,
+                                             maxShownPerSecond: 120, sourceHeight: 1080)
+        #expect(all.map { $0.deliveredFraction > 0.99 } == true)
     }
 
     @Test func theNextFrameIsAskedForInTurn() {
