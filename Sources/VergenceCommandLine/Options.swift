@@ -55,6 +55,8 @@ public struct Options: Equatable, Sendable {
     public var models: String?
     /// `interpolate --fields FILE.vgat`: the analysis track to make in-between frames from.
     public var fields: String?
+    /// `interpolate --no-guard` (mono): VideoToolbox's frames as they come, without `StaticRegionGuard`.
+    public var noGuard = false
 
     public init() {}
 }
@@ -196,6 +198,7 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
             o.rate = FrameRate(numerator: parts[0], denominator: parts.count == 2 ? parts[1] : 1)
         case "--models": o.models = try value()
         case "--fields": o.fields = try value()
+        case "--no-guard": try flag(); o.noGuard = true
         default: throw UsageError("unknown option \(name)")
         }
     }

@@ -14,6 +14,13 @@
 
    ffmpeg -i clip.mkv -vf "select=not(mod(n\\,2))" -fps_mode passthrough -f rawvideo -pix_fmt bgra - \\
      | vergence interpolate --raw 1920x1080 - --fields clip.vgat -o clip-mid.bgra
+
+ Without --fields it reads plain (mono) WxH BGRA frames and makes each
+ in-between frame with VideoToolbox's low-latency frame interpolation, the
+ interpolator a 2D video's Smooth Motion uses on the headset
+ (`VTMidFrameInterpolator`), so its artefacts can be looked at on a Mac.
+ Its frames go through `StaticRegionGuard` as on the headset; --no-guard
+ writes VideoToolbox's frames as they come.
  */
 
 import Foundation
@@ -26,7 +33,7 @@ import CoreVideo
 
 func interpolate(_ o: Options) throws {
     guard let size = o.raw else { usage("interpolate needs --raw WxH (one eye)") }
-    guard let trackPath = o.fields else { usage("interpolate needs --fields FILE.vgat") }
+    guard let trackPath = o.fields else { return try interpolateMono(o, width: size.width, height: size.height) }
     guard o.output != "-" else { usage("interpolate needs --output FILE.bgra") }
     guard o.positional.count == 1 else { usage("interpolate reads one FILE or -") }
     let index = try AnalysisTrackIndex(Data(contentsOf: URL(fileURLWithPath: trackPath), options: .mappedIfSafe))
@@ -77,6 +84,58 @@ func interpolate(_ o: Options) throws {
     let median = gpuMs.isEmpty ? .nan : gpuMs.sorted()[gpuMs.count / 2]
     log(String(format: "vergence: %d in-between frames, %d pairs without fields; %.1f ms median a frame (lookup, upload, pass)",
                made, missed, median))
+}
+
+/// Mono frames through VideoToolbox's interpolator, as a 2D video's Smooth Motion makes them.
+private func interpolateMono(_ o: Options, width w: Int, height h: Int) throws {
+    guard o.output != "-" else { usage("interpolate needs --output FILE.bgra") }
+    guard o.positional.count == 1 else { usage("interpolate reads one FILE or -") }
+    guard #available(macOS 26.0, *), VTMidFrameInterpolator.isSupported else {
+        throw FormatError("VideoToolbox's low-latency frame interpolation isn't supported here")
+    }
+    let interpolator = VTMidFrameInterpolator(guardsStillRegions: !o.noGuard)
+    guard interpolator.prepare(width: w, height: h, scale: 1) else { throw FormatError("can't interpolate \(w)x\(h)") }
+    let input = o.positional[0] == "-" ? FileHandle.standardInput
+        : try FileHandle(forReadingFrom: URL(fileURLWithPath: o.positional[0]))
+    FileManager.default.createFile(atPath: o.output, contents: nil)
+    let out = try FileHandle(forWritingTo: URL(fileURLWithPath: o.output))
+    defer { try? out.close() }
+    let frameBytes = w * h * 4
+    let zeros = Data(count: frameBytes)
+    var previous: CVPixelBuffer?
+    var k = 0, made = 0, failed = 0
+    var ms: [Double] = []
+    while k < o.frames, try autoreleasepool(invoking: { () throws -> Bool in
+        var data = Data()
+        while data.count < frameBytes {
+            guard let chunk = try input.read(upToCount: frameBytes - data.count), !chunk.isEmpty else { break }
+            data.append(chunk)
+        }
+        guard data.count == frameBytes else { return false }
+        k += 1
+        let buffer = try bgraBuffer(data, width: w, height: h)
+        if let previous {
+            let done = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var result: (CVPixelBuffer?, Double) = (nil, 0)
+            interpolator.midFrame(between: previous, and: buffer) { frame, processMs in
+                result = (frame, processMs)
+                done.signal()
+            }
+            done.wait()
+            if let mid = result.0 {
+                ms.append(result.1)
+                try out.write(contentsOf: bytes(of: mid))
+                made += 1
+            } else {
+                try out.write(contentsOf: zeros)
+                failed += 1
+            }
+        }
+        previous = buffer
+        return true
+    }) {}
+    let median = ms.isEmpty ? .nan : ms.sorted()[ms.count / 2]
+    log(String(format: "vergence: %d in-between frames (VideoToolbox), %d failed; %.1f ms median a frame", made, failed, median))
 }
 
 private func bgraBuffer(_ data: Data, width: Int, height: Int) throws -> CVPixelBuffer {
