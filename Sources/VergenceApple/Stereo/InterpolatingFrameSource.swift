@@ -484,8 +484,9 @@ import VideoToolbox
 /// 1920×1080 pixels (same Mac). All of it runs on the caller's work queue and
 /// the processor's completion queue, one request at a time.
 ///
-/// Its result goes through `StaticRegionGuard`, which puts back the stripes it
-/// shifts where nothing moved (still blinds flickered at 48 Hz without it).
+/// Its result goes through `InterpolationGuard`, which redoes the tiles where it
+/// matched evenly spaced stripes to the wrong stripe (blinds, still or panning,
+/// flickered at 48 Hz without it).
 @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
 public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Sendable {
     public static var isSupported: Bool { VTLowLatencyFrameInterpolationConfiguration.isSupported }
@@ -501,12 +502,15 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
     /// The last `current` converted, reused as the next request's `previous`.
     private var lastConverted: (source: CVPixelBuffer, yuv: CVPixelBuffer)?
     /// nil when the guard is off or couldn't be made (then frames pass as they are).
-    private let staticGuard: StaticRegionGuard?
+    private let resultGuard: InterpolationGuard?
 
-    /// - Parameter guardsStillRegions: run `StaticRegionGuard` on each result.
-    public init(guardsStillRegions: Bool = true) {
-        staticGuard = guardsStillRegions ? StaticRegionGuard() : nil
+    /// - Parameter guardsResults: run `InterpolationGuard` on each result.
+    public init(guardsResults: Bool = true) {
+        resultGuard = guardsResults ? InterpolationGuard() : nil
     }
+
+    /// GPU time of the guard's last pass (0 without the guard).
+    public var guardGPUMilliseconds: Double { resultGuard?.lastGPUMilliseconds ?? 0 }
 
     deinit { processor?.endSession() }
 
@@ -569,7 +573,7 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
             processor.endSession()
             return false
         }
-        if let staticGuard, !staticGuard.prepare(width: fullWidth, height: fullHeight) {
+        if let resultGuard, !resultGuard.prepare(width: fullWidth, height: fullHeight) {
             VergenceLog.pipeline.error("frame interpolation: static-region guard unavailable")
         }
         self.processor = processor
@@ -607,7 +611,7 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
         // The completion runs on the processor's queue; one request is in
         // flight at a time, so nothing else touches these meanwhile.
         let job = Job(previous: previous, current: current, midYUV: midYUV, toBGRA: toBGRA, bgraPool: bgraPool,
-                      staticGuard: staticGuard)
+                      resultGuard: resultGuard)
         let started = CACurrentMediaTime()
         processor.process(parameters: parameters) { _, error in
             let processMs = (CACurrentMediaTime() - started) * 1000
@@ -623,14 +627,14 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
                 return
             }
             CVBufferPropagateAttachments(job.current, out)
-            guard let staticGuard = job.staticGuard else {
+            guard let resultGuard = job.resultGuard else {
                 completion(out, processMs)
                 return
             }
             // The governor's time is the processor's plus the guard's (about
             // 0.4 ms at 1080p on an M2 Max), not the conversion between them.
             let guardStarted = CACurrentMediaTime()
-            staticGuard.apply(previous: job.previous, current: job.current, mid: out) { guarded in
+            resultGuard.apply(previous: job.previous, current: job.current, mid: out) { guarded in
                 completion(guarded, processMs + (CACurrentMediaTime() - guardStarted) * 1000)
             }
         }
@@ -642,7 +646,7 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
         let midYUV: CVPixelBuffer
         let toBGRA: VTPixelTransferSession
         let bgraPool: CVPixelBufferPool?
-        let staticGuard: StaticRegionGuard?
+        let resultGuard: InterpolationGuard?
     }
 
     private func convert(_ bgra: CVPixelBuffer) -> CVPixelBuffer? {

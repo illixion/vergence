@@ -55,7 +55,7 @@ public struct Options: Equatable, Sendable {
     public var models: String?
     /// `interpolate --fields FILE.vgat`: the analysis track to make in-between frames from.
     public var fields: String?
-    /// `interpolate --no-guard` (mono): VideoToolbox's frames as they come, without `StaticRegionGuard`.
+    /// `interpolate --no-guard` (mono): VideoToolbox's frames as they come, without `InterpolationGuard`.
     public var noGuard = false
 
     public init() {}

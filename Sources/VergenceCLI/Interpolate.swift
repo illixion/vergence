@@ -19,7 +19,7 @@
  in-between frame with VideoToolbox's low-latency frame interpolation, the
  interpolator a 2D video's Smooth Motion uses on the headset
  (`VTMidFrameInterpolator`), so its artefacts can be looked at on a Mac.
- Its frames go through `StaticRegionGuard` as on the headset; --no-guard
+ Its frames go through `InterpolationGuard` as on the headset; --no-guard
  writes VideoToolbox's frames as they come.
  */
 
@@ -93,7 +93,7 @@ private func interpolateMono(_ o: Options, width w: Int, height h: Int) throws {
     guard #available(macOS 26.0, *), VTMidFrameInterpolator.isSupported else {
         throw FormatError("VideoToolbox's low-latency frame interpolation isn't supported here")
     }
-    let interpolator = VTMidFrameInterpolator(guardsStillRegions: !o.noGuard)
+    let interpolator = VTMidFrameInterpolator(guardsResults: !o.noGuard)
     guard interpolator.prepare(width: w, height: h, scale: 1) else { throw FormatError("can't interpolate \(w)x\(h)") }
     let input = o.positional[0] == "-" ? FileHandle.standardInput
         : try FileHandle(forReadingFrom: URL(fileURLWithPath: o.positional[0]))
@@ -104,7 +104,7 @@ private func interpolateMono(_ o: Options, width w: Int, height h: Int) throws {
     let zeros = Data(count: frameBytes)
     var previous: CVPixelBuffer?
     var k = 0, made = 0, failed = 0
-    var ms: [Double] = []
+    var ms: [Double] = [], guardMs: [Double] = []
     while k < o.frames, try autoreleasepool(invoking: { () throws -> Bool in
         var data = Data()
         while data.count < frameBytes {
@@ -124,6 +124,7 @@ private func interpolateMono(_ o: Options, width w: Int, height h: Int) throws {
             done.wait()
             if let mid = result.0 {
                 ms.append(result.1)
+                if !o.noGuard { guardMs.append(interpolator.guardGPUMilliseconds) }
                 try out.write(contentsOf: bytes(of: mid))
                 made += 1
             } else {
@@ -135,7 +136,10 @@ private func interpolateMono(_ o: Options, width w: Int, height h: Int) throws {
         return true
     }) {}
     let median = ms.isEmpty ? .nan : ms.sorted()[ms.count / 2]
-    log(String(format: "vergence: %d in-between frames (VideoToolbox), %d failed; %.1f ms median a frame", made, failed, median))
+    let guardMedian = guardMs.isEmpty ? 0 : guardMs.sorted()[guardMs.count / 2]
+    log(String(format: "vergence: %d in-between frames (VideoToolbox), %d failed; %.1f ms median a frame%@",
+               made, failed, median,
+               guardMs.isEmpty ? "" : String(format: " (guard GPU %.2f ms median, %.2f max)", guardMedian, guardMs.max() ?? 0)))
 }
 
 private func bgraBuffer(_ data: Data, width: Int, height: Int) throws -> CVPixelBuffer {
