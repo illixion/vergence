@@ -171,6 +171,8 @@ public final class StereoPump: @unchecked Sendable {
     private var checkedPackedSize: CGSize?
     private var correctedLayout: PackedStereoLayout?
     private var lastReportedSize: CGSize?
+    /// Pump-queue only: the colour signal last reported (`onFrameSignal`).
+    private var lastReportedSignal: FrameColorSignal?
     /// Pump-queue only. One line per pump, not one per frame at 60Hz.
     private var didWarnAboutPixelFormat = false
     /// When the depth source last transitioned unavailable → available; drives
@@ -270,6 +272,10 @@ public final class StereoPump: @unchecked Sendable {
     private let performanceInterval: Double = 2
     /// Any thread may read; set before `start()`. Called on the pump queue.
     public var onPerformance: (@Sendable (StereoPerformance) -> Void)?
+    /// Any thread may read; set before `start()`. Called on the pump queue
+    /// with the first source frame's colour signal, and again whenever it
+    /// changes (an HLS variant switch, a new item).
+    public var onFrameSignal: (@Sendable (FrameColorSignal) -> Void)?
     /// Any thread may read; set before `start()`. Called once, on the pump
     /// queue, when the first frame is one no warp can show right (Dolby
     /// Vision profile 5, `DolbyVisionFrames`); nothing is rendered from then
@@ -705,7 +711,7 @@ public final class StereoPump: @unchecked Sendable {
             limitsToNormalSpeed: depthSource?.limitsToSourceFrameRate == true,
             minimumInterval: clock == nil ? 0 : frameInterval
         ) else { return }
-        reportSizeIfNeeded(frame.pixelBuffer)
+        reportPictureIfNeeded(frame.pixelBuffer)
         delivery.sourceHeight = CVPixelBufferGetHeight(frame.pixelBuffer)
         maxScheduledForSize = StereoLookaheadPolicy.capacity(width: CVPixelBufferGetWidth(frame.pixelBuffer),
                                                            height: CVPixelBufferGetHeight(frame.pixelBuffer))
@@ -1395,9 +1401,14 @@ public final class StereoPump: @unchecked Sendable {
         return CVMetalTextureGetTexture(cvTexture)
     }
 
-    private func reportSizeIfNeeded(_ pixelBuffer: CVPixelBuffer) {
+    private func reportPictureIfNeeded(_ pixelBuffer: CVPixelBuffer) {
         let frame = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
         let size = packedLayout(forFrame: frame)?.eyeSize(packed: frame) ?? frame
+        let signal = FrameColorSignal(pixelBuffer)
+        if signal != lastReportedSignal {
+            lastReportedSignal = signal
+            onFrameSignal?(signal)
+        }
         guard size.width > 0, size.height > 0, lastReportedSize != size else { return }
         lastReportedSize = size
         onVideoSizeKnown(size)

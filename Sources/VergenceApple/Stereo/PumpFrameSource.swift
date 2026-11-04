@@ -42,6 +42,26 @@ public enum DolbyVisionFrames {
     }
 }
 
+/// What a source frame says about its picture: its transfer function
+/// (`kCVImageBufferTransferFunctionKey`, e.g. "SMPTE_ST_2084_PQ") and whether
+/// a Dolby Vision RPU rides on it. A host reads this to say what plays (HDR10,
+/// HLG, SDR); the warp keeps the transfer in both eyes but never applies the
+/// RPU.
+public struct FrameColorSignal: Sendable, Equatable {
+    public var transferFunction: String?
+    public var hasDolbyVisionRPU: Bool
+
+    public init(transferFunction: String?, hasDolbyVisionRPU: Bool) {
+        self.transferFunction = transferFunction
+        self.hasDolbyVisionRPU = hasDolbyVisionRPU
+    }
+
+    public init(_ pixelBuffer: CVPixelBuffer) {
+        transferFunction = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil) as? String
+        hasDolbyVisionRPU = CVBufferCopyAttachment(pixelBuffer, "DolbyVisionRPUData" as CFString, nil) != nil
+    }
+}
+
 /// Where `StereoPump` gets frames. Called only on the pump queue (including
 /// `invalidate`, from the stop-drain block), at the pump's tick rate.
 ///
