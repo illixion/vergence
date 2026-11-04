@@ -1,5 +1,6 @@
 #if canImport(CoreVideo)
 import CoreVideo
+import VergenceCore
 
 extension LumaSignature {
     /// Luma samples on the grid from a decoded BGRA frame, or a half-float
@@ -23,10 +24,13 @@ extension LumaSignature {
         if format == kCVPixelFormatType_64RGBAHalf {
             for gy in 0..<gridSize {
                 let y = gy * (height - 1) / (gridSize - 1)
-                let row = (base + y * bytesPerRow).assumingMemoryBound(to: Float16.self)
+                let row = (base + y * bytesPerRow).assumingMemoryBound(to: UInt16.self)
                 for gx in 0..<gridSize {
                     let px = row + gx * (width - 1) / (gridSize - 1) * 4 // RGBA
-                    let luma = Float(px[0]) + 2 * Float(px[1]) + Float(px[2])
+                    let red = HalfFloat.value(from: px[0])
+                    let green = HalfFloat.value(from: px[1])
+                    let blue = HalfFloat.value(from: px[2])
+                    let luma: Float = red + 2 * green + blue
                     signature[gy * gridSize + gx] = min(max(luma, 0), 4) * (255 / 4)
                 }
             }
@@ -46,5 +50,6 @@ extension LumaSignature {
         }
         return signature
     }
+
 }
 #endif
