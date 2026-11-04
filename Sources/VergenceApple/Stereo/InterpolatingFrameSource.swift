@@ -13,8 +13,9 @@ public protocol MidFrameInterpolator: AnyObject, Sendable {
     /// back up, for less work): true when they can be interpolated. May
     /// block (a model load: ~60 ms warm, seconds cold).
     func prepare(width: Int, height: Int, scale: Double) -> Bool
-    /// The BGRA frame halfway between `previous` and `current` (both BGRA, of
-    /// the prepared size), handed to `completion` on any queue; nil on failure.
+    /// The frame halfway between `previous` and `current` (both BGRA, or
+    /// both half-float RGBA for HDR, of the prepared size), in their format,
+    /// handed to `completion` on any queue; nil on failure.
     /// `processMs` is the interpolation itself, without the format conversions.
     func midFrame(between previous: CVPixelBuffer, and current: CVPixelBuffer,
                   completion: @escaping @Sendable (_ frame: CVPixelBuffer?, _ processMs: Double) -> Void)
@@ -567,6 +568,11 @@ import VideoToolbox
 /// Its result goes through `InterpolationGuard`, which redoes the tiles where it
 /// matched evenly spaced stripes to the wrong stripe (blinds, still or panning,
 /// flickered at 48 Hz without it).
+///
+/// HDR frames (half-float RGBA, still PQ/HLG-encoded) go through the same 8-bit
+/// interpolator, and `HDRMidFrameComposer` takes only its motion from it, laid
+/// over the full-precision blend of the real frames, so the in-between frames
+/// don't band where the real ones don't.
 @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
 public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Sendable {
     public static var isSupported: Bool { VTLowLatencyFrameInterpolationConfiguration.isSupported }
@@ -583,6 +589,9 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
     private var lastConverted: (source: CVPixelBuffer, yuv: CVPixelBuffer)?
     /// nil when the guard is off or couldn't be made (then frames pass as they are).
     private let resultGuard: InterpolationGuard?
+    /// Made on the first HDR pair; nil until then, or if Metal can't make it.
+    private var hdrComposer: HDRMidFrameComposer?
+    private var hdrComposerTried = false
 
     /// - Parameter guardsResults: run `InterpolationGuard` on each result.
     public init(guardsResults: Bool = true) {
@@ -678,6 +687,15 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
         }
         lastConverted = (current, currentYUV)
         copyColorTags(from: current, to: midYUV)
+        let isHDR = CVPixelBufferGetPixelFormatType(current) == FramePixelFormat.hdr
+        if isHDR, !hdrComposerTried {
+            hdrComposerTried = true
+            hdrComposer = HDRMidFrameComposer()
+        }
+        if isHDR, hdrComposer == nil {
+            completion(nil, .nan)
+            return
+        }
         // The times only order the two inputs and place the result between them.
         guard let previousFrame = VTFrameProcessorFrame(buffer: previousYUV, presentationTimeStamp: CMTime(value: 0, timescale: 2)),
               let currentFrame = VTFrameProcessorFrame(buffer: currentYUV, presentationTimeStamp: CMTime(value: 2, timescale: 2)),
@@ -690,11 +708,30 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
         }
         // The completion runs on the processor's queue; one request is in
         // flight at a time, so nothing else touches these meanwhile.
-        let job = Job(previous: previous, current: current, midYUV: midYUV, toBGRA: toBGRA, bgraPool: bgraPool,
-                      resultGuard: resultGuard)
+        let job = Job(previous: previous, current: current, previousYUV: previousYUV, currentYUV: currentYUV,
+                      midYUV: midYUV, toBGRA: toBGRA, bgraPool: bgraPool, resultGuard: resultGuard,
+                      hdrComposer: isHDR ? hdrComposer : nil)
         let started = CACurrentMediaTime()
         processor.process(parameters: parameters) { _, error in
             let processMs = (CACurrentMediaTime() - started) * 1000
+            if error == nil, let composer = job.hdrComposer {
+                composer.compose(previous: job.previous, current: job.current, previousYUV: job.previousYUV,
+                                 currentYUV: job.currentYUV, midYUV: job.midYUV) { composed in
+                    guard let composed else {
+                        completion(nil, processMs)
+                        return
+                    }
+                    guard let resultGuard = job.resultGuard else {
+                        completion(composed, processMs)
+                        return
+                    }
+                    let guardStarted = CACurrentMediaTime()
+                    resultGuard.apply(previous: job.previous, current: job.current, mid: composed) { guarded in
+                        completion(guarded, processMs + (CACurrentMediaTime() - guardStarted) * 1000)
+                    }
+                }
+                return
+            }
             guard error == nil, let bgraPool = job.bgraPool else {
                 if let error { VergenceLog.pipeline.error("frame interpolation failed: \(error, privacy: .public)") }
                 completion(nil, processMs)
@@ -723,12 +760,18 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
     private struct Job: @unchecked Sendable {
         let previous: CVPixelBuffer
         let current: CVPixelBuffer
+        let previousYUV: CVPixelBuffer
+        let currentYUV: CVPixelBuffer
         let midYUV: CVPixelBuffer
         let toBGRA: VTPixelTransferSession
         let bgraPool: CVPixelBufferPool?
         let resultGuard: InterpolationGuard?
+        let hdrComposer: HDRMidFrameComposer?
     }
 
+    /// BGRA or half-float RGBA in; the processor's `420v` out, with the
+    /// frame's own primaries and transfer function, so code values pass as
+    /// they are.
     private func convert(_ bgra: CVPixelBuffer) -> CVPixelBuffer? {
         guard let toYUV, let yuv = makeBuffer(yuvPool) else { return nil }
         copyColorTags(from: bgra, to: yuv)

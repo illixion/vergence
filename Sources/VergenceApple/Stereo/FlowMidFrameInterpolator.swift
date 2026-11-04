@@ -40,7 +40,7 @@ import VergenceCore
 ///
 /// It has one size: about 1.1 ms of GPU at 1080p on an M2 Max, less than
 /// anything a smaller one would save, so the governor's `scale` changes
-/// nothing (and a governor that finds it too slow pauses it). BGRA only.
+/// nothing (and a governor that finds it too slow pauses it). BGRA, or half-float RGBA for HDR (`FramePixelFormat`).
 public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Sendable {
     /// Largest symmetric shift searched at quarter size, in quarter pixels
     /// (×4 for the frame's): 8 × 5 → 32 × 20 px, motion 64 × 40 px a frame.
@@ -71,7 +71,8 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
     private let smoothPipeline: MTLComputePipelineState
     private let composePipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
-    private var outputPool: CVPixelBufferPool?
+    /// One per frame format (BGRA, half-float HDR); made as first needed.
+    private var outputPools: [OSType: CVPixelBufferPool] = [:]
     private var width = 0
     private var height = 0
     private var lumaHalf: MTLTexture?
@@ -119,15 +120,6 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
     public func prepare(width: Int, height: Int, scale: Double) -> Bool {
         var cache: CVMetalTextureCache?
         CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
-        var pool: CVPixelBufferPool?
-        let attributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height,
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
-        ]
-        CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
         func make(_ format: MTLPixelFormat, _ w: Int, _ h: Int) -> MTLTexture? {
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: format, width: max(1, w), height: max(1, h), mipmapped: false)
@@ -139,7 +131,7 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
             let levelSide = (side + levelScale - 1) / levelScale
             return (levelSide + Self.block - 1) / Self.block
         }
-        guard width >= 32, height >= 32, let cache, let pool,
+        guard width >= 32, height >= 32, let cache,
               let lumaHalf = make(.rg16Float, (width + 1) / 2, (height + 1) / 2),
               let lumaQuarter = make(.rg16Float, (width + 3) / 4, (height + 3) / 4),
               let fieldQuarter = make(.rgba16Float, blocks(width, 4), blocks(height, 4)),
@@ -147,7 +139,7 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
               let fieldSmooth = make(.rgba16Float, blocks(width, 2), blocks(height, 2))
         else { return false }
         textureCache = cache
-        outputPool = pool
+        outputPools = [:]
         self.lumaHalf = lumaHalf
         self.lumaQuarter = lumaQuarter
         self.fieldQuarter = fieldQuarter
@@ -200,12 +192,13 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
 
     private func encode(previous: CVPixelBuffer, current: CVPixelBuffer,
                         completion: @escaping @Sendable (CVPixelBuffer?) -> Void) -> MTLCommandBuffer? {
-        guard width > 0,
+        let format = CVPixelBufferGetPixelFormatType(previous)
+        guard width > 0, FramePixelFormat.isSupported(format),
               [previous, current].allSatisfy({
                   CVPixelBufferGetWidth($0) == width && CVPixelBufferGetHeight($0) == height
-                      && CVPixelBufferGetPixelFormatType($0) == kCVPixelFormatType_32BGRA
+                      && CVPixelBufferGetPixelFormatType($0) == format
               }),
-              let pool = outputPool, let lumaHalf, let lumaQuarter,
+              let pool = outputPool(format), let lumaHalf, let lumaQuarter,
               let fieldQuarter, let fieldHalf, let fieldSmooth else { return nil }
         var output: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &output)
@@ -291,12 +284,15 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
 
     private func texture(_ buffer: CVPixelBuffer) -> (texture: MTLTexture, held: CVMetalTexture)? {
         guard let textureCache else { return nil }
-        var cvTexture: CVMetalTexture?
-        guard CVMetalTextureCacheCreateTextureFromImage(
-            nil, textureCache, buffer, nil, .bgra8Unorm,
-            CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer), 0, &cvTexture) == kCVReturnSuccess,
-            let cvTexture, let texture = CVMetalTextureGetTexture(cvTexture) else { return nil }
-        return (texture, cvTexture)
+        return FramePixelFormat.texture(buffer, cache: textureCache)
+    }
+
+    /// One request is in flight at a time, so one caller at a time.
+    private func outputPool(_ format: OSType) -> CVPixelBufferPool? {
+        if let pool = outputPools[format] { return pool }
+        let pool = FramePixelFormat.pool(format: format, width: width, height: height)
+        outputPools[format] = pool
+        return pool
     }
 
     static let source = """

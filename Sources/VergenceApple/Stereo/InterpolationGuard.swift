@@ -57,7 +57,8 @@ public final class InterpolationGuard: @unchecked Sendable {
     private let widenPipeline: MTLComputePipelineState
     private let applyPipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
-    private var outputPool: CVPixelBufferPool?
+    /// One per frame format (BGRA, half-float HDR); made as first needed.
+    private var outputPools: [OSType: CVPixelBufferPool] = [:]
     private var width = 0
     private var height = 0
     private var luma: MTLTexture?
@@ -100,19 +101,11 @@ public final class InterpolationGuard: @unchecked Sendable {
     /// refined one.
     private static let searchThreads = MTLSize(width: 64, height: 1, depth: 1)
 
-    /// Sets the frame size (BGRA, all three frames alike).
+    /// Sets the frame size (BGRA or half-float RGBA, all three frames alike;
+    /// the guard's levels are on the 0-255 scale of either's code values).
     public func prepare(width: Int, height: Int) -> Bool {
         var cache: CVMetalTextureCache?
         CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
-        var pool: CVPixelBufferPool?
-        let attributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height,
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
-        ]
-        CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
         let tilesWide = (width + Self.tile - 1) / Self.tile
         let tilesHigh = (height + Self.tile - 1) / Self.tile
         func make(_ format: MTLPixelFormat, _ w: Int = tilesWide, _ h: Int = tilesHigh) -> MTLTexture? {
@@ -122,12 +115,12 @@ public final class InterpolationGuard: @unchecked Sendable {
             descriptor.storageMode = .private
             return device.makeTexture(descriptor: descriptor)
         }
-        guard let cache, let pool,
+        guard let cache,
               let luma = make(.rg16Float, (width + 1) / 2, (height + 1) / 2),
               let stats = make(.rg16Float), let motion = make(.rg16Float),
               let weights = make(.rg16Float), let widened = make(.r16Float) else { return false }
         textureCache = cache
-        outputPool = pool
+        outputPools = [:]
         self.luma = luma
         self.stats = stats
         self.motion = motion
@@ -176,12 +169,13 @@ public final class InterpolationGuard: @unchecked Sendable {
 
     private func encode(previous: CVPixelBuffer, current: CVPixelBuffer, mid: CVPixelBuffer,
                         completion: @escaping @Sendable (CVPixelBuffer) -> Void) -> MTLCommandBuffer? {
-        guard width > 0,
+        let format = CVPixelBufferGetPixelFormatType(mid)
+        guard width > 0, FramePixelFormat.isSupported(format),
               [previous, current, mid].allSatisfy({
                   CVPixelBufferGetWidth($0) == width && CVPixelBufferGetHeight($0) == height
-                      && CVPixelBufferGetPixelFormatType($0) == kCVPixelFormatType_32BGRA
+                      && CVPixelBufferGetPixelFormatType($0) == format
               }),
-              let pool = outputPool, let luma, let stats, let motion, let weights, let widened else { return nil }
+              let pool = outputPool(format), let luma, let stats, let motion, let weights, let widened else { return nil }
         var output: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &output)
         guard let output,
@@ -264,12 +258,16 @@ public final class InterpolationGuard: @unchecked Sendable {
 
     private func texture(_ buffer: CVPixelBuffer) -> (texture: MTLTexture, held: CVMetalTexture)? {
         guard let textureCache else { return nil }
-        var cvTexture: CVMetalTexture?
-        guard CVMetalTextureCacheCreateTextureFromImage(
-            nil, textureCache, buffer, nil, .bgra8Unorm,
-            CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer), 0, &cvTexture) == kCVReturnSuccess,
-            let cvTexture, let texture = CVMetalTextureGetTexture(cvTexture) else { return nil }
-        return (texture, cvTexture)
+        return FramePixelFormat.texture(buffer, cache: textureCache)
+    }
+
+    /// Called on one completion or encode thread at a time (one request in
+    /// flight per interpolator).
+    private func outputPool(_ format: OSType) -> CVPixelBufferPool? {
+        if let pool = outputPools[format] { return pool }
+        let pool = FramePixelFormat.pool(format: format, width: width, height: height)
+        outputPools[format] = pool
+        return pool
     }
 
     static let source = """
