@@ -18,6 +18,14 @@ import QuartzCore
 ///
 /// It reaches the lead a step at a time, so no decoded frame between the
 /// playhead and the lead is skipped (an output asked past a frame drops it).
+///
+/// **A frame counts as due half a draw tick early.** When frames come as
+/// often as the draw loop ticks (60 fps doubled to 120 on a 120 Hz loop), a
+/// tick that lands a hair before a frame's time would leave it for the next
+/// tick, which then finds two due, shows the newer and drops the older: a
+/// hitch every few hundred milliseconds wherever the ticks and the frames
+/// line up. Due within half a tick (and half a frame), each tick takes the
+/// one frame nearest it. The tick is measured from the calls.
 /// Not thread-safe: call it from the player's draw loop only.
 public final class InterpolatedFramePresenter {
     /// How far ahead of the playhead frames are asked for, in item seconds at
@@ -41,6 +49,13 @@ public final class InterpolatedFramePresenter {
     private var lastPulled: Double?
     private var lastShown: Double?
     private var spacing = SourceFrameSpacing()
+    private var lastTick: CFTimeInterval?
+    /// Smoothed time between calls, once measured.
+    private(set) var tickInterval: Double?
+    /// For the 5 s log line: what reached the screen.
+    private var logStart: CFTimeInterval?
+    private var ticksLogged = 0
+    private var shownLogged = 0
 
     public init(source: LookaheadFrameSource) {
         self.source = source
@@ -51,6 +66,7 @@ public final class InterpolatedFramePresenter {
     public func frame(forHostTime hostTime: CFTimeInterval) -> PumpFrame? {
         let playhead = source.itemTime(forHostTime: hostTime).seconds
         guard playhead.isFinite else { return nil }
+        noteTick(hostTime)
         if let lastShown, playhead < lastShown - Self.backwardJump { reset() }
         if let first = pending.first, first.itemTime.seconds > playhead + Self.lead + 1 { reset() }
 
@@ -78,11 +94,50 @@ public final class InterpolatedFramePresenter {
         }
 
         var due: PumpFrame?
-        while let first = pending.first, first.itemTime.seconds <= playhead {
+        let early = earlyAllowance
+        while let first = pending.first, first.itemTime.seconds <= playhead + early {
             due = pending.removeFirst()
         }
         if let due { lastShown = due.itemTime.seconds }
+        logIfDue(hostTime, shown: due != nil)
         return due
+    }
+
+    /// Half a tick, or half the frames' spacing where that is shorter; none
+    /// until the tick is measured.
+    var earlyAllowance: Double {
+        guard let tickInterval else { return 0 }
+        let frames = spacing.seconds
+        return 0.5 * (frames.isFinite ? min(tickInterval, frames) : tickInterval)
+    }
+
+    /// `presenter …` every 5 s of drawing: frames shown and draw ticks a
+    /// second, the measured tick, so a device run says whether 120 frames a
+    /// second reached the screen.
+    private func logIfDue(_ hostTime: CFTimeInterval, shown: Bool) {
+        ticksLogged += 1
+        if shown { shownLogged += 1 }
+        guard let start = logStart else {
+            logStart = hostTime
+            return
+        }
+        let window = hostTime - start
+        guard window >= 5 else { return }
+        VergenceLog.pipeline.info(
+            "presenter \(Double(self.shownLogged) / window, format: .fixed(precision: 1), privacy: .public) frames/s shown over \(Double(self.ticksLogged) / window, format: .fixed(precision: 1), privacy: .public) draws/s, tick \((self.tickInterval ?? .nan) * 1000, format: .fixed(precision: 2), privacy: .public) ms"
+        )
+        logStart = hostTime
+        ticksLogged = 0
+        shownLogged = 0
+    }
+
+    private func noteTick(_ hostTime: CFTimeInterval) {
+        defer { lastTick = hostTime }
+        guard let lastTick else { return }
+        let gap = hostTime - lastTick
+        // A stall or a paused view isn't the loop's rate; nor is a repeat call.
+        guard gap > 1.0 / 400, gap < 1.0 / 20 else { return }
+        tickInterval = tickInterval.map { 0.9 * $0 + 0.1 * gap } ?? gap
     }
 
     /// Drop what is held, after a seek or a loop.

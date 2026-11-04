@@ -150,6 +150,25 @@ struct InterpolatingFrameSourceTests {
         #expect(!taken.contains { $0.standsIn })
     }
 
+    @Test("a 60 fps source plays at 120 fps through the fast tier; a 24 fps one through the slow tier")
+    func tiersPickByRate() {
+        for (fps, slowMakes) in [(60.0, false), (24.0, true)] {
+            let inner = FakeSource(fps: fps, luma: { UInt8((10 + 2 * $0) % 250) })
+            let slow = FakeInterpolator(), fast = FakeInterpolator()
+            let source = InterpolatingFrameSource(
+                wrapping: inner,
+                tiers: [.init(fast, upTo: InterpolatingFrameSource.maxFastSourceFrameRate),
+                        .init(slow, upTo: InterpolatingFrameSource.maxSourceFrameRate)])
+            #expect(source.highestSourceFrameRate == InterpolatingFrameSource.maxFastSourceFrameRate)
+            let taken = Self.play(source, to: 1.5)
+            #expect((slow.made > 0) == slowMakes, "\(fps) fps: slow made \(slow.made)")
+            #expect((fast.made > 0) == !slowMakes, "\(fps) fps: fast made \(fast.made)")
+            let settled = taken.drop { $0.seconds < 0.5 }
+            let steps = zip(settled, settled.dropFirst()).map { $1.seconds - $0.seconds }
+            #expect(!steps.isEmpty && steps.allSatisfy { abs($0 - 0.5 / fps) < 0.001 }, "\(fps) fps doubled")
+        }
+    }
+
     @Test("after a seek no frame from before it comes out")
     func seekDropsOldFrames() {
         let inner = FakeSource(fps: 24, luma: { UInt8(($0 * 3) % 250) })

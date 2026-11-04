@@ -90,11 +90,25 @@ func interpolate(_ o: Options) throws {
 private func interpolateMono(_ o: Options, width w: Int, height h: Int) throws {
     guard o.output != "-" else { usage("interpolate needs --output FILE.bgra") }
     guard o.positional.count == 1 else { usage("interpolate reads one FILE or -") }
-    guard #available(macOS 26.0, *), VTMidFrameInterpolator.isSupported else {
-        throw FormatError("VideoToolbox's low-latency frame interpolation isn't supported here")
+    let interpolator: MidFrameInterpolator
+    var gpuMilliseconds: () -> Double = { 0 }
+    if o.gpuFlow {
+        guard let flow = FlowMidFrameInterpolator() else {
+            throw FormatError("no Metal device, or the flow kernels didn't compile")
+        }
+        interpolator = flow
+        gpuMilliseconds = { flow.lastGPUMilliseconds }
+    } else {
+        guard #available(macOS 26.0, *), VTMidFrameInterpolator.isSupported else {
+            throw FormatError("VideoToolbox's low-latency frame interpolation isn't supported here")
+        }
+        let vt = VTMidFrameInterpolator(guardsResults: !o.noGuard)
+        interpolator = vt
+        if !o.noGuard { gpuMilliseconds = { vt.guardGPUMilliseconds } }
     }
-    let interpolator = VTMidFrameInterpolator(guardsResults: !o.noGuard)
-    guard interpolator.prepare(width: w, height: h, scale: 1) else { throw FormatError("can't interpolate \(w)x\(h)") }
+    guard interpolator.prepare(width: w, height: h, scale: o.scale ?? 1) else {
+        throw FormatError("can't interpolate \(w)x\(h)")
+    }
     let input = o.positional[0] == "-" ? FileHandle.standardInput
         : try FileHandle(forReadingFrom: URL(fileURLWithPath: o.positional[0]))
     FileManager.default.createFile(atPath: o.output, contents: nil)
@@ -124,7 +138,7 @@ private func interpolateMono(_ o: Options, width w: Int, height h: Int) throws {
             done.wait()
             if let mid = result.0 {
                 ms.append(result.1)
-                if !o.noGuard { guardMs.append(interpolator.guardGPUMilliseconds) }
+                if o.gpuFlow || !o.noGuard { guardMs.append(gpuMilliseconds()) }
                 try out.write(contentsOf: bytes(of: mid))
                 made += 1
             } else {
@@ -137,9 +151,10 @@ private func interpolateMono(_ o: Options, width w: Int, height h: Int) throws {
     }) {}
     let median = ms.isEmpty ? .nan : ms.sorted()[ms.count / 2]
     let guardMedian = guardMs.isEmpty ? 0 : guardMs.sorted()[guardMs.count / 2]
-    log(String(format: "vergence: %d in-between frames (VideoToolbox), %d failed; %.1f ms median a frame%@",
-               made, failed, median,
-               guardMs.isEmpty ? "" : String(format: " (guard GPU %.2f ms median, %.2f max)", guardMedian, guardMs.max() ?? 0)))
+    log(String(format: "vergence: %d in-between frames (%@), %d failed; %.1f ms median a frame%@",
+               made, o.gpuFlow ? "GPU flow" : "VideoToolbox", failed, median,
+               guardMs.isEmpty ? "" : String(format: " (%@ GPU %.2f ms median, %.2f max)",
+                                             o.gpuFlow ? "flow" : "guard", guardMedian, guardMs.max() ?? 0)))
 }
 
 private func bgraBuffer(_ data: Data, width: Int, height: Int) throws -> CVPixelBuffer {

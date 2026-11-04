@@ -43,7 +43,13 @@ extension MidFrameInterpolator {
 /// What it never interpolates across: a cut (the held-depth policy's luma
 /// grid), a seek or a dropped frame (a gap unlike the source's spacing), a
 /// speed above 1.1× (the frames are already coming faster), or a source above
-/// `maxSourceFrameRate`. Those frames pass through as they came.
+/// every tier's `maxSourceFrameRate`. Those frames pass through as they came.
+///
+/// **Tiers** pick the interpolator by the source's rate: the first whose
+/// `maxSourceFrameRate` the source doesn't exceed. A flat player doubles 24-30
+/// fps with VideoToolbox (the better guesser) and 50-60 fps with
+/// `FlowMidFrameInterpolator` (the one fast enough for an in-between frame
+/// every 16.7 ms); see `Engine`.
 ///
 /// **It reads one real frame ahead.** The pump asks for the frame 1.5 of its
 /// spacings past the last one it took; once in-between frames halve that
@@ -65,14 +71,42 @@ extension MidFrameInterpolator {
 /// back up. It reacts to the slowdown, not to the thermal state, which a
 /// headset reported as serious the moment a 2D video opened (2026-11-01).
 public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Sendable {
-    /// Sources above this rate pass through: 48 and 60 fps are smooth already.
+    /// VideoToolbox's tier: sources above this rate are too fast for it (an
+    /// in-between frame every 16.7 ms at 60 fps, where it takes 5-18) and
+    /// pass through unless a faster tier takes them.
     public static let maxSourceFrameRate = 40.0
+    /// The GPU flow tier: 50 and 60 fps (59.94 included), doubled to 100 and
+    /// 120 for a display that has them.
+    public static let maxFastSourceFrameRate = 61.0
+
+    /// An interpolator and the fastest source it takes.
+    public struct Tier: Sendable {
+        public let interpolator: MidFrameInterpolator
+        public let maxSourceFrameRate: Double
+        public init(_ interpolator: MidFrameInterpolator, upTo maxSourceFrameRate: Double) {
+            self.interpolator = interpolator
+            self.maxSourceFrameRate = maxSourceFrameRate
+        }
+    }
+
+    /// Which interpolator makes the in-between frames.
+    public enum Engine: Sendable {
+        /// VideoToolbox up to 40 fps; faster sources pass through (AI 3D,
+        /// whose depth model couldn't keep up with 120 eyes a second anyway).
+        case videoToolbox
+        /// VideoToolbox up to 40 fps and the GPU flow interpolator for 50-60 fps.
+        case automatic
+        /// The GPU flow interpolator for every source up to 60 fps (to compare
+        /// it with VideoToolbox on 24-30 fps).
+        case gpu
+    }
     /// Interpolations whose median the governor judges speed by.
     static let timingWindow = 12
     static let maxPlaybackRate = 1.1
 
     private let inner: LookaheadFrameSource
-    private let interpolator: MidFrameInterpolator
+    /// Slowest first.
+    private let tiers: [Tier]
     private let work = DispatchQueue(label: "vergence.interpolation", qos: .userInteractive)
     private let lock = NSLock()
 
@@ -87,32 +121,64 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
     private var preparedSize: (width: Int, height: Int)?
     private var preparedOK = false
     private var preparedScale = 1.0
+    private var preparedFor: ObjectIdentifier?
     /// Recent interpolation times with conversions, at the current scale.
     private var recentMs: [Double] = []
     private var preparing = false
     private var stats = Stats()
     private var governor: InterpolationGovernor
 
-    public init(wrapping inner: LookaheadFrameSource, interpolator: MidFrameInterpolator,
+    public init(wrapping inner: LookaheadFrameSource, tiers: [Tier],
                 thresholds: InterpolationGovernor.Thresholds = .depthPump) {
+        precondition(!tiers.isEmpty, "an interpolating source needs an interpolator")
         self.inner = inner
-        self.interpolator = interpolator
+        self.tiers = tiers.sorted { $0.maxSourceFrameRate < $1.maxSourceFrameRate }
         self.lastSequence = inner.sequence
         self.governor = InterpolationGovernor(thresholds: thresholds)
     }
 
-    /// `inner` wrapped with VideoToolbox's low-latency interpolator, or
-    /// `inner` itself where that doesn't exist (the simulator, older systems).
+    /// One interpolator for sources up to `maxSourceFrameRate`.
+    public convenience init(wrapping inner: LookaheadFrameSource, interpolator: MidFrameInterpolator,
+                            maxSourceFrameRate: Double = InterpolatingFrameSource.maxSourceFrameRate,
+                            thresholds: InterpolationGovernor.Thresholds = .depthPump) {
+        self.init(wrapping: inner, tiers: [Tier(interpolator, upTo: maxSourceFrameRate)], thresholds: thresholds)
+    }
+
+    /// The fastest source any tier interpolates.
+    public var highestSourceFrameRate: Double { tiers.last?.maxSourceFrameRate ?? 0 }
+
+    /// `inner` wrapped with the interpolators `engine` names that exist here,
+    /// or `inner` itself where none does. VideoToolbox's exists only on a
+    /// device or a Mac (not the simulator); the GPU one wherever Metal does.
     public static func wrappingIfSupported(_ inner: LookaheadFrameSource,
-                                           thresholds: InterpolationGovernor.Thresholds = .depthPump) -> LookaheadFrameSource {
+                                           thresholds: InterpolationGovernor.Thresholds = .depthPump,
+                                           engine: Engine = .videoToolbox) -> LookaheadFrameSource {
+        var tiers: [Tier] = []
+        if engine != .gpu, let vt = makeVideoToolboxInterpolator() {
+            tiers.append(Tier(vt, upTo: maxSourceFrameRate))
+        }
+        if engine != .videoToolbox {
+            if let flow = FlowMidFrameInterpolator() {
+                tiers.append(Tier(flow, upTo: maxFastSourceFrameRate))
+            } else {
+                VergenceLog.pipeline.error("frame interpolation: GPU interpolator unavailable (no Metal, or its kernels failed)")
+            }
+        }
+        guard !tiers.isEmpty else {
+            VergenceLog.pipeline.notice("frame interpolation: not supported here, playing source frames")
+            return inner
+        }
+        return InterpolatingFrameSource(wrapping: inner, tiers: tiers, thresholds: thresholds)
+    }
+
+    private static func makeVideoToolboxInterpolator() -> MidFrameInterpolator? {
         #if targetEnvironment(simulator)
-        return inner
+        return nil
         #else
         if #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *), VTMidFrameInterpolator.isSupported {
-            return InterpolatingFrameSource(wrapping: inner, interpolator: VTMidFrameInterpolator(), thresholds: thresholds)
+            return VTMidFrameInterpolator()
         }
-        VergenceLog.pipeline.notice("frame interpolation: not supported here, playing source frames")
-        return inner
+        return nil
         #endif
     }
 
@@ -214,13 +280,17 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
             stats.passed += 1
             return reason.leavesOutMidFrame ? real.standingIn : real
         }
+        guard let interpolator = tier?.interpolator else {
+            stats.passed += 1
+            return real
+        }
         inFlight = true
         let requestGeneration = generation
         let midSeconds = (before.itemTime.seconds + seconds) / 2
         let midTime = CMTime(seconds: midSeconds, preferredTimescale: 600_000)
         let submitted = CACurrentMediaTime()
         let beforeSeconds = before.itemTime.seconds
-        work.async { [weak self, interpolator] in
+        work.async { [weak self] in
             interpolator.midFrame(between: before.pixelBuffer, at: beforeSeconds, and: real.pixelBuffer,
                                   at: seconds) { [weak self] mid, processMs in
                 guard let self else { return }
@@ -243,11 +313,17 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
         return nil
     }
 
-    /// The source's spacing when it's slow enough to interpolate.
+    /// The source's spacing when some tier is slow enough to interpolate it.
     private var eligibleSpacing: Double? {
         let spacing = realSpacing.seconds
-        guard spacing.isFinite, spacing >= 1 / Self.maxSourceFrameRate else { return nil }
+        guard spacing.isFinite, spacing >= 1 / highestSourceFrameRate else { return nil }
         return spacing
+    }
+
+    /// The tier for the source's rate, nil while it's unknown or too fast.
+    private var tier: Tier? {
+        guard let spacing = eligibleSpacing else { return nil }
+        return tiers.first { spacing >= 1 / $0.maxSourceFrameRate }
     }
 
     enum SkipReason: String {
@@ -276,24 +352,28 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
         guard CVPixelBufferGetWidth(before.pixelBuffer) == width,
               CVPixelBufferGetHeight(before.pixelBuffer) == height else { return .size }
         let scale = governor.scale
-        if let size = preparedSize, size.width == width, size.height == height, preparedScale == scale {
+        guard let interpolator = tier?.interpolator else { return .fast }
+        let id = ObjectIdentifier(interpolator)
+        if let size = preparedSize, size.width == width, size.height == height, preparedScale == scale,
+           preparedFor == id {
             return preparedOK ? nil : .size
         }
         if !preparing {
             preparing = true
             preparedSize = nil
-            work.async { [weak self, interpolator] in
+            work.async { [weak self] in
                 let started = CACurrentMediaTime()
                 let ok = interpolator.prepare(width: width, height: height, scale: scale)
                 let ms = (CACurrentMediaTime() - started) * 1000
                 VergenceLog.pipeline.notice(
-                    "frame interpolation: \(width)×\(height) at \(scale * 100, format: .fixed(precision: 0), privacy: .public)% \(ok ? "ready" : "unavailable", privacy: .public) in \(ms, format: .fixed(precision: 0), privacy: .public) ms"
+                    "frame interpolation: \(String(describing: type(of: interpolator)), privacy: .public) \(width)×\(height) at \(scale * 100, format: .fixed(precision: 0), privacy: .public)% \(ok ? "ready" : "unavailable", privacy: .public) in \(ms, format: .fixed(precision: 0), privacy: .public) ms"
                 )
                 guard let self else { return }
                 self.lock.withLock {
                     self.preparing = false
                     self.preparedSize = (width, height)
                     self.preparedScale = scale
+                    self.preparedFor = id
                     self.preparedOK = ok
                 }
             }

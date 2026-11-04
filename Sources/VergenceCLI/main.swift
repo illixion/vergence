@@ -19,7 +19,7 @@
    vergence analyze DISC|BASE.m2ts [DEPENDENT.m2ts] --models DIR [--seek S] [--frames N] [--output FILE.vgat]
    vergence analyze --raw WxH [--rate N/D] FILE|- --models DIR --output FILE.vgat
    vergence interpolate --raw WxH [--rate N/D] FILE|- --fields FILE.vgat --output FILE.bgra
-   vergence interpolate --raw WxH FILE|- [--no-guard] --output FILE.bgra   (mono, VideoToolbox)
+   vergence interpolate --raw WxH FILE|- [--no-guard | --gpu] --output FILE.bgra   (mono, VideoToolbox or GPU flow)
 
    options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N
             --output FILE|-
@@ -142,7 +142,7 @@ func usage(_ problem: String? = nil) -> Never {
            vergence analyze DISC|BASE.m2ts [DEPENDENT.m2ts] --models DIR [--seek S] [--frames N] [--output FILE.vgat]
            vergence analyze --raw WxH [--rate N/D] FILE|- --models DIR --output FILE.vgat
            vergence interpolate --raw WxH [--rate N/D] FILE|- --fields FILE.vgat --output FILE.bgra
-           vergence interpolate --raw WxH FILE|- [--no-guard] --output FILE.bgra   (mono, VideoToolbox)
+           vergence interpolate --raw WxH FILE|- [--no-guard | --gpu] --output FILE.bgra   (mono, VideoToolbox or GPU flow)
     options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N  --output FILE|-
              --header "Name: value" (for an http(s) DISC)
              a value follows its option or an "=": --adjust -0.02, --adjust=-0.02

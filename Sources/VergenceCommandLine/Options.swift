@@ -57,6 +57,12 @@ public struct Options: Equatable, Sendable {
     public var fields: String?
     /// `interpolate --no-guard` (mono): VideoToolbox's frames as they come, without `InterpolationGuard`.
     public var noGuard = false
+    /// `interpolate --gpu` (mono): `FlowMidFrameInterpolator`'s frames (block-matched motion on the GPU,
+    /// Smooth Motion's 60 → 120 fps path) instead of VideoToolbox's.
+    public var gpuFlow = false
+    /// `interpolate --scale S` (mono): the share of the frame's size the interpolator works at, as the
+    /// governor's smaller step (0.67) runs it.
+    public var scale: Double?
 
     public init() {}
 }
@@ -199,6 +205,13 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
         case "--models": o.models = try value()
         case "--fields": o.fields = try value()
         case "--no-guard": try flag(); o.noGuard = true
+        case "--gpu": try flag(); o.gpuFlow = true
+        case "--scale":
+            let text = try value()
+            guard let scale = Double(text), scale > 0, scale <= 1 else {
+                throw UsageError("--scale takes a share of the frame's size, 0...1, not \"\(text)\"")
+            }
+            o.scale = scale
         default: throw UsageError("unknown option \(name)")
         }
     }

@@ -41,7 +41,7 @@ struct InterpolatedFramePresenterTests {
         var shown: [Shown] = []
         Self.play(presenter, to: 2, shown: &shown)
 
-        #expect(shown.allSatisfy { $0.seconds <= $0.playhead + 1e-6 }, "nothing shown early")
+        #expect(shown.allSatisfy { $0.seconds <= $0.playhead + 0.5 / 96 + 1e-6 }, "nothing shown over half a tick early")
         let settled = shown.drop { $0.playhead < 0.5 }
         #expect(settled.count > 60)
         let steps = zip(settled, settled.dropFirst()).map { $1.seconds - $0.seconds }
@@ -65,6 +65,24 @@ struct InterpolatedFramePresenterTests {
         let steps = zip(settled, settled.dropFirst()).map { $1.seconds - $0.seconds }
         #expect(steps.allSatisfy { abs($0 - 1.0 / 60) < 0.001 })
         #expect(interpolator.made == 0)
+    }
+
+    @Test("a 60 fps source with a fast tier shows at 120 fps on a 120 Hz draw loop, none skipped")
+    func doublesSixty() {
+        let inner = Fakes.FakeSource(fps: 60, luma: { UInt8((10 + 2 * $0) % 250) })
+        let fast = Fakes.FakeInterpolator()
+        let source = InterpolatingFrameSource(
+            wrapping: inner, tiers: [.init(fast, upTo: InterpolatingFrameSource.maxFastSourceFrameRate)],
+            thresholds: .flat)
+        let presenter = InterpolatedFramePresenter(source: source)
+        var shown: [Shown] = []
+        Self.play(presenter, to: 1.5, hz: 120, shown: &shown)
+        #expect(shown.allSatisfy { $0.seconds <= $0.playhead + 0.5 / 120 + 1e-6 }, "nothing shown over half a tick early")
+        let settled = shown.drop { $0.playhead < 0.5 }
+        #expect(settled.count > 100)
+        let steps = zip(settled, settled.dropFirst()).map { $1.seconds - $0.seconds }
+        #expect(steps.allSatisfy { abs($0 - 1.0 / 120) < 0.001 }, "every half frame, none skipped")
+        #expect(fast.made > 50)
     }
 
     @Test("a seek back starts over at the new playhead and keeps doubling")
