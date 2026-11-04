@@ -72,8 +72,9 @@ public struct FrameColorSignal: Sendable, Equatable {
 /// than repeat a frame the pump has already seen — a tick that re-warps the
 /// same frame costs a full GPU pass and enqueues a duplicate.
 ///
-/// **Frames must be `kCVPixelFormatType_32BGRA` and Metal-compatible.** The pump
-/// binds plane 0 as one `.bgra8Unorm` texture, so a 4:2:0 buffer does not fail —
+/// **Frames must be `kCVPixelFormatType_32BGRA` (or, for an HDR picture,
+/// `kCVPixelFormatType_64RGBAHalf`, `FramePixelFormat`) and Metal-compatible.**
+/// The pump binds plane 0 as one texture, so a 4:2:0 buffer does not fail —
 /// it renders, with each texel eating four luma bytes, which comes out as four
 /// side-by-side greyscale copies of the frame at a quarter width each. Configure
 /// `AVPlayerItemVideoOutput` or the `VTDecompressionSession` accordingly;
@@ -142,16 +143,60 @@ public final class AVPlayerFrameSource: LookaheadFrameSource, @unchecked Sendabl
     /// nothing ahead before the player first plays), measured on a Mac
     /// 2026-10-27 with the same output settings.
     public let decodesAheadWhilePaused = false
-    private let output: AVPlayerItemVideoOutput
+    private let lock = NSLock()
+    private var currentOutput: AVPlayerItemVideoOutput
+    private var output: AVPlayerItemVideoOutput { lock.withLock { currentOutput } }
     private weak var item: AVPlayerItem?
+    /// Swap a BGRA output for a half-float one once a frame says PQ/HLG.
+    private let upgradesForHDR: Bool
+    private var upgradeStarted = false
     public var endTime: Double? {
         guard let value = item?.duration.seconds, value.isFinite, value > 0 else { return nil }
         return value
     }
 
-    public init(output: AVPlayerItemVideoOutput, item: AVPlayerItem? = nil) {
+    /// - Parameter upgradesForHDR: once a frame says PQ or HLG, the BGRA output
+    ///   is replaced by a half-float one on the item (`FramePixelFormat.hdr`):
+    ///   AVFoundation hands HDR frames over still encoded, and 8 bits of PQ
+    ///   band. Nothing says whether a stream is HDR before its first frame
+    ///   (an HLS item has no track format until it plays), so the first few
+    ///   frames come as BGRA. Needs `item`.
+    public init(output: AVPlayerItemVideoOutput, item: AVPlayerItem? = nil, upgradesForHDR: Bool = false) {
         self.item = item
-        self.output = output
+        self.currentOutput = output
+        self.upgradesForHDR = upgradesForHDR
+    }
+
+    /// The output now in use (it changes once for HDR, `upgradesForHDR`).
+    public var videoOutput: AVPlayerItemVideoOutput { output }
+
+    private func upgradeIfHDR(_ buffer: CVPixelBuffer) {
+        guard upgradesForHDR, CVPixelBufferGetPixelFormatType(buffer) == FramePixelFormat.sdr,
+              FramePixelFormat.forTransfer(CVBufferCopyAttachment(buffer, kCVImageBufferTransferFunctionKey, nil),
+                                           width: CVPixelBufferGetWidth(buffer),
+                                           height: CVPixelBufferGetHeight(buffer)) == FramePixelFormat.hdr
+        else { return }
+        let start = lock.withLock { () -> Bool in
+            guard !upgradeStarted else { return false }
+            upgradeStarted = true
+            return true
+        }
+        guard start else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let item = self.item else { return }
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: FramePixelFormat.hdr,
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ])
+            item.add(output)
+            let old = self.lock.withLock { () -> AVPlayerItemVideoOutput in
+                let old = self.currentOutput
+                self.currentOutput = output
+                return old
+            }
+            item.remove(old)
+            VergenceLog.pipeline.notice("frame source: HDR picture, frames now half float")
+        }
     }
 
     public func nextFrame(hostTime: CFTimeInterval) -> PumpFrame? {
@@ -168,6 +213,7 @@ public final class AVPlayerFrameSource: LookaheadFrameSource, @unchecked Sendabl
               let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &presentationTime) else {
             return nil
         }
+        upgradeIfHDR(buffer)
         // The frame's own time, not the one asked for: that runs up to a
         // frame past it, so cached depth could match the next frame's, and
         // frame gaps would be the asking's spacing.

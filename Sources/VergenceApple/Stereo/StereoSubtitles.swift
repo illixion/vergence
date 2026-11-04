@@ -212,6 +212,7 @@ final class StereoSubtitleCompositor: @unchecked Sendable {
 
     private let device: MTLDevice
     private let quadPipeline: MTLRenderPipelineState
+    private let quadPipelineHDR: MTLRenderPipelineState
     private let matchPipeline: MTLComputePipelineState
     private let matchResults: MTLBuffer
 
@@ -244,16 +245,20 @@ final class StereoSubtitleCompositor: @unchecked Sendable {
         descriptor.vertexFunction = vertex
         descriptor.fragmentFunction = fragment
         let color = descriptor.colorAttachments[0]!
-        color.pixelFormat = .bgra8Unorm
         color.isBlendingEnabled = true
         // Premultiplied source over the eye image.
         color.sourceRGBBlendFactor = .one
         color.destinationRGBBlendFactor = .oneMinusSourceAlpha
         color.sourceAlphaBlendFactor = .one
         color.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        color.pixelFormat = .bgra8Unorm
         guard let quadPipeline = try? device.makeRenderPipelineState(descriptor: descriptor) else { return nil }
+        // HDR eyes are half float.
+        color.pixelFormat = .rgba16Float
+        guard let quadPipelineHDR = try? device.makeRenderPipelineState(descriptor: descriptor) else { return nil }
         self.device = device
         self.quadPipeline = quadPipeline
+        self.quadPipelineHDR = quadPipelineHDR
         self.matchPipeline = matchPipeline
         self.matchResults = results
     }
@@ -323,7 +328,7 @@ final class StereoSubtitleCompositor: @unchecked Sendable {
             pass.colorAttachments[0].loadAction = .load
             pass.colorAttachments[0].storeAction = .store
             guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
-            encoder.setRenderPipelineState(quadPipeline)
+            encoder.setRenderPipelineState(texture.pixelFormat == .rgba16Float ? quadPipelineHDR : quadPipeline)
             for (item, rect) in zip(overlay.items, rects) {
                 // Crossed disparity reads as in front: the left eye's copy
                 // moves right, the right eye's left.

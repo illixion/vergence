@@ -90,6 +90,9 @@ public final class StereoWarpResources: Sendable {
     /// `nil` when Metal or the shader library is unavailable, which callers
     /// treat as "fake-3D unavailable" rather than an error.
     public static let shared = StereoWarpResources()
+    /// The same into half-float eye targets, for an HDR picture (PQ/HLG code
+    /// values, which 8 bits band).
+    public static let sharedHDR = StereoWarpResources(pixelFormat: .rgba16Float)
 
     public let device: MTLDevice
     /// Per-pixel backward warp (heuristic fallback; the real-depth path always
@@ -137,9 +140,9 @@ public final class StereoWarpResources: Sendable {
     public nonisolated(unsafe) let denseGridIndices: MTLBuffer
     public let denseGridIndexCount: Int
 
-    private convenience init?() {
+    private convenience init?(pixelFormat: MTLPixelFormat = .bgra8Unorm) {
         guard let metal = VergenceMetal.shared else { return nil }
-        self.init(device: metal.device, library: metal.library)
+        self.init(device: metal.device, library: metal.library, pixelFormat: pixelFormat)
     }
 
     init?(device: MTLDevice, library: MTLLibrary, pixelFormat: MTLPixelFormat = .bgra8Unorm) {
@@ -181,13 +184,14 @@ public final class StereoWarpResources: Sendable {
         self.denseGridIndexCount = dense.indexCount
 
         do {
-            // Pseudo-3D eye warp: opaque write into a bgra8 IOSurface-backed eye
-            // texture (no blending — each eye is a full opaque frame).
+            // Pseudo-3D eye warp: opaque write into an IOSurface-backed eye
+            // texture (bgra8, or half float for HDR; no blending — each eye is
+            // a full opaque frame).
             let stereoDesc = MTLRenderPipelineDescriptor()
             stereoDesc.vertexFunction = vertexFunction
             stereoDesc.fragmentFunction = stereoEyeFn
             stereoDesc.colorAttachments[0].isBlendingEnabled = false
-            stereoDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            stereoDesc.colorAttachments[0].pixelFormat = pixelFormat
             self.eyePipelineState = try device.makeRenderPipelineState(descriptor: stereoDesc)
             stereoDesc.fragmentFunction = packedEyeFn
             self.packedEyePipelineState = try device.makeRenderPipelineState(descriptor: stereoDesc)

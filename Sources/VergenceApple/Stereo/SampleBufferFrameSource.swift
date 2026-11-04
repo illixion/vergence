@@ -35,6 +35,7 @@ public final class SampleBufferFrameSource: LookaheadFrameSource, @unchecked Sen
     private var transfer: VTPixelTransferSession?
     private var transferPool: CVPixelBufferPool?
     private var transferPoolSize = (width: 0, height: 0)
+    private var transferPoolFormat: OSType = 0
 
     public var sequence: Int { lock.withLock { generation } }
     public let endTime: Double?
@@ -135,8 +136,13 @@ public final class SampleBufferFrameSource: LookaheadFrameSource, @unchecked Sen
                 awaitingKeyframe = false
             }
             if session == nil {
+                // An HDR film decodes to half float: its PQ/HLG code values
+                // band in 8 bits (`FramePixelFormat`).
+                let transfer = CMFormatDescriptionGetExtension(format, extensionKey: kCMFormatDescriptionExtension_TransferFunction)
+                let dimensions = CMVideoFormatDescriptionGetDimensions(format)
                 let attributes: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                    kCVPixelBufferPixelFormatTypeKey as String: FramePixelFormat.forTransfer(
+                        transfer, width: Int(dimensions.width), height: Int(dimensions.height)),
                     kCVPixelBufferMetalCompatibilityKey as String: true,
                     kCVPixelBufferIOSurfacePropertiesKey as String: [:],
                 ]
@@ -187,13 +193,17 @@ public final class SampleBufferFrameSource: LookaheadFrameSource, @unchecked Sen
         CMTimebaseGetRate(timebase)
     }
 
-    /// `image` as BGRA, through a pixel transfer when it isn't already.
+    /// `image` as BGRA (half float for an HDR picture), through a pixel
+    /// transfer when it isn't already.
     private func bgra(_ image: CVPixelBuffer) -> CVPixelBuffer? {
-        if CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_32BGRA { return image }
         let width = CVPixelBufferGetWidth(image), height = CVPixelBufferGetHeight(image)
-        if transferPool == nil || transferPoolSize != (width, height) {
+        let target = FramePixelFormat.forTransfer(
+            CVBufferCopyAttachment(image, kCVImageBufferTransferFunctionKey, nil), width: width, height: height)
+        if CVPixelBufferGetPixelFormatType(image) == target { return image }
+        if transferPool == nil || transferPoolSize != (width, height) || transferPoolFormat != target {
+            transferPoolFormat = target
             let attributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey as String: target,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
                 kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -208,8 +218,11 @@ public final class SampleBufferFrameSource: LookaheadFrameSource, @unchecked Sen
         }
         guard let transferPool, let transfer else { return nil }
         var out: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, transferPool, &out) == kCVReturnSuccess, let out,
-              VTPixelTransferSessionTransferImage(transfer, from: image, to: out) == noErr else { return nil }
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, transferPool, &out) == kCVReturnSuccess, let out
+        else { return nil }
+        // Same colour on both sides, so the transfer converts the format only.
+        CVBufferPropagateAttachments(image, out)
+        guard VTPixelTransferSessionTransferImage(transfer, from: image, to: out) == noErr else { return nil }
         return out
     }
 

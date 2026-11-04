@@ -605,9 +605,11 @@ final class RealtimeDepthRefiner {
 
     private func videoTexture(_ frame: CVPixelBuffer) -> (texture: MTLTexture, keepAlive: [Any])? {
         var cvTexture: CVMetalTexture?
-        guard CVPixelBufferGetPixelFormatType(frame) == kCVPixelFormatType_32BGRA,
+        // BGRA, or half float for an HDR picture (its code values, as BGRA
+        // carried them before).
+        guard let format = FramePixelFormat.metal(CVPixelBufferGetPixelFormatType(frame)),
               CVMetalTextureCacheCreateTextureFromImage(
-                nil, textureCache, frame, nil, .bgra8Unorm,
+                nil, textureCache, frame, nil, format,
                 CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame), 0, &cvTexture
               ) == kCVReturnSuccess,
               let cvTexture, let texture = CVMetalTextureGetTexture(cvTexture) else { return nil }

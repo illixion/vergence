@@ -22,10 +22,16 @@ public enum FramePixelFormat {
         }
     }
 
+    /// The most pixels a half-float frame may have: 2560×1440. A 4K one is
+    /// 66 MB, so the stereo pump's 256 MB reserve would hold three frames
+    /// (and the eyes as much again); above this an HDR picture stays BGRA.
+    public static let maxHDRPixels = 2560 * 1440
+
     /// The frame format for a picture with this transfer function
-    /// (`kCVImageBufferTransferFunctionKey`): half float for PQ and HLG.
-    public static func forTransfer(_ transfer: CFTypeRef?) -> OSType {
-        isHDR(transfer: transfer) ? hdr : sdr
+    /// (`kCVImageBufferTransferFunctionKey`) and size: half float for PQ and
+    /// HLG up to `maxHDRPixels`.
+    public static func forTransfer(_ transfer: CFTypeRef?, width: Int = 0, height: Int = 0) -> OSType {
+        isHDR(transfer: transfer) && width * height <= maxHDRPixels ? hdr : sdr
     }
 
     public static func isHDR(transfer: CFTypeRef?) -> Bool {

@@ -123,6 +123,15 @@ public final class StereoPump: @unchecked Sendable {
     private let frameSource: PumpFrameSource
     private lazy var meshWarp = StereoMeshWarp(resources: warp)
     private let warp: StereoWarpResources
+    /// The warp's pipelines into half-float eyes, for an HDR picture: PQ and
+    /// HLG code values through 8-bit eyes banded every sky and gradient, and
+    /// a 10-bit compositor buffer holds what half float carries.
+    private let hdrWarp = StereoWarpResources.sharedHDR
+    private lazy var hdrMeshWarp = hdrWarp.map { StereoMeshWarp(resources: $0) }
+    /// Pump-queue only: the frame being drawn is HDR (half-float RGBA).
+    private var drawingHDR = false
+    /// The warp resources for the frame being drawn.
+    private var activeWarp: StereoWarpResources { drawingHDR ? (hdrWarp ?? warp) : warp }
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private lazy var boundaryWarp = VergenceMetal.shared.flatMap {
@@ -131,6 +140,10 @@ public final class StereoPump: @unchecked Sendable {
     private lazy var layeredWarp = VergenceMetal.shared.flatMap {
         StereoLayeredWarp(device: device, library: $0.library, pixelFormat: .bgra8Unorm,
                           sampleCount: warp.msaaSampleCount)
+    }
+    private lazy var hdrLayeredWarp = VergenceMetal.shared.flatMap {
+        StereoLayeredWarp(device: device, library: $0.library, pixelFormat: .rgba16Float,
+                          sampleCount: hdrWarp?.msaaSampleCount ?? warp.msaaSampleCount)
     }
     private let startHostTime: CFTimeInterval
     private let onVideoSizeKnown: @Sendable (CGSize) -> Void
@@ -153,13 +166,15 @@ public final class StereoPump: @unchecked Sendable {
 
     private var textureCache: CVMetalTextureCache?
     /// BGRA Metal render targets for the warp (intermediate, not handed to the
-    /// compositor).
+    /// compositor); half-float RGBA for an HDR picture.
     private var bgraPool: CVPixelBufferPool?
-    /// 420v buffers handed to the renderer — built exactly like the validated
-    /// test pattern (merged with `recommendedPixelBufferAttributes`).
+    /// 420f buffers handed to the renderer — built exactly like the validated
+    /// test pattern (merged with `recommendedPixelBufferAttributes`); 10-bit
+    /// `xf20` for an HDR picture.
     private var outPool: CVMutablePixelBuffer.Pool?
     private var poolWidth = 0
     private var poolHeight = 0
+    private var poolHDR = false
     /// Converts the BGRA warp output into the compositor's native 420v format.
     private let transferSession: VTPixelTransferSession
     /// Per-frame depth: realtime inference or PTS-matched cached depth (nil →
@@ -471,7 +486,9 @@ public final class StereoPump: @unchecked Sendable {
             self.outPool = nil
             self.boundaryWarp = nil
             self.layeredWarp = nil
+            self.hdrLayeredWarp = nil
             self.meshWarp.reset()
+            self.hdrMeshWarp?.reset()
         }
     }
 
@@ -1008,8 +1025,9 @@ public final class StereoPump: @unchecked Sendable {
             ?? CGSize(width: width, height: height)
         let eyeWidth = Int(eyeSize.width)
         let eyeHeight = Int(eyeSize.height)
+        drawingHDR = CVPixelBufferGetPixelFormatType(src) == FramePixelFormat.hdr
         guard width > 0, height > 0, eyeWidth > 0, eyeHeight > 0,
-              ensurePools(width: eyeWidth, height: eyeHeight),
+              ensurePools(width: eyeWidth, height: eyeHeight, hdr: drawingHDR),
               let bgraPool, let outPool,
               let srcTexture = makeTexture(from: src, cache: cache) else { return nil }
 
@@ -1020,6 +1038,9 @@ public final class StereoPump: @unchecked Sendable {
         guard CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, bgraPool, aux as CFDictionary, &leftBGRA) == kCVReturnSuccess,
               CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, bgraPool, aux as CFDictionary, &rightBGRA) == kCVReturnSuccess,
               let leftBGRA, let rightBGRA,
+              // The eyes are the source's colour (BT.2020 PQ for HDR): tagged
+              // before the conversion below, which reads the tags.
+              tagIntermediate(leftBGRA, from: src), tagIntermediate(rightBGRA, from: src),
               let leftTex = makeTexture(from: leftBGRA, cache: cache),
               let rightTex = makeTexture(from: rightBGRA, cache: cache),
               let cmdBuf = commandQueue.makeCommandBuffer() else { return nil }
@@ -1071,9 +1092,9 @@ public final class StereoPump: @unchecked Sendable {
         // must complete before VTPixelTransferSession reads the BGRA surfaces.
         cmdBuf.waitUntilCompleted()
         subtitles?.didComplete()
-        if let capture {
+        if let capture, let captureEyes = captureBuffers(left: leftBGRA, right: rightBGRA, source: src) {
             StereoEyeCapture.deliver(.init(
-                left: leftBGRA, right: rightBGRA, source: src, depth: capture.read(),
+                left: captureEyes.left, right: captureEyes.right, source: captureEyes.source, depth: capture.read(),
                 itemSeconds: itemTime.seconds, depthStrength: cfg.depthStrength, convergence: cfg.convergence,
                 warp: .init(uvScale: frameDepth?.uvScale ?? SIMD2(1, 1),
                             uvOffset: frameDepth?.uvOffset ?? .zero,
@@ -1095,11 +1116,11 @@ public final class StereoPump: @unchecked Sendable {
         let transferState = signposter.beginInterval("pump-transfer")
         defer { signposter.endInterval("pump-transfer", transferState) }
         guard let left = try? outPool.makeMutablePixelBuffer() else { return nil }
-        guard transfer(from: leftBGRA, to: left) else { return nil }
         tagColor(left, from: src)
+        guard transfer(from: leftBGRA, to: left) else { return nil }
         guard let right = try? outPool.makeMutablePixelBuffer() else { return nil }
-        guard transfer(from: rightBGRA, to: right) else { return nil }
         tagColor(right, from: src)
+        guard transfer(from: rightBGRA, to: right) else { return nil }
         let eyes = Eyes(left: CVReadOnlyPixelBuffer(left), right: CVReadOnlyPixelBuffer(right))
 
         stageTiming.warp += warpDone - drawStart
@@ -1175,6 +1196,34 @@ public final class StereoPump: @unchecked Sendable {
         )
     }
 
+    /// The source's colour tags on a warp target. Always true (for a guard).
+    private func tagIntermediate(_ buffer: CVPixelBuffer, from src: CVPixelBuffer) -> Bool {
+        for key in [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrixKey] {
+            if let value = CVBufferGetAttachment(src, key, nil)?.takeUnretainedValue() {
+                CVBufferSetAttachment(buffer, key, value, .shouldPropagate)
+            }
+        }
+        return true
+    }
+
+    /// The eyes and source for `StereoEyeCapture`, which reads BGRA: HDR ones
+    /// converted (their PQ/HLG code values, quantised; a debug view).
+    private func captureBuffers(left: CVPixelBuffer, right: CVPixelBuffer, source: CVPixelBuffer)
+        -> (left: CVPixelBuffer, right: CVPixelBuffer, source: CVPixelBuffer)? {
+        guard drawingHDR else { return (left, right, source) }
+        func bgra(_ buffer: CVPixelBuffer) -> CVPixelBuffer? {
+            guard let pool = FramePixelFormat.pool(format: FramePixelFormat.sdr, width: CVPixelBufferGetWidth(buffer),
+                                                   height: CVPixelBufferGetHeight(buffer)) else { return nil }
+            var out: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out)
+            guard let out else { return nil }
+            CVBufferPropagateAttachments(buffer, out)
+            return VTPixelTransferSessionTransferImage(transferSession, from: buffer, to: out) == noErr ? out : nil
+        }
+        guard let l = bgra(left), let r = bgra(right), let s = bgra(source) else { return nil }
+        return (l, r, s)
+    }
+
     private func transfer(from source: CVPixelBuffer, to dest: borrowing CVMutablePixelBuffer) -> Bool {
         var ok = false
         dest.withUnsafeBuffer { destBuffer in
@@ -1199,6 +1248,16 @@ public final class StereoPump: @unchecked Sendable {
             let matrix = CVBufferGetAttachment(src, kCVImageBufferYCbCrMatrixKey, nil)?.takeUnretainedValue()
                 ?? kCVImageBufferYCbCrMatrix_ITU_R_709_2
             CVBufferSetAttachment(d, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
+
+            // HDR's static metadata: without it the compositor tone-maps PQ
+            // to a guessed peak. The film's own mastering display and light
+            // levels make it map the picture as the flat player does.
+            for key in [kCVImageBufferMasteringDisplayColorVolumeKey, kCVImageBufferContentLightLevelInfoKey,
+                        kCVImageBufferAmbientViewingEnvironmentKey] {
+                if let value = CVBufferGetAttachment(src, key, nil)?.takeUnretainedValue() {
+                    CVBufferSetAttachment(d, key, value, .shouldPropagate)
+                }
+            }
         }
     }
 
@@ -1207,6 +1266,7 @@ public final class StereoPump: @unchecked Sendable {
     /// the mesh then draws alone, as it always has.
     private func prepareLayers(source: MTLTexture, depth: PumpFrameDepth?, config: Config,
                                continuesBackground: Bool, commandBuffer: MTLCommandBuffer) -> StereoLayeredWarp? {
+        let layeredWarp = drawingHDR ? hdrLayeredWarp : self.layeredWarp
         guard DepthRefinement.layersSilhouettes, !DepthRefinement.separatesBoundaries,
               let depth, !config.isFlat, let layeredWarp,
               layeredWarp.prepare(source: source, depth: depth, strength: config.depthStrength,
@@ -1249,6 +1309,7 @@ public final class StereoPump: @unchecked Sendable {
         // buffer, so a shared attachment cross-contaminated the depth test.
         let eyeIndex = eyeSign > 0 ? 0 : 1
         if let depth, DepthRefinement.separatesBoundaries, let boundaryWarp {
+            let warp = activeWarp
             let dense = depthSource?.prefersDenseWarpGrid == true
             let columns = dense ? StereoWarpResources.denseGridColumns : StereoWarpResources.gridColumns
             let u = StereoBoundaryWarp.Uniforms(
@@ -1264,6 +1325,7 @@ public final class StereoPump: @unchecked Sendable {
                 uniforms: u, commandBuffer: commandBuffer) { return }
         }
         if let depth {
+            let meshWarp = drawingHDR ? (hdrMeshWarp ?? self.meshWarp) : self.meshWarp
             _ = meshWarp.encode(source: source, depth: depth.texture, destination: dest,
                 uniforms: uniforms, dense: depthSource?.prefersDenseWarpGrid == true,
                 eye: eyeIndex, commandBuffer: commandBuffer,
@@ -1283,7 +1345,7 @@ public final class StereoPump: @unchecked Sendable {
         desc.colorAttachments[0].loadAction = .dontCare
         desc.colorAttachments[0].storeAction = .store
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return }
-        encoder.setRenderPipelineState(warp.eyePipelineState)
+        encoder.setRenderPipelineState(activeWarp.eyePipelineState)
         encoder.setFragmentTexture(source, index: 0)
         encoder.setFragmentTexture(source, index: 1) // placeholder; unused when useDepth=0
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<VideoStereoUniforms>.size, index: 0)
@@ -1335,7 +1397,7 @@ public final class StereoPump: @unchecked Sendable {
         desc.colorAttachments[0].loadAction = .dontCare
         desc.colorAttachments[0].storeAction = .store
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: desc) else { return }
-        encoder.setRenderPipelineState(warp.packedEyePipelineState)
+        encoder.setRenderPipelineState(activeWarp.packedEyePipelineState)
         encoder.setFragmentTexture(source, index: 0)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<PackedEyeUniforms>.size, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
@@ -1343,13 +1405,14 @@ public final class StereoPump: @unchecked Sendable {
     }
 
 
-    /// (Re)creates the BGRA warp pool and the 420v output pool for the current
-    /// source dimensions. Returns false if either pool can't be made.
-    private func ensurePools(width: Int, height: Int) -> Bool {
-        if bgraPool != nil, outPool != nil, poolWidth == width, poolHeight == height { return true }
+    /// (Re)creates the warp pool (BGRA, or half float for HDR) and the output
+    /// pool (420f, or 10-bit xf20 for HDR) for the current source dimensions.
+    /// Returns false if either pool can't be made.
+    private func ensurePools(width: Int, height: Int, hdr: Bool) -> Bool {
+        if bgraPool != nil, outPool != nil, poolWidth == width, poolHeight == height, poolHDR == hdr { return true }
 
         let bgraAttrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: hdr ? FramePixelFormat.hdr : kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -1365,7 +1428,8 @@ public final class StereoPump: @unchecked Sendable {
         // range, so video-range here lifts blacks / lowers whites (washed out).
         let eyeSize = CVImageSize(width: width, height: height)
         let defaultAttributes = CVPixelBufferCreationAttributes(
-            pixelFormatType: CVPixelFormatType(rawValue: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+            pixelFormatType: CVPixelFormatType(rawValue: hdr ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                                                             : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
             size: eyeSize
         )
         let recommended = videoRenderer.recommendedPixelBufferAttributes
@@ -1377,6 +1441,10 @@ public final class StereoPump: @unchecked Sendable {
         outPool = out
         poolWidth = width
         poolHeight = height
+        if poolHDR != hdr {
+            VergenceLog.pipeline.notice("pump eyes: \(hdr ? "half float → 10-bit xf20 (HDR)" : "BGRA → 420f", privacy: .public)")
+        }
+        poolHDR = hdr
         return true
     }
 
@@ -1388,15 +1456,15 @@ public final class StereoPump: @unchecked Sendable {
         // here, once, rather than leaving a new frame source to be debugged
         // from a screenshot.
         let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        if format != kCVPixelFormatType_32BGRA, !didWarnAboutPixelFormat {
+        if !FramePixelFormat.isSupported(format), !didWarnAboutPixelFormat {
             didWarnAboutPixelFormat = true
             VergenceLog.pipeline.error(
-                "frame source is not 32BGRA (\(fourCC(format), privacy: .public)) — the warp will render garbage"
+                "frame source is not 32BGRA or 64RGBAHalf (\(fourCC(format), privacy: .public)) — the warp will render garbage"
             )
         }
         var cvTexture: CVMetalTexture?
         guard CVMetalTextureCacheCreateTextureFromImage(
-            nil, cache, pixelBuffer, nil, .bgra8Unorm, width, height, 0, &cvTexture
+            nil, cache, pixelBuffer, nil, FramePixelFormat.metal(format) ?? .bgra8Unorm, width, height, 0, &cvTexture
         ) == kCVReturnSuccess, let cvTexture else { return nil }
         return CVMetalTextureGetTexture(cvTexture)
     }
