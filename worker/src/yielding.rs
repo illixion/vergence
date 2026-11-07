@@ -8,10 +8,10 @@
 //!   - another program computing on it (another model, a CUDA renderer): a
 //!     process of type `C`. Windows lists nearly every desktop program as
 //!     `C+G` (the shell, the browser), so those don't count;
-//!   - elsewhere than Windows, a video encoder session (NVENC): a game
-//!     stream, a recording or a broadcast, unless a Vergence converter is
-//!     running (`nvidia-smi` can't say whose sessions they are; on Windows the
-//!     per-process engine counters below can);
+//!   - a video encoder session (NVENC): a game stream, a recording or a
+//!     broadcast. `nvidia-smi` can't say whose sessions they are, so while a
+//!     Vergence converter runs this is left to the per-process engine
+//!     counters below (Windows);
 //!   - less than 1 GiB of the GPU's memory free (a game loading), until
 //!     2.5 GiB are free again.
 //!
@@ -189,7 +189,7 @@ impl NvidiaPeers {
             nvidia_smi(&["--query-gpu=memory.used,memory.total,encoder.stats.sessionCount", "--format=csv,noheader,nounits"])
                 .and_then(|csv| gpu_state(&csv))?;
         let converting = table.iter().any(|p| p.name.to_lowercase().starts_with("vergence-convert"));
-        if !cfg!(windows) && sessions > 0 && !converting {
+        if sessions > 0 && !converting {
             return Some(format!("the GPU is encoding video ({sessions} session(s): a stream or a recording)"));
         }
         let mut short = self.short_of_memory.lock().unwrap();
@@ -244,7 +244,7 @@ pub fn engine_instance(name: &str) -> Option<(u32, String)> {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const BUSY_PERCENT: f64 = 30.0;
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const ENCODING_PERCENT: f64 = 1.0;
+pub const ENCODING_PERCENT: f64 = 0.1;
 
 /// What a process is doing on the GPU that the worker yields to.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -128,6 +128,9 @@ fn profile(engine: &Engine, share_core_ml: bool) -> BTreeMap<String, String> {
     ])
 }
 
+/// How long the machine must have been free before the worker goes back to work.
+const BACK_TO_WORK_AFTER: Duration = Duration::from_secs(30);
+
 /// Loads the models again after standing aside, on the provider that loaded first.
 type Loader = Arc<dyn Fn() -> Result<Engine, String> + Send + Sync>;
 
@@ -227,7 +230,19 @@ impl Worker {
                 standing_aside = Some(reason);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
-            } else if standing_aside.take().is_some() {
+            } else if standing_aside.is_some() {
+                // Only once the machine has been free for a while: a stream
+                // showing a still desktop encodes little, and a game between
+                // levels is quiet for a moment.
+                let mut quiet = Duration::ZERO;
+                while quiet < BACK_TO_WORK_AFTER && self.yield_reason().await.is_none() {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    quiet += Duration::from_secs(5);
+                }
+                if quiet < BACK_TO_WORK_AFTER {
+                    continue;
+                }
+                standing_aside = None;
                 log("back to work");
             }
             if let Err(e) = self.ensure_loaded().await {

@@ -14,6 +14,7 @@
 //! measures.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use ort::ep::{self, ExecutionProviderDispatch};
 use ort::environment::Environment;
@@ -154,6 +155,17 @@ fn session_with(env: &Environment, path: &Path, provider: Provider, options: &En
     builder.commit_from_file(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// ONNX Runtime's environment: one per process, kept for good, so the models
+/// can be loaded again after standing aside.
+fn environment() -> Result<Environment, String> {
+    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+    if let Some(env) = ENVIRONMENT.get() {
+        return Ok(env.clone());
+    }
+    let env = ort::init().with_name("vergence-worker").build().map_err(|e| e.to_string())?;
+    Ok(ENVIRONMENT.get_or_init(|| env).clone())
+}
+
 /// The newest-named `prefix*size*.onnx` in `folder`, preferring one-way NeuFlow
 /// exports (as `vergence analyze` picks among Core ML models).
 pub fn find_model(folder: &Path, prefix: &str, size: &str) -> Result<PathBuf, String> {
@@ -211,7 +223,7 @@ impl Engine {
     pub fn load(models: &Path, provider: Provider, options: &EngineOptions) -> Result<Engine, String> {
         let flow_path = find_model(models, "RIFE", "480x288")?;
         let disparity_path = find_model(models, "NeuFlow", "512x288")?;
-        let env = ort::init().with_name("vergence-worker").build().map_err(|e| e.to_string())?;
+        let env = environment()?;
         let mut errors = Vec::new();
         for candidate in provider.candidates() {
             let loaded = session(&env, &flow_path, candidate, options)
@@ -307,6 +319,12 @@ mod tests {
         assert_eq!(stem(&find_model(dir.path(), "NeuFlow", "512x288").unwrap()), "NeuFlowV2_512x288_1way_i4_fp32");
         assert_eq!(stem(&find_model(dir.path(), "RIFE", "480x288").unwrap()), "RIFE425lite_480x288");
         assert!(find_model(dir.path(), "RIFE", "640x384").is_err());
+    }
+
+    #[test]
+    fn keeps_one_environment() {
+        assert!(environment().is_ok());
+        assert!(environment().is_ok(), "a second load must reuse the environment");
     }
 
     #[test]
