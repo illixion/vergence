@@ -83,6 +83,9 @@ pub struct Config {
     pub name: Option<String>,
     #[serde(default)]
     pub remote: Option<bool>,
+    /// Ask to carry on into a title's next piece (default true; AI HDR keeps its keyframes).
+    #[serde(default)]
+    pub sticky_runs: Option<bool>,
     pub models: String,
     #[serde(default)]
     pub compute_units: Option<String>,

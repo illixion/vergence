@@ -212,6 +212,18 @@ pub struct Claim {
     /// (the 2D workload's RIFE runs at another size than the 3D one's).
     #[serde(default)]
     pub workload_models: BTreeMap<String, Profile>,
+    /// The worker holds a title's state up to a frame (its last piece's end:
+    /// depth anchoring, gain keyframes) and would rather carry on from there.
+    #[serde(default)]
+    pub continues: Option<Continues>,
+}
+
+/// A worker's run: the title it is in and the first frame it would take next.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Continues {
+    pub title: String,
+    pub frame: i64,
 }
 
 impl Claim {
@@ -473,25 +485,40 @@ impl Queue {
 
         let mut best: Option<(Rank, String)> = None;
         for title in self.titles.values() {
-            if let Some(names) = &claim.workloads
-                && !names.contains(&title.workload.name)
-            {
-                continue;
-            }
-            let models = claim.models_for(&title.workload.name);
-            if !title.workload.kinds.iter().all(|k| models.contains_key(k.name())) {
-                continue;
-            }
-            if let Some(profile) = &title.profile
-                && profile.iter().any(|(k, m)| models.get(k) != Some(m))
-            {
+            if !Self::eligible(title, claim) {
                 continue;
             }
             let heads: Vec<f64> = self.playheads.values().filter(|p| p.title == title.key).map(|p| p.now(now)).collect();
-            if let Some(rank) = Self::best_piece(title, &heads, claim.remote)
+            let others: Vec<usize> = self
+                .leases
+                .values()
+                .filter(|l| l.title == title.key && l.worker != claim.worker)
+                .map(|l| l.piece)
+                .collect();
+            if let Some(rank) = Self::best_piece(title, &heads, claim.remote, &others)
                 && best.as_ref().is_none_or(|(b, _)| rank < *b)
             {
                 best = Some((rank, title.key.clone()));
+            }
+        }
+        // Sticky runs: the piece after the worker's last one, when it is free and no more urgent
+        // than what the queue would hand out otherwise (live pieces near a playhead still come first).
+        if let Some(run) = &claim.continues
+            && let Some(title) = self.titles.get(&run.title)
+            && Self::eligible(title, claim)
+            && let Some(piece) = (0..title.pieces.len()).find(|&i| title.piece_frames(i).start == run.frame)
+            && title.pieces[piece] == PieceState::Pending
+        {
+            let heads: Vec<f64> = self.playheads.values().filter(|p| p.title == title.key).map(|p| p.now(now)).collect();
+            let at = piece as f64 * PIECE_SECONDS;
+            let class = heads
+                .iter()
+                .filter(|&&head| at + PIECE_SECONDS > head)
+                .map(|&head| if at - head < LIVE_SECONDS && !claim.remote { 0 } else { 1 })
+                .min()
+                .unwrap_or(2);
+            if best.as_ref().is_none_or(|(b, _)| class <= b.class) {
+                best = Some((Rank { class, distance: 0.0, ordinal: title.ordinal, piece }, title.key.clone()));
             }
         }
         let (rank, key) = best?;
@@ -529,8 +556,25 @@ impl Queue {
         })
     }
 
+    /// The worker takes this title's workload, with the title's profile.
+    fn eligible(title: &Title, claim: &Claim) -> bool {
+        if let Some(names) = &claim.workloads
+            && !names.contains(&title.workload.name)
+        {
+            return false;
+        }
+        let models = claim.models_for(&title.workload.name);
+        if !title.workload.kinds.iter().all(|k| models.contains_key(k.name())) {
+            return false;
+        }
+        !title.profile.as_ref().is_some_and(|profile| profile.iter().any(|(k, m)| models.get(k) != Some(m)))
+    }
+
     /// The pending piece of `title` this worker should take, if any.
-    fn best_piece(title: &Title, heads: &[f64], remote: bool) -> Option<Rank> {
+    /// `others`: pieces other workers hold now. In backfill, a piece right
+    /// behind one of theirs is the one that worker carries on into next, so a
+    /// new run starts halfway along the longest pending stretch instead.
+    fn best_piece(title: &Title, heads: &[f64], remote: bool, others: &[usize]) -> Option<Rank> {
         let first_pending = |from: usize| (from..title.pieces.len()).find(|&i| title.pieces[i] == PieceState::Pending);
         let mut best: Option<Rank> = None;
         let mut consider = |rank: Rank| {
@@ -555,9 +599,33 @@ impl Queue {
             }
         }
         if let Some(i) = first_pending(0) {
-            consider(Rank { class: 2, distance: 0.0, ordinal: title.ordinal, piece: i });
+            let behind_another = |i: usize| i > 0 && others.contains(&(i - 1));
+            let piece = if behind_another(i) { Self::split_longest_stretch(title, others).unwrap_or(i) } else { i };
+            consider(Rank { class: 2, distance: 0.0, ordinal: title.ordinal, piece });
         }
         best
+    }
+
+    /// Where a new run should start: the longest stretch of pending pieces,
+    /// at its start when nobody is about to carry on into it, else halfway.
+    fn split_longest_stretch(title: &Title, others: &[usize]) -> Option<usize> {
+        let mut longest: Option<(usize, usize)> = None;
+        let mut i = 0;
+        while i < title.pieces.len() {
+            if title.pieces[i] != PieceState::Pending {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < title.pieces.len() && title.pieces[i] == PieceState::Pending {
+                i += 1;
+            }
+            if longest.is_none_or(|(s, e)| i - start > e - s) {
+                longest = Some((start, i));
+            }
+        }
+        let (start, end) = longest?;
+        Some(if start > 0 && others.contains(&(start - 1)) { start + (end - start) / 2 } else { start })
     }
 
     /// Keeps a lease alive; returns its new length in seconds.
@@ -770,6 +838,7 @@ mod tests {
             models: models("RIFE 480x288"),
             workloads: None,
             workload_models: BTreeMap::new(),
+            continues: None,
         }
     }
 
@@ -1033,6 +1102,7 @@ mod tests {
                 (Workload::SMOOTH_MOTION_3D.to_string(), models(flow)),
                 (Workload::AI_3D_DEPTH.to_string(), [("depth".to_string(), depth.to_string())].into()),
             ]),
+            continues: None,
         };
         let mac = worker("mac", "RIFE425lite_480x288 480x288", shared);
         let pc = worker("pc", "RIFE425lite_480x288 480x288 onnx", shared);
@@ -1128,5 +1198,50 @@ mod tests {
             q.complete(lease.lease, (1280, 720), None, now);
         }
         assert_eq!(q.status(&key).unwrap().state, "ready");
+    }
+
+    #[test]
+    fn a_worker_carries_on_into_the_next_piece_of_its_run() {
+        let mut q = Queue::new();
+        let older = SourceRef::jellyfin("older");
+        let source = SourceRef::jellyfin("run");
+        q.add(older.clone(), &workload(Workload::AI_3D_DEPTH), mono_info(20.0)).unwrap();
+        q.add(source.clone(), &workload(Workload::AI_3D_DEPTH), mono_info(20.0)).unwrap();
+        let key = Title::key_for(&source, Workload::AI_3D_DEPTH);
+        let now = Instant::now();
+        let profile: Profile = [("depth".to_string(), "DA2 Small".to_string())].into();
+        let worker = |name: &str, continues: Option<Continues>| Claim {
+            models: profile.clone(),
+            continues,
+            ..claim(name, false)
+        };
+        // Backfill would take the older title first; a worker in a run of the newer one carries on.
+        let run = Continues { title: key.clone(), frame: 48 };
+        let next = q.claim(&worker("a", Some(run.clone())), now).unwrap();
+        assert_eq!((next.title.as_str(), next.piece), (key.as_str(), 1));
+        // Not when that piece is taken: then the queue's own choice.
+        let taken = q.claim(&worker("b", Some(run)), now).unwrap();
+        assert_ne!((taken.title.as_str(), taken.piece), (key.as_str(), 1));
+        // A live piece near someone's playhead still comes first.
+        q.report_playhead("vp", &Title::key_for(&older, Workload::AI_3D_DEPTH), 10.0, 1.0, now);
+        let live = q.claim(&worker("a", Some(Continues { title: key.clone(), frame: 96 })), now).unwrap();
+        assert!(live.live && live.title != key, "{live:?}");
+    }
+
+    #[test]
+    fn a_second_worker_starts_its_run_halfway_along_the_rest() {
+        let mut q = Queue::new();
+        let source = SourceRef::jellyfin("long");
+        q.add(source.clone(), &workload(Workload::AI_3D_DEPTH), mono_info(200.0)).unwrap();
+        let now = Instant::now();
+        let profile: Profile = [("depth".to_string(), "DA2 Small".to_string())].into();
+        let a = q.claim(&Claim { models: profile.clone(), ..claim("a", false) }, now).unwrap();
+        assert_eq!(a.piece, 0);
+        // Worker b would sit right behind a's run; it starts in the middle of the 99 pieces left.
+        let b = q.claim(&Claim { models: profile.clone(), ..claim("b", false) }, now).unwrap();
+        assert_eq!(b.piece, 1 + 99 / 2);
+        // One worker claiming on its own still goes in order.
+        let a2 = q.claim(&Claim { models: profile, ..claim("a", false) }, now).unwrap();
+        assert_eq!(a2.piece, 1);
     }
 }

@@ -154,11 +154,25 @@ pub fn is_keyframe(index: i64, interval: i64, cut: bool) -> bool {
     cut || index % interval == 0
 }
 
+#[derive(Clone, Debug)]
 pub struct Keyframe {
     pub index: i64,
     pub grid: GainGrid,
     /// The frame starts a shot.
     pub cut: bool,
+}
+
+/// A sticky run's state, kept between a title's pieces: the keyframes so far,
+/// the last frame decoded and its signature (the cut detector's), and where
+/// the next piece starts. The next piece then decodes on from there instead
+/// of its keyframe interval of context, and comes out the same.
+#[derive(Clone, Debug)]
+pub struct Run {
+    pub title: String,
+    pub next: i64,
+    pub last_decoded: i64,
+    pub signature: Vec<f32>,
+    pub keyframes: Vec<Keyframe>,
 }
 
 /// Frame `index`'s grid from the keyframes around it (sorted by index); None

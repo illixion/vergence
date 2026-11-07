@@ -106,6 +106,14 @@ final class DepthConverter: @unchecked Sendable {
         var modelURL: URL? = nil
         /// Only this part of the video (nil: all of it).
         var timeRange: CMTimeRange? = nil
+        /// Carry Stable Depth's anchoring on from an earlier run: the locked
+        /// mapping that run gave this video's first frame. Single-sweep
+        /// (below `twoPassMinFrameRate`) only; a two-pass source ignores it.
+        var seed: DepthShotRange? = nil
+        /// Reuse the last map for a frame that looks unchanged (the motion
+        /// gate). A worker turns it off: which frames are skipped depends on
+        /// where a run started, so pieces wouldn't match one decode of the title.
+        var reusesStaticDepth = true
     }
 
     struct Output: Sendable {
@@ -495,7 +503,7 @@ final class DepthConverter: @unchecked Sendable {
             // treats as "repeat the previous frame's depth" — exact when
             // nothing moved, and zero ANE work.
             let inferred: (texture: MTLTexture, keepAlive: [Any])?
-            if motionGate.shouldReuseDepth(for: pixelBuffer) {
+            if plan.request.reusesStaticDepth, motionGate.shouldReuseDepth(for: pixelBuffer) {
                 inferred = nil
                 skippedInferences += 1
             } else {
@@ -788,10 +796,17 @@ extension DepthConverter {
                 let relative = cutBefore ? nil : anchorStats?.sums.fit(
                     pixelCount: depthWidth * depthHeight, frameSpan: p98 - p02
                 )
-                let liveMapping = liveTracker.update(
-                    lo: p02, hi: p98, relative: relative, cut: cutBefore || frameIndex == 0,
-                    dt: liveTrackerSeconds.map { max(pts.seconds - $0, 0) } ?? 0
-                )
+                let liveMapping: DepthAffine
+                if frameIndex == 0, sweep.stride == 1, let seed = plan.request.seed {
+                    // Carrying on from an earlier run: this frame where that run's anchoring put it.
+                    liveMapping = DepthAffine(mappingLo: p02, hi: p98, onto: seed)
+                    liveTracker = DepthScaleShiftTracker(state: liveMapping)
+                } else {
+                    liveMapping = liveTracker.update(
+                        lo: p02, hi: p98, relative: relative, cut: cutBefore || frameIndex == 0,
+                        dt: liveTrackerSeconds.map { max(pts.seconds - $0, 0) } ?? 0
+                    )
+                }
                 liveTrackerSeconds = pts.seconds
                 prevBackground = DepthAnchorCeiling(mapping: liveMapping)
                 hasPrevMap = true
@@ -1294,10 +1309,11 @@ extension DepthConverter {
         /// through `DepthBudget.studio`, so depth past the near end plateaus.
         private func buildMeta(completed: Bool) -> DepthCacheStore.Meta {
             let frames = mergedStats()
-            let mapping = DepthShotMapping.map(frames.map {
+            let seed = sweep.stride == 1 && sweep.base == nil ? plan.request.seed : nil
+            let (mapping, locked) = DepthShotMapping.map(frames.map {
                 DepthShotMapping.Frame(seconds: $0.pts.seconds, lo: $0.lo, hi: $0.hi, cutBefore: $0.cutBefore,
                           relative: $0.relative, lattice: $0.lattice)
-            })
+            }, seed: seed)
             let n = frames.count
             var displayScale = [Float](repeating: 1, count: n)
             var displayBias = [Float](repeating: 0, count: n)
@@ -1322,7 +1338,7 @@ extension DepthConverter {
                 videoWidth: decodedWidth, videoHeight: decodedHeight,
                 depthWidth: encodeWidth, depthHeight: encodeHeight
             )
-            return DepthCacheStore.Meta(
+            var meta = DepthCacheStore.Meta(
                 version: DepthCacheStore.pipelineVersion,
                 videoIdentity: plan.request.videoIdentity,
                 modelName: provider.modelName,
@@ -1344,6 +1360,11 @@ extension DepthConverter {
                 displayBias: displayBias,
                 displayMedian: displayMedian
             )
+            if plan.request.directory != nil {
+                // A worker's run (its own folder): the anchoring's state, for its next piece.
+                meta.shotLock = zip(locked, frames).flatMap { lock, f in [lock(f.lo), lock(f.hi)] }
+            }
+            return meta
         }
     }
 }

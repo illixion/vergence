@@ -193,23 +193,34 @@ struct Seen {
 pub fn gain_grids(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Vec<u8>, Failure> {
     let lease = piece.lease;
     let (w, h) = mono_size(lease)?;
-    let model = engine.gain.as_mut().ok_or_else(|| Failure::Error("GMNet isn't loaded".into()))?;
     let rate = lease.info.frame_rate;
     let interval = gain::keyframe_interval(rate.num as f64 / rate.den as f64);
-    let first = (lease.first_frame - interval).max(0);
+    // A sticky run carries on after the last frame the previous piece decoded, with its keyframes
+    // and that frame's signature, so this piece's context isn't decoded again.
+    let run = engine.gain_run.take().filter(|run| {
+        run.title == lease.title && run.next == lease.first_frame && run.last_decoded + 1 >= lease.first_frame
+            && run.last_decoded + 1 < lease.end_frame
+    });
+    let model = engine.gain.as_mut().ok_or_else(|| Failure::Error("GMNet isn't loaded".into()))?;
+    let first = run.as_ref().map_or((lease.first_frame - interval).max(0), |run| run.last_decoded + 1);
     let last = lease.frame_count.min(lease.end_frame + interval);
     let mut decode = Decode::start(piece, first, last - first)?;
     // The cut detector runs in order, on the decoding thread.
-    let previous = std::sync::Mutex::new(None::<Vec<f32>>);
+    let previous = std::sync::Mutex::new(run.as_ref().map(|run| run.signature.clone()));
+    let last_signature = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<f32>>));
+    let keep = last_signature.clone();
     let seen = frames(decode.output.take().expect("piped"), w * h * 3 / 2, first, last - first, move |index, frame| {
         let [y, _, _] = whole(frame, w, h);
         let signature = gain::signature(&y);
         let mut previous = previous.lock().unwrap_or_else(|p| p.into_inner());
         let cut = previous.as_ref().is_some_and(|p| gain::is_cut(p, &signature));
+        *keep.lock().unwrap_or_else(|p| p.into_inner()) = Some(signature.clone());
         *previous = Some(signature);
         Seen { cut, frame: gain::is_keyframe(index, interval, cut).then(|| frame.to_vec()) }
     });
-    let mut keyframes: Vec<Keyframe> = Vec::new();
+    let mut keyframes: Vec<Keyframe> = run
+        .map(|run| run.keyframes.into_iter().filter(|k| k.index >= lease.first_frame - 2 * interval).collect())
+        .unwrap_or_default();
     let mut decoded_to = first;
     let result = (|| -> Result<(), Failure> {
         for (index, Seen { cut, frame }) in seen.iter() {
@@ -249,6 +260,15 @@ pub fn gain_grids(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Resu
             let record = Record::float16(&grid.0, KIND_GAIN_MAP, EYE_MONO, gain::LUMA_BINS, gain::WIDTH, gain::HEIGHT, at, at);
             track.extend(record.deflated().framed());
         }
+    }
+    if !ended_early && let Some(signature) = last_signature.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        engine.gain_run = Some(gain::Run {
+            title: lease.title.clone(),
+            next: lease.end_frame,
+            last_decoded: decoded_to - 1,
+            signature,
+            keyframes,
+        });
     }
     Ok(if ended_early { crate::record::with_video_end(track, decoded_to) } else { track })
 }

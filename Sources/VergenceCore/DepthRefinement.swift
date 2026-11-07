@@ -112,6 +112,12 @@ public struct DepthAffine: Equatable, Sendable {
 
     public func callAsFunction(_ x: Float) -> Float { a * x + b }
 
+    /// The mapping that sends a frame's raw `lo`…`hi` onto `range` (shot space).
+    public init(mappingLo lo: Float, hi: Float, onto range: DepthShotRange) {
+        let a = (range.hi - range.lo) / max(hi - lo, 1e-6)
+        self.init(a: a, b: range.lo - a * lo)
+    }
+
     /// `self(inner(x))`.
     public func after(_ inner: DepthAffine) -> DepthAffine {
         DepthAffine(a: a * inner.a, b: a * inner.b + b)
@@ -273,6 +279,14 @@ public struct DepthScaleShiftTracker: Sendable {
         self.tuning = tuning
     }
 
+    /// A tracker that carries on from `state`, the mapping an earlier run
+    /// locked for the frame before the next one it sees (a worker's next
+    /// piece of the same shot).
+    public init(tuning: Tuning = Tuning(), state: DepthAffine) {
+        self.tuning = tuning
+        self.state = state
+    }
+
     public mutating func reset() { state = nil }
 
     /// One frame. `lo`/`hi` are the frame's robust range in its own units,
@@ -351,6 +365,19 @@ public struct DepthCutDetector: Sendable {
     }
 }
 
+/// A frame's robust depth range in shot space: where the anchoring had put
+/// it. What carries a run on from one piece to the next (a seed), in a form
+/// that doesn't depend on the raw units of that frame's own inference, which
+/// a run that skipped it as static (and reused its neighbour's map) doesn't share.
+public struct DepthShotRange: Sendable, Equatable {
+    public var lo: Float
+    public var hi: Float
+    public init(lo: Float, hi: Float) {
+        self.lo = lo
+        self.hi = hi
+    }
+}
+
 /// The converter's per-frame mapping policy, over a whole (merged) timeline:
 /// one `DepthScaleShiftTracker` per half-rate lattice (the anchor fits chain
 /// within a lattice), all reset at a cut; then each frame's robust range in
@@ -381,13 +408,28 @@ public enum DepthShotMapping {
 
     /// Raw units → shot space for every frame of a merged timeline.
     public static func map(_ frames: [Frame]) -> [DepthAffine] {
+        map(frames, seed: nil).mapping
+    }
+
+    /// The same, carrying on from an earlier run: `seed` is where that run's
+    /// anchoring put the first frame here (a frame both decoded) in shot
+    /// space, so the chain continues as if the timeline had never been cut.
+    /// Also returns each frame's locked mapping, the state a later run seeds from.
+    public static func map(_ frames: [Frame], seed: DepthShotRange?) -> (mapping: [DepthAffine], locked: [DepthAffine]) {
         let n = frames.count
-        guard n > 0 else { return [] }
+        guard n > 0 else { return ([], []) }
         var trackers: [Int: DepthScaleShiftTracker] = [:]
         var lastSeconds: [Int: Double] = [:]
         var locked = [DepthAffine](repeating: .identity, count: n)
         for i in 0..<n {
             let f = frames[i]
+            if i == 0, let seed {
+                let state = DepthAffine(mappingLo: f.lo, hi: f.hi, onto: seed)
+                trackers[f.lattice] = DepthScaleShiftTracker(state: state)
+                lastSeconds[f.lattice] = f.seconds
+                locked[0] = state
+                continue
+            }
             if f.cutBefore {
                 // A cut resets every lattice: both sit on the same shot.
                 for key in trackers.keys { trackers[key]?.reset() }
@@ -429,6 +471,6 @@ public enum DepthShotMapping {
             }
             segmentStart = i
         }
-        return result
+        return (result, locked)
     }
 }

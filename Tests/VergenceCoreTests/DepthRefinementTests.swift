@@ -215,6 +215,29 @@ struct DepthRefinementTests {
         }
     }
 
+    @Test func aSeededRunCarriesOnTheChainAsIfNeverCut() {
+        // One shot whose range drifts and whose anchor fits say "same scene": the locked
+        // chain holds the drift for seconds. A second run from frame 30, seeded with the
+        // first run's lock there, maps every later frame as the uncut run does.
+        var frames: [DepthShotMapping.Frame] = []
+        for i in 0..<80 {
+            let lo = 0.1 + 0.01 * Float(i), hi = 0.9 + 0.03 * Float(i)
+            frames.append(.init(seconds: Double(i) / 24, lo: lo, hi: hi, cutBefore: false,
+                                relative: i == 0 ? nil : DepthAffine(a: 0.97, b: 0.01), lattice: 0))
+        }
+        let whole = DepthShotMapping.map(frames, seed: nil)
+        let seed = DepthShotRange(lo: whole.locked[30](frames[30].lo), hi: whole.locked[30](frames[30].hi))
+        let piece = DepthShotMapping.map(Array(frames[30...]), seed: seed)
+        let fresh = DepthShotMapping.map(Array(frames[30...]))
+        var seededWorst: Float = 0, freshWorst: Float = 0
+        for i in 32..<79 {
+            seededWorst = max(seededWorst, abs(piece.mapping[i - 30](0.5) - whole.mapping[i](0.5)))
+            freshWorst = max(freshWorst, abs(fresh[i - 30](0.5) - whole.mapping[i](0.5)))
+        }
+        #expect(seededWorst < 1e-5, "\(seededWorst)")
+        #expect(freshWorst > 0.01, "a fresh start differs, which is why a run is seeded: \(freshWorst)")
+    }
+
     // MARK: End to end on a synthetic shot
 
     /// The breathing scenario, end to end on the CPU: a static room, a subject

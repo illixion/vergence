@@ -250,6 +250,8 @@ pub struct Engine {
     pub mono: Option<FlowModel>,
     pub gain: Option<GainModel>,
     pub depth: Option<DepthEngine>,
+    /// AI HDR's sticky run, if the last piece left one (`gain::Run`).
+    pub gain_run: Option<crate::gain::Run>,
     /// The provider that loaded (never `Auto`).
     pub provider: Provider,
     _env: Environment,
@@ -338,7 +340,7 @@ impl Engine {
             }
             None => None,
         };
-        Ok(Engine { stereo, mono, gain, depth, provider: candidate, _env: env.clone() })
+        Ok(Engine { stereo, mono, gain, depth, gain_run: None, provider: candidate, _env: env.clone() })
     }
 }
 

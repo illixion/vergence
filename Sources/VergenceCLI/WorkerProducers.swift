@@ -33,8 +33,16 @@ protocol PieceProducer: AnyObject {
     /// Frames decoded before and after the piece, for context.
     var framesBefore: Int64 { get }
     var framesAfter: Int64 { get }
-    /// A new run starts.
-    func begin()
+    /// A new run starts. `continuing`: it carries on from the producer's own
+    /// state (the frame it asked to resume from), not from context.
+    func begin(continuing: Bool)
+    /// Sticky runs: when the producer holds this title's state from its last
+    /// piece and `piece` follows it, the frame to start decoding at instead of
+    /// the piece's context (nil: decode the context).
+    func resumeFrame(mediaID: String, piece: Range<Int64>) -> Int64?
+    /// Whether a claim may ask to carry on into the next piece (the
+    /// producer keeps state worth keeping).
+    var keepsRuns: Bool { get }
     /// The next frame, `index` on the title's grid. Returns records for frames in `piece` only.
     func frame(_ frame: DecodedFrame, index: Int64, time: AnalysisTime, piece: Range<Int64>) throws -> [AnalysisRecord]
     /// Records held back for context, once every frame was seen.
@@ -42,7 +50,9 @@ protocol PieceProducer: AnyObject {
 }
 
 extension PieceProducer {
-    func begin() {}
+    func begin(continuing: Bool) {}
+    func resumeFrame(mediaID: String, piece: Range<Int64>) -> Int64? { nil }
+    var keepsRuns: Bool { false }
     func finish(piece: Range<Int64>) throws -> [AnalysisRecord] { [] }
 }
 
@@ -134,7 +144,8 @@ struct PieceDecoder {
             producer.timeScaleNum = Int32(input.rate.num)
             producer.timeScaleDen = Int64(input.rate.den)
         }
-        let first = max(0, piece.lowerBound - producer.framesBefore)
+        let resume = producer.resumeFrame(mediaID: mediaID, piece: piece)
+        let first = resume ?? max(0, piece.lowerBound - producer.framesBefore)
         let (after, overflow) = piece.upperBound.addingReportingOverflow(producer.framesAfter)
         let last = overflow ? frameCount : min(frameCount, after)
         let wanted = last - first
@@ -168,7 +179,7 @@ struct PieceDecoder {
         func append(_ records: [AnalysisRecord]) throws {
             for record in records { track.append(AnalysisTrack.record(try record.deflated())) }
         }
-        producer.begin()
+        producer.begin(continuing: resume != nil)
         let frameBytes = w * h * 3 / 2
         let reader = output.fileHandleForReading
         var index = first
@@ -192,12 +203,14 @@ struct PieceDecoder {
         }
         process.waitUntilExit()
         errors.fileHandleForReading.readabilityHandler = nil
-        let decodedPiece = min(index, piece.upperBound) - piece.lowerBound
+        // A resumed run may start inside the piece: its earlier frames were seen in the last one.
+        let decodedPiece = min(index, piece.upperBound) - max(piece.lowerBound, first)
+        let pieceToDecode = piece.upperBound - max(piece.lowerBound, first)
         let reference = frameCount == Int64.max
         // ffmpeg finished cleanly short of the piece: the video stream ends here (the coordinator
         // takes that only near the title's end, where a container's audio often outlasts its picture).
-        let endedEarly = !reference && decodedPiece < piece.count && process.terminationStatus == 0 && index > piece.lowerBound
-        guard reference ? decodedPiece > 0 : decodedPiece >= piece.count || endedEarly else {
+        let endedEarly = !reference && decodedPiece < pieceToDecode && process.terminationStatus == 0 && index > piece.lowerBound
+        guard reference ? decodedPiece > 0 : decodedPiece >= pieceToDecode || endedEarly else {
             throw WorkerFailure("ffmpeg gave \(index - first) of \(wanted) frames (\(process.terminationStatus)): \(messages.text.prefix(300))")
         }
         if endedEarly { header.videoEndFrame = index }
@@ -265,7 +278,7 @@ final class StereoFlowProducer: PieceProducer, @unchecked Sendable {
                   "disparity": "\(analyzer.disparityModelName) \(d.width)x\(d.height)"]
     }
 
-    func begin() { previous = nil }
+    func begin(continuing: Bool) { previous = nil }
 
     func frame(_ frame: DecodedFrame, index: Int64, time: AnalysisTime, piece: Range<Int64>) throws -> [AnalysisRecord] {
         guard let right = frame.right else { throw WorkerFailure("a 3D frame without a right eye") }
@@ -329,7 +342,7 @@ final class MonoFlowProducer: PieceProducer {
         models = ["flowPair": analyzer.profileName]
     }
 
-    func begin() { previous = nil }
+    func begin(continuing: Bool) { previous = nil }
 
     func frame(_ frame: DecodedFrame, index: Int64, time: AnalysisTime, piece: Range<Int64>) throws -> [AnalysisRecord] {
         let p = frame.left
@@ -366,6 +379,16 @@ final class DepthProducer: PieceFileProducer {
     let kinds: Set<String> = ["depth"]
     let models: [String: String]
     let needsStereo = false
+    let keepsRuns = true
+    /// Frames each piece decodes before its own when carrying on a run: the
+    /// temporal window's reach. The anchoring's state comes from the last
+    /// piece (`Meta.shotLock`), so its second of context isn't needed.
+    static let runOverlap: Int64 = 2
+    /// Sticky runs: the title, where its next piece starts, and the locked
+    /// shot mapping of the last piece's final frames (the anchoring's state).
+    private var run: (title: String, next: Int64, locks: [Int64: DepthShotRange])?
+    /// How the last piece started, for the log.
+    private(set) var lastPieceCarriedOn = false
 
     init(model: URL) async throws {
         guard OfflineDepthConversion.canLoad(model: model) else { throw WorkerFailure("can't load the depth model at \(model.path)") }
@@ -431,7 +454,19 @@ final class DepthProducer: PieceFileProducer {
         guard input.stereo == "mono" else { throw WorkerFailure("the title is stereo; AI 3D depth is for 2D") }
         let rate = Double(input.rate.num) / Double(input.rate.den)
         let before = Int64((Self.contextSeconds * rate).rounded())
-        let first = max(0, piece.lowerBound - before)
+        // Carrying on a run: the anchoring goes on from the lock the last piece gave this
+        // piece's first overlap frame, as one decode of the whole title would have it.
+        let previous = run
+        run = nil
+        let seed = previous.flatMap { run -> DepthShotRange? in
+            guard run.title == mediaID, run.next == piece.lowerBound, rate < 48 else { return nil }
+            return run.locks[piece.lowerBound - Self.runOverlap]
+        }
+        lastPieceCarriedOn = seed != nil
+        if let previous, seed == nil, previous.title == mediaID {
+            log("vergence worker: depth starts piece at \(piece.lowerBound) afresh (run ended at \(previous.next), \(previous.locks.count) locks)")
+        }
+        let first = seed != nil ? piece.lowerBound - Self.runOverlap : max(0, piece.lowerBound - before)
         let (after, overflow) = piece.upperBound.addingReportingOverflow(2)
         let last = overflow ? frameCount : min(frameCount, after)
         let wanted = last - first
@@ -458,7 +493,7 @@ final class DepthProducer: PieceFileProducer {
         }
 
         let entry = try await OfflineDepthConversion.convert(video: intermediate, into: work.appendingPathComponent("depth"),
-                                                             model: model)
+                                                             model: model, seed: seed, reusesStaticDepth: false)
         let records = try await OfflineDepthConversion.records(entry)
         // The intermediate's frame at k / rate is the title's frame first + k.
         var byIndex: [Int64: AnalysisRecord] = [:]
@@ -487,6 +522,19 @@ final class DepthProducer: PieceFileProducer {
             record.time = AnalysisTime(value: index * Int64(input.rate.den), timescale: Int32(input.rate.num))
             record.endTime = record.time
             track.append(AnalysisTrack.record(try record.deflated()))
+        }
+        // Keep the anchoring's state at the end of this piece for the next one.
+        if !endedEarly, let lock = entry.meta.shotLock, lock.count == 2 * entry.meta.framePTS.count {
+            var locks: [Int64: DepthShotRange] = [:]
+            for (k, seconds) in entry.meta.framePTS.enumerated() {
+                let index = first + Int64((seconds * rate).rounded())
+                if index >= piece.upperBound - Self.runOverlap {
+                    locks[index] = DepthShotRange(lo: lock[2 * k], hi: lock[2 * k + 1])
+                }
+            }
+            run = (mediaID, piece.upperBound, locks)
+        } else {
+            log("vergence worker: no anchoring state kept (shotLock \(entry.meta.shotLock?.count ?? -1), frames \(entry.meta.framePTS.count))")
         }
         return track
     }
@@ -520,6 +568,14 @@ final class GainGridProducer: PieceProducer {
     private var interval: Int64 = 12
     private var keyframes: [GainGridSchedule.Keyframe] = []
     private var previousSignature: [Float]?
+    /// Sticky runs: the title being decoded, the last frame seen (its
+    /// signature is `previousSignature`), and where the next piece starts.
+    /// Nothing carries over from a piece that didn't finish.
+    private var title: String?
+    private var lastDecoded: Int64 = -1
+    private var runNext: Int64?
+    private var inProgress = false
+    let keepsRuns = true
 
     init(modelURL: URL, computeUnits: MLComputeUnits) async throws {
         let configuration = MLModelConfiguration()
@@ -537,12 +593,30 @@ final class GainGridProducer: PieceProducer {
         framesAfter = interval
     }
 
-    func begin() {
-        keyframes = []
-        previousSignature = nil
+    /// The next piece of the same title carries on after the last frame seen:
+    /// the keyframes up to there are known, and so is that frame's signature
+    /// for the cut detector, so its context isn't decoded again.
+    func resumeFrame(mediaID: String, piece: Range<Int64>) -> Int64? {
+        defer { title = mediaID }
+        guard !inProgress, title == mediaID, runNext == piece.lowerBound, previousSignature != nil,
+              lastDecoded + 1 >= piece.lowerBound, lastDecoded + 1 < piece.upperBound else { return nil }
+        return lastDecoded + 1
+    }
+
+    func begin(continuing: Bool) {
+        if continuing {
+            // Keep what the new piece's frames may still ease from.
+            if let start = runNext { keyframes.removeAll { $0.index < start - 2 * interval } }
+        } else {
+            keyframes = []
+            previousSignature = nil
+        }
+        runNext = nil
+        inProgress = true
     }
 
     func frame(_ frame: DecodedFrame, index: Int64, time: AnalysisTime, piece: Range<Int64>) throws -> [AnalysisRecord] {
+        lastDecoded = index
         let p = frame.left
         let signature = GainGridSchedule.signature(p[0])
         let cut = previousSignature.map { GainGridSchedule.isCut($0, signature) } ?? false
@@ -553,7 +627,9 @@ final class GainGridProducer: PieceProducer {
     }
 
     func finish(piece: Range<Int64>) throws -> [AnalysisRecord] {
-        piece.compactMap { index in
+        inProgress = false
+        runNext = piece.upperBound
+        return piece.compactMap { index in
             GainGridSchedule.grid(at: index, keyframes: keyframes)?
                 .record(time: AnalysisTime(value: index * timeScaleDen, timescale: timeScaleNum))
         }

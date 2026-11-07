@@ -85,8 +85,10 @@ impl Coordinator {
     }
 
     /// `profiles`: each workload this worker takes, with its models per kind.
-    pub async fn claim(&self, remote: bool, profiles: &BTreeMap<String, BTreeMap<String, String>>)
-        -> Result<Option<Lease>, String> {
+    /// `continues`: the title and frame this worker's last piece ended at,
+    /// when it keeps state for the next one (a sticky run).
+    pub async fn claim(&self, remote: bool, profiles: &BTreeMap<String, BTreeMap<String, String>>,
+                       continues: Option<&(String, i64)>) -> Result<Option<Lease>, String> {
         // `models` for a coordinator that knows only one workload.
         let models = profiles.get("smooth-motion-3d").or_else(|| profiles.values().next()).cloned().unwrap_or_default();
         let workloads: Vec<&String> = profiles.keys().collect();
@@ -95,7 +97,8 @@ impl Coordinator {
             .post(format!("{}/v1/work/claim", self.base))
             .bearer_auth(&self.token)
             .json(&json!({ "worker": self.name, "remote": remote, "models": models, "workloads": workloads,
-                           "workloadModels": profiles }))
+                           "workloadModels": profiles,
+                           "continues": continues.map(|(title, frame)| json!({ "title": title, "frame": frame })) }))
             .send()
             .await
             .map_err(|e| e.to_string())?;

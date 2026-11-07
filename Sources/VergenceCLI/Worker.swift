@@ -33,6 +33,7 @@
      "remote": false,                                     (true: never takes live pieces)
      "models": "~/Models/interp",                         (RIFE*480x288 and NeuFlow*512x288, as for analyze; RIFE*960x576 for 2D)
      "workloads": ["smooth-motion-3d"],                   (default: every one the models allow)
+     "stickyRuns": true,                                  (carry depth and AI HDR state on into a title's next piece)
      "depthModel": "~/Models/DepthAnythingV2Small770x574.mlpackage",   (ai-3d-depth; Apache-2.0 weights only)
      "gainModel": "~/Models/GainMapGMNet.mlpackage",      (ai-hdr; Convolution's GMNet conversion)
      "computeUnits": "all",                               (ane | gpu | cpu | all)
@@ -78,6 +79,9 @@ struct WorkerConfig: Decodable {
     var remote: Bool?
     var models: String
     var workloads: [String]?
+    /// Ask to carry on into the next piece of a title (default true): depth
+    /// keeps its anchoring and AI HDR its keyframes instead of decoding context.
+    var stickyRuns: Bool?
     /// The AI 3D depth model (`ai-3d-depth`), a Core ML Depth Anything V2 Small conversion.
     var depthModel: String?
     /// AI HDR's GMNet (`ai-hdr`): Convolution's GainMapGMNet conversion (MIT).
@@ -227,6 +231,9 @@ final class AnalysisWorker: @unchecked Sendable {
     let token: String
     let name: String
     let producers: [String: PieceProducer]
+    /// The title and frame this worker's last piece ended at, when its producer
+    /// keeps state for the next one (a sticky run; the coordinator decides).
+    var lastRun: (title: String, next: Int64)?
     let session = URLSession(configuration: .ephemeral)
 
     init(config: WorkerConfig) async throws {
@@ -282,9 +289,16 @@ final class AnalysisWorker: @unchecked Sendable {
                 heartbeat.cancel()
                 try await upload(track, for: lease)
                 let seconds = (clock.now - started) / .seconds(1)
-                log(String(format: "vergence worker: piece %d of %@ (%@) in %.1f s, %.0f KB", lease.piece,
-                           lease.title, lease.live ? "live" : "ahead/backfill", seconds, Double(track.count) / 1024))
+                let carried = lastRun.map { $0.title == lease.title && $0.next == lease.firstFrame } ?? false
+                log(String(format: "vergence worker: piece %d of %@ (%@%@) in %.1f s, %.0f KB", lease.piece,
+                           lease.title, lease.live ? "live" : "ahead/backfill", carried ? ", carried on" : "", seconds,
+                           Double(track.count) / 1024))
+                // Sticky runs: ask for the next piece of this title, which the producer can carry on into.
+                lastRun = config.stickyRuns != false && producers[lease.workload]?.keepsRuns == true
+                    && lease.endFrame < lease.frameCount
+                    ? (lease.title, lease.endFrame) : nil
             } catch {
+                lastRun = nil
                 heartbeat.cancel()
                 log("vergence worker: piece \(lease.piece) of \(lease.title) failed: \(error)")
                 _ = try? await post("v1/work/leases/\(lease.lease)/release")
@@ -321,7 +335,7 @@ final class AnalysisWorker: @unchecked Sendable {
             "worker": name, "remote": config.remote ?? false,
             "models": byWorkload[StereoFlowProducer.workload] ?? byWorkload.values.first ?? [:],
             "workloads": producers.keys.sorted(), "workloadModels": byWorkload,
-        ] as [String: Any])
+        ].merging(lastRun.map { ["continues": ["title": $0.title, "frame": $0.next]] } ?? [:]) { a, _ in a } as [String: Any])
         let (data, response) = try await session.data(for: request)
         switch (response as? HTTPURLResponse)?.statusCode {
         case 200: return try JSONDecoder().decode(WorkLease.self, from: data)

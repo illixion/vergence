@@ -92,6 +92,10 @@ public enum DepthCacheStore {
         /// force a `pipelineVersion` bump, invalidating every existing cache
         /// entry for no benefit.
         public let displayMedian: [Float]
+        /// Each frame's robust range in shot space as the anchoring locked it,
+        /// lo then hi, when the converter was asked for it: what a worker's
+        /// next piece of the same title seeds its anchoring from.
+        public var shotLock: [Float]? = nil
     }
 
     /// Small, frequently rewritten progressive-playback signal. Keeping this

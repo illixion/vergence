@@ -209,6 +209,9 @@ struct Worker {
     profiles: BTreeMap<String, BTreeMap<String, String>>,
     producer: String,
     yielder: Arc<dyn Yield>,
+    /// A sticky run: the title and frame the last piece ended at, when its
+    /// workload keeps state for the next (AI HDR here).
+    last_run: Mutex<Option<(String, i64)>>,
 }
 
 async fn run(config_path: &Path, provider: Option<Provider>, once: bool) -> Result<(), String> {
@@ -249,6 +252,7 @@ async fn run(config_path: &Path, provider: Option<Provider>, once: bool) -> Resu
         loader,
         profiles,
         producer,
+        last_run: Mutex::new(None),
     };
     let list: Vec<String> = worker
         .profiles
@@ -329,7 +333,8 @@ impl Worker {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 continue;
             }
-            let lease = match self.coordinator.claim(self.config.remote.unwrap_or(false), &self.profiles).await {
+            let run = self.last_run.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let lease = match self.coordinator.claim(self.config.remote.unwrap_or(false), &self.profiles, run.as_ref()).await {
                 Ok(lease) => lease,
                 Err(e) => {
                     log(format!("claim failed: {e}"));
@@ -401,16 +406,25 @@ impl Worker {
             }
             Err(e) => Err(e),
         };
+        let carried = self.last_run.lock().unwrap_or_else(|p| p.into_inner()).take()
+            .is_some_and(|(title, frame)| title == lease.title && frame == lease.first_frame);
         match outcome {
             Ok(size) => {
                 log(format!(
-                    "piece {} of {} ({}) in {:.1} s, {:.0} KB",
+                    "piece {} of {} ({}{}) in {:.1} s, {:.0} KB",
                     lease.piece,
                     lease.title,
                     if lease.live { "live" } else { "ahead/backfill" },
+                    if carried { ", carried on" } else { "" },
                     started.elapsed().as_secs_f64(),
                     size as f64 / 1024.0
                 ));
+                // Only AI HDR keeps state across pieces here: depth's lives in the converter crate.
+                if self.config.sticky_runs != Some(false) && lease.workload == workloads::AI_HDR
+                    && lease.end_frame < lease.frame_count
+                {
+                    *self.last_run.lock().unwrap_or_else(|p| p.into_inner()) = Some((lease.title.clone(), lease.end_frame));
+                }
                 Ok(())
             }
             Err(failure) => {

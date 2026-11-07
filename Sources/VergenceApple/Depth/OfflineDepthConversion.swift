@@ -35,11 +35,15 @@ public enum OfflineDepthConversion {
 
     /// Converts `video` (a local file AVFoundation reads) into a depth entry in
     /// `directory`, replacing anything there. `progress` is 0…1.
+    /// - Parameter seed: where an earlier run's anchoring put the video's
+    ///   first frame in shot space (`Meta.shotLock`), to carry it on.
     public static func convert(video: URL, into directory: URL, model: URL, timeRange: CMTimeRange? = nil,
+                               seed: DepthShotRange? = nil, reusesStaticDepth: Bool = true,
                                progress: @escaping @Sendable (Double) -> Void = { _ in }) async throws -> DepthCacheStore.Entry {
         let request = DepthConverter.Request(
             videoIdentity: video.path, title: nil, localFileURL: video,
-            directory: directory, modelURL: model, timeRange: timeRange)
+            directory: directory, modelURL: model, timeRange: timeRange, seed: seed,
+            reusesStaticDepth: reusesStaticDepth)
         let output = try await DepthConverter().convert(request: request) { fraction, _, _ in progress(fraction) }
         guard output.meta.completed else { throw Failure.incomplete }
         return DepthCacheStore.Entry(directory: output.directory, meta: output.meta)
