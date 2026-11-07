@@ -20,6 +20,7 @@
    vergence analyze --raw WxH [--rate N/D] FILE|- --models DIR --output FILE.vgat
    vergence interpolate --raw WxH [--rate N/D] FILE|- --fields FILE.vgat --output FILE.bgra
    vergence interpolate --raw WxH FILE|- [--no-guard | --gpu] --output FILE.bgra   (mono, VideoToolbox or GPU flow)
+   vergence worker --config FILE [--once]   (analysis pieces for a coordinator, vergenced; see Worker.swift)
 
    options: --packing tab|sbs  --seek SECONDS  --start N  --frames N  --threads N
             --output FILE|-
@@ -436,6 +437,17 @@ func cat(_ o: Options) throws {
         if chunk.isEmpty { break }
         FileHandle.standardOutput.write(chunk)
         offset += Int64(chunk.count)
+    }
+}
+
+// The worker takes its settings from a config file, not the shared options.
+if CommandLine.arguments.count > 1, CommandLine.arguments[1] == "worker" {
+    do {
+        try await runWorker(Array(CommandLine.arguments.dropFirst(2)))
+        exit(0)
+    } catch {
+        log("vergence: \(error)")
+        exit(1)
     }
 }
 
