@@ -146,8 +146,8 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
     let mut args = input_args(job.input, job.probe, job.span);
     args.extend([
         "-vf".to_string(),
-        format!("scale={dw}:{dh}:flags=area:in_color_matrix={}:in_range={}", scale_matrix(&colour.matrix),
-                if colour.full_range { "pc" } else { "tv" }),
+        job.probe.video_filter(&format!("scale={dw}:{dh}:flags=area:in_color_matrix={}:in_range={}", scale_matrix(&colour.matrix),
+                                        if colour.full_range { "pc" } else { "tv" })),
         "-f".into(),
         "rawvideo".into(),
         "-pix_fmt".into(),

@@ -39,6 +39,9 @@ pub enum Layout {
     Htab,
     /// MV-HEVC spatial video, for a Vision Pro or iPhone.
     Spatial,
+    /// No 3D: upscaled only (with `upscale`).
+    #[serde(rename = "2d")]
+    Flat,
 }
 
 impl Layout {
@@ -49,6 +52,7 @@ impl Layout {
             Layout::Tab => "tab",
             Layout::Htab => "htab",
             Layout::Spatial => "spatial",
+            Layout::Flat => "2d",
         }
     }
 }
@@ -65,6 +69,9 @@ pub struct ConvertOptions {
     pub sample: bool,
     /// Redo a file whose output exists.
     pub force: bool,
+    /// Make each eye twice the size first (Real-ESRGAN's compact network); a side-by-side or
+    /// top-and-bottom source is upscaled eye by eye with no depth.
+    pub upscale: bool,
 }
 
 impl ConvertOptions {
@@ -78,6 +85,9 @@ impl ConvertOptions {
             && !(0.0..=1.0).contains(&c)
         {
             return Err("Convergence is 0 to 1.".into());
+        }
+        if self.layout == Layout::Flat && !self.upscale {
+            return Err("2D (no 3D) only upscales: turn on Upscale 2×.".into());
         }
         Ok(self)
     }
@@ -135,6 +145,9 @@ impl ConvertJob {
         if self.options.sample {
             args.extend(["--sample".into(), SAMPLE_SECONDS.to_string().into()]);
         }
+        if self.options.upscale {
+            args.extend(["--upscale".into(), "2x".into()]);
+        }
         if let Some(dir) = &self.output_dir {
             // A trailing separator makes it a folder to `convert`, even before it exists.
             let mut dir = dir.clone().into_os_string();
@@ -142,7 +155,13 @@ impl ConvertJob {
             args.extend(["--output".into(), dir]);
         }
         match model {
-            Some(model) => args.extend(["--model".into(), model.into()]),
+            Some(model) => {
+                args.extend(["--model".into(), model.into()]);
+                // The upscaling network's weights (BSD-3-Clause) are fetched once, if missing.
+                if self.options.upscale {
+                    args.push("--download-model".into());
+                }
+            }
             // Fetches Depth Anything V2 Small (Apache-2.0) once, if no model is installed; or
             // the larger model the person chose and whose licence they accepted (`models`).
             None => {
@@ -215,7 +234,9 @@ fn after_name(rest: &str) -> &str {
 
 /// The stages a layout goes through, and each one's share of the time.
 fn stages(layout: Layout) -> &'static [(&'static str, f64)] {
-    if layout == Layout::Spatial {
+    if layout == Layout::Flat {
+        &[("picture", 1.0)]
+    } else if layout == Layout::Spatial {
         &[("depth", 0.45), ("picture", 0.4), ("spatial", 0.15)]
     } else {
         &[("depth", 0.5), ("picture", 0.5)]
@@ -263,7 +284,7 @@ impl ConvertJob {
                 true
             }
             Event::Downloading => {
-                self.phase = Some("downloading the depth model".into());
+                self.phase = Some("downloading a model".into());
                 true
             }
             Event::Note(message) => {
@@ -687,7 +708,7 @@ mod tests {
             ["/films/Film.mkv", "--layout", "fsbs", "--variant", "base", "--download-model"]
         );
         assert_eq!(strings(job(ConvertOptions::default()).arguments_with(Some("/m/x.onnx"), "base")).last().unwrap(), "/m/x.onnx");
-        let mut j = job(ConvertOptions { layout: Layout::Spatial, strength: Some(0.012), convergence: Some(0.5), sample: true, force: true });
+        let mut j = job(ConvertOptions { layout: Layout::Spatial, strength: Some(0.012), convergence: Some(0.5), sample: true, force: true, upscale: false });
         j.output_dir = Some(PathBuf::from("/out/3D"));
         assert_eq!(
             strings(j.arguments(Some("/models/depth.mlpackage"))),
@@ -696,6 +717,13 @@ mod tests {
                 "--output", "/out/3D/", "--model", "/models/depth.mlpackage", "--force",
             ]
         );
+        let upscaled = job(ConvertOptions { layout: Layout::Flat, upscale: true, ..Default::default() });
+        assert_eq!(
+            strings(upscaled.arguments(Some("/m/d.mlpackage"))),
+            ["/films/Film.mkv", "--layout", "2d", "--upscale", "2x", "--model", "/m/d.mlpackage", "--download-model"]
+        );
+        assert!(ConvertOptions { layout: Layout::Flat, ..Default::default() }.checked().is_err());
+        assert_eq!(overall(Layout::Flat, "picture", 0.5), 0.5);
         assert!(ConvertOptions { strength: Some(0.2), ..Default::default() }.checked().is_err());
         assert!(ConvertOptions { convergence: Some(-1.0), ..Default::default() }.checked().is_err());
     }

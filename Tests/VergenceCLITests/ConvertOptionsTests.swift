@@ -68,6 +68,21 @@ import VergenceCommandLine
         #expect(try name("-o", "/q/x.mp4") == "/q/x.mp4")
     }
 
+    @Test func upscalingOptionsAndNames() throws {
+        let o = try parse(["convert", "a.mkv", "--upscale", "2x", "--upscale-model", "~/w.pth", "--input-layout", "HSBS",
+                           "--keep-repeated-frames", "--layout", "2d"])
+        #expect(o.upscale == 2 && o.upscaleModel == "~/w.pth" && o.inputLayout == "hsbs" && o.keepRepeatedFrames)
+        #expect(o.convertLayout == .flat)
+        #expect(try parse(["convert", "a", "--input-layout", "flat", "--upscale", "2"]).inputLayout == "2d")
+        let input = URL(fileURLWithPath: "/films/Film.mkv")
+        func name(_ args: String...) throws -> String {
+            OutputNames.converted(for: input, try parse(["convert", input.path] + args), single: true).path
+        }
+        #expect(try name("--upscale", "2x") == "/films/Film.2x.3D.FSBS.mp4")
+        #expect(try name("--upscale", "2x", "--layout", "2d") == "/films/Film.2x.mp4")
+        #expect(try name("--upscale", "2x", "--sample", "10", "--layout", "htab") == "/films/Film.sample.2x.3D.HTAB.mp4")
+    }
+
     static let refused: [(args: [String], message: String)] = [
         (["convert", "a", "--strength", "0.2"], "--strength takes a share of the frame's width, 0...0.05"),
         (["convert", "a", "--strength", "-0.01"], "--strength takes a share"),
@@ -76,6 +91,10 @@ import VergenceCommandLine
         (["convert", "a", "--start", "-3"], "--start must be 0 or more"),
         (["convert", "a", "--frames", "0"], "--frames must be 1 or more"),
         (["convert", "a", "--layout", "anaglyph"], "unknown --layout anaglyph"),
+        (["convert", "a", "--upscale", "3x"], "--upscale takes 2x, not 3x"),
+        (["convert", "a", "--input-layout", "cube"], "unknown --input-layout cube"),
+        (["convert", "a", "--layout", "2d"], "--layout 2d makes no 3D, so it needs --upscale"),
+        (["make", "a", "--layout", "2d"], "--layout 2d is for convert"),
         (["convert", "a", "--download-model=yes"], "--download-model takes no value"),
         (["convert", "a", "--model"], "--model needs a value"),
         (["make", "a", "--layout", "spatial"], "--layout spatial is for convert"),

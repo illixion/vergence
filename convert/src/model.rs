@@ -140,7 +140,7 @@ impl Provider {
     }
 }
 
-fn dispatch(provider: Provider, cache: &Path) -> Result<Option<ExecutionProviderDispatch>, String> {
+pub(crate) fn dispatch(provider: Provider, cache: &Path) -> Result<Option<ExecutionProviderDispatch>, String> {
     let _ = cache;
     let ep = match provider {
         Provider::Auto | Provider::Cpu => return Ok(None),

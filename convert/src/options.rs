@@ -13,6 +13,8 @@ pub enum Layout {
     FullTopAndBottom,
     HalfTopAndBottom,
     Spatial,
+    /// No 3D: upscaled only (`--layout 2d`, with `--upscale`).
+    Flat,
 }
 
 impl Layout {
@@ -23,6 +25,7 @@ impl Layout {
             "tab" | "ftab" | "ou" => Layout::FullTopAndBottom,
             "htab" | "hou" => Layout::HalfTopAndBottom,
             "spatial" | "mvhevc" => Layout::Spatial,
+            "2d" | "flat" => Layout::Flat,
             _ => return None,
         })
     }
@@ -42,6 +45,7 @@ impl Layout {
             Layout::FullTopAndBottom => ".3D.FTAB.mp4",
             Layout::HalfTopAndBottom => ".3D.HTAB.mp4",
             Layout::Spatial => ".spatial.mov",
+            Layout::Flat => ".mp4",
         }
     }
 
@@ -52,6 +56,7 @@ impl Layout {
             Layout::FullTopAndBottom => "full top and bottom",
             Layout::HalfTopAndBottom => "half top and bottom",
             Layout::Spatial => "spatial video (MV-HEVC)",
+            Layout::Flat => "2D",
         }
     }
 }
@@ -77,6 +82,14 @@ pub struct Options {
     pub include_audio: bool,
     pub dry_run: bool,
     pub force: bool,
+    /// `--upscale 2x`: each eye made twice the size by the upscaling network.
+    pub upscale: Option<u32>,
+    /// `--upscale-model PATH`: its weights (a compact Real-ESRGAN `.pth`).
+    pub upscale_model: Option<String>,
+    /// `--input-layout auto|2d|sbs|hsbs|tab|htab`: what the source is.
+    pub input_layout: String,
+    /// `--keep-repeated-frames`: keep a pulldown's repeats.
+    pub keep_repeated_frames: bool,
 }
 
 impl Default for Options {
@@ -100,6 +113,10 @@ impl Default for Options {
             include_audio: true,
             dry_run: false,
             force: false,
+            upscale: None,
+            upscale_model: None,
+            input_layout: "auto".into(),
+            keep_repeated_frames: false,
         }
     }
 }
@@ -217,8 +234,30 @@ pub fn parse(args: &[String]) -> Result<Options, UsageError> {
                 flag(&inline, &name)?;
                 o.force = true;
             }
+            "--upscale" => {
+                let v = value()?.to_lowercase();
+                if !["2x", "2", "×2", "x2"].contains(&v.as_str()) {
+                    return Err(UsageError(format!("--upscale takes 2x, not {v}")));
+                }
+                o.upscale = Some(2);
+            }
+            "--upscale-model" => o.upscale_model = Some(value()?),
+            "--input-layout" => {
+                let v = value()?.to_lowercase();
+                if !["auto", "2d", "flat", "sbs", "fsbs", "hsbs", "tab", "ftab", "ou", "htab", "hou"].contains(&v.as_str()) {
+                    return Err(UsageError(format!("unknown --input-layout {v} (auto, 2d, sbs, hsbs, tab or htab)")));
+                }
+                o.input_layout = if v == "flat" { "2d".into() } else { v };
+            }
+            "--keep-repeated-frames" => {
+                flag(&inline, &name)?;
+                o.keep_repeated_frames = true;
+            }
             _ => return Err(UsageError(format!("unknown option {name}"))),
         }
+    }
+    if o.layout == Layout::Flat && o.upscale.is_none() {
+        return Err(UsageError("--layout 2d makes no 3D, so it needs --upscale (it upscales only)".into()));
     }
     Ok(o)
 }
@@ -246,7 +285,8 @@ pub fn parse_bitrate(text: &str) -> Option<u64> {
 /// for a sample; beside the input, or in/at --output.
 pub fn converted(input: &Path, o: &Options, single: bool) -> PathBuf {
     let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let name = format!("{stem}{}{}", if o.sample.is_some() { ".sample" } else { "" }, o.layout.name_suffix());
+    let name = format!("{stem}{}{}{}", if o.sample.is_some() { ".sample" } else { "" },
+                       o.upscale.map(|s| format!(".{s}x")).unwrap_or_default(), o.layout.name_suffix());
     if o.output == "-" {
         return input.parent().unwrap_or(Path::new("")).join(name);
     }
@@ -368,6 +408,20 @@ mod tests {
         assert!(parse(&args("a --force=1")).is_err());
         assert!(parse(&args("a --wat")).is_err());
         assert!(parse(&args("a --sample")).is_err());
+        assert_eq!(parse(&args("a --upscale 3x")).unwrap_err().0, "--upscale takes 2x, not 3x");
+        assert!(parse(&args("a --input-layout cube")).is_err());
+        assert!(parse(&args("a --layout 2d")).is_err());
+    }
+
+    #[test]
+    fn upscaling_options_and_names() {
+        let o = parse(&args("a.mkv --upscale 2x --upscale-model /w.pth --input-layout HSBS --keep-repeated-frames --layout 2d")).unwrap();
+        assert_eq!((o.upscale, o.upscale_model.as_deref(), o.input_layout.as_str()), (Some(2), Some("/w.pth"), "hsbs"));
+        assert!(o.keep_repeated_frames && o.layout == Layout::Flat);
+        let o = Options { upscale: Some(2), ..Options::default() };
+        assert_eq!(converted(Path::new("/f/Film.mkv"), &o, true), PathBuf::from("/f/Film.2x.3D.FSBS.mp4"));
+        let o = Options { upscale: Some(2), layout: Layout::Flat, sample: Some(10.0), ..Options::default() };
+        assert_eq!(converted(Path::new("/f/Film.mkv"), &o, true), PathBuf::from("/f/Film.sample.2x.mp4"));
     }
 
     #[test]

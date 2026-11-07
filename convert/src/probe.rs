@@ -130,6 +130,11 @@ pub struct Probe {
     #[serde(default)]
     pub streams: Vec<Stream>,
     pub format: Option<Format>,
+    /// The video repeats one frame in five and the repeats are dropped
+    /// (`repeats`): `rate` is four fifths of the stream's, and every pass
+    /// decodes through `video_filter`'s decimate.
+    #[serde(skip)]
+    pub drop_repeats: bool,
 }
 
 /// A frame rate as a fraction.
@@ -185,10 +190,17 @@ impl Probe {
 
     pub fn rate(&self) -> Rate {
         let video = self.video();
-        video
+        let rate = video
             .and_then(|v| v.avg_frame_rate.as_deref().and_then(Rate::parse))
             .or_else(|| video.and_then(|v| v.r_frame_rate.as_deref().and_then(Rate::parse)))
-            .unwrap_or(Rate { num: 30, den: 1 })
+            .unwrap_or(Rate { num: 30, den: 1 });
+        if self.drop_repeats { Rate { num: rate.num * 4, den: rate.den * 5 } } else { rate }
+    }
+
+    /// The start of a decoding pass's `-vf`: ffmpeg's decimate when the
+    /// repeats are dropped, else nothing.
+    pub fn video_filter(&self, rest: &str) -> String {
+        if self.drop_repeats { format!("decimate=cycle=5,{rest}") } else { rest.to_string() }
     }
 
     /// The video's own bit rate: its stream's, a Matroska statistics tag, or

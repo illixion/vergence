@@ -8,9 +8,11 @@
    vergence sbs SPATIAL-VIDEO|FOLDER... [--output FILE|DIR] [--half] [--max-eye PIXELS] [--no-ambisonics]
    vergence sbs SPATIAL-VIDEO --segments DIR [--segment-seconds S] [--first N] [--last N] [--half] [--max-eye PIXELS]
    vergence sbs SPATIAL-VIDEO --info [--segment-seconds S] [--half] [--max-eye PIXELS]
-   vergence convert VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab|spatial] [--strength S]
+   vergence convert VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab|spatial|2d] [--strength S]
                     [--convergence 0...1] [--sample SECONDS] [--start S] [--frames N] [--model PATH]
                     [--download-model] [--depth-track FILE.vgat] [--quality ...] [--bitrate MBPS] [--max-eye PIXELS]
+                    [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab]
+                    [--keep-repeated-frames]
    vergence audio VIDEO [--track N] [--bitrate KBPS] --output FILE.opus|.ogg|.mka|.webm|.mp4|.wav
    vergence info DISC
    vergence decode DISC [--playlist NNNNN] [options]
@@ -111,6 +113,9 @@
  read: Core ML depth for every frame with the pre-processed refinement, each
  eye warped from it, HEVC side by side (VIDEO.3D.FSBS.mp4; --layout hsbs,
  tab, htab, or spatial for MV-HEVC), audio copied (see Convert.swift).
+ --upscale 2x makes each eye twice the size with Real-ESRGAN's compact
+ network first; a side-by-side or top-and-bottom source is upscaled eye by
+ eye instead (no depth), and --layout 2d upscales a 2D video and stops there.
 
  inspect says what a file is and, for spatial video, what a player would
  miss; for a frame-packed file, which layout it looks like.
@@ -139,10 +144,12 @@ func usage(_ problem: String? = nil) -> Never {
            vergence inspect VIDEO|DISC
            vergence sbs SPATIAL-VIDEO|FOLDER... [--output FILE|DIR] [--half] [--max-eye PIXELS] [--no-ambisonics]
                         [--quality low|standard|high|max] [--bitrate MBPS] [--dry-run] [--force]
-           vergence convert VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab|spatial]
+           vergence convert VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab|spatial|2d]
                             [--strength S] [--convergence 0...1] [--sample SECONDS] [--start S] [--frames N]
                             [--model PATH] [--download-model] [--depth-track FILE.vgat]
                             [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio]
+                            [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab]
+                            [--keep-repeated-frames]
            vergence info DISC
            vergence decode DISC [--playlist NNNNN] [options]
            vergence decode BASE.m2ts [DEPENDENT.m2ts] [options]

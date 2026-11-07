@@ -98,8 +98,10 @@
               <option value="tab">Top and bottom</option>
               <option value="htab">Half top and bottom</option>
               <option value="spatial">Spatial video (MV-HEVC)</option>
+              <option value="2d">2D (upscale only)</option>
             </select>
           </label>
+          <label class="check"><input id="opt-upscale" type="checkbox"> <span>Upscale 2× <span class="muted small">Real-ESRGAN; a 3D file has each eye upscaled</span></span></label>
           <label>Strength <span class="muted small">share of the width, 0–0.05</span>
             <input id="opt-strength" type="number" min="0" max="0.05" step="0.001" placeholder="Default (Subtle)">
           </label>

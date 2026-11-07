@@ -204,10 +204,11 @@ function options() {
     convergence: num("opt-convergence"),
     sample: $("opt-sample").checked,
     force: $("opt-force").checked,
+    upscale: $("opt-upscale").checked,
   };
 }
 
-const describeLayout = { fsbs: "full SBS", hsbs: "half SBS", tab: "top-bottom", htab: "half top-bottom", spatial: "spatial video" };
+const describeLayout = { fsbs: "full SBS", hsbs: "half SBS", tab: "top-bottom", htab: "half top-bottom", spatial: "spatial video", "2d": "2D" };
 
 async function refreshConvert() {
   const c = await invoke("convert_status").catch(() => null);
@@ -223,6 +224,7 @@ async function refreshConvert() {
     $("opt-convergence").value = d.convergence ?? "";
     $("opt-sample").checked = d.sample;
     $("opt-force").checked = d.force;
+    $("opt-upscale").checked = d.upscale;
   }
   $("sample-seconds").textContent = c.sampleSeconds;
   $("out-dir").textContent = c.outputDir || "Beside the original";
@@ -230,7 +232,7 @@ async function refreshConvert() {
   const jobs = [...c.jobs].reverse();
   $("jobs").innerHTML = jobs.map((j) => {
     const o = j.options;
-    const what = [describeLayout[o.layout], o.sample ? `${c.sampleSeconds} s sample` : null,
+    const what = [describeLayout[o.layout], o.upscale ? "upscaled 2×" : null, o.sample ? `${c.sampleSeconds} s sample` : null,
       o.strength != null ? `strength ${o.strength}` : null, o.convergence != null ? `convergence ${o.convergence}` : null].filter(Boolean).join(" · ");
     const active = j.state === "running" || j.state === "queued";
     const detail = j.state === "running"
@@ -252,7 +254,7 @@ async function refreshConvert() {
 }
 
 let optionsTimer = null;
-for (const id of ["opt-layout", "opt-strength", "opt-convergence", "opt-sample", "opt-force"]) {
+for (const id of ["opt-layout", "opt-strength", "opt-convergence", "opt-sample", "opt-force", "opt-upscale"]) {
   $(id).addEventListener("input", () => {
     optionsDirty = true;
     clearTimeout(optionsTimer);

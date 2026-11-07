@@ -76,8 +76,21 @@ public struct Options: Equatable, Sendable {
     public var model: String?
     /// `--depth-track FILE.vgat`: also write the depth as an analysis track.
     public var depthTrack: String?
-    /// `--download-model`: fetch Depth Anything V2 Small first if none is installed.
+    /// `--download-model`: fetch Depth Anything V2 Small first if none is installed
+    /// (and the upscaling network's weights, with `--upscale`).
     public var downloadModel = false
+    /// `--upscale 2x`: each eye made twice the size by the upscaling network.
+    public var upscale: Int?
+    /// `--upscale-model PATH`: the upscaling network's weights (a compact
+    /// Real-ESRGAN `.pth`).
+    public var upscaleModel: String?
+    /// `--input-layout auto|2d|sbs|hsbs|tab|htab`: what the source is. `auto`
+    /// goes by the file's metadata, and with `--upscale` by its name and
+    /// picture too.
+    public var inputLayout = "auto"
+    /// `--keep-repeated-frames`: keep the frames a pulldown repeats (one in
+    /// five), which are otherwise found and dropped.
+    public var keepRepeatedFrames = false
 
     public init() {}
 
@@ -88,6 +101,8 @@ public struct Options: Equatable, Sendable {
 /// What `vergence convert` writes.
 public enum ConvertLayout: String, Sendable, CaseIterable {
     case fullSideBySide, halfSideBySide, fullTopAndBottom, halfTopAndBottom, spatial
+    /// No 3D: the picture upscaled and nothing else (`--layout 2d`).
+    case flat
 
     /// From a `--layout` value; nil for one convert doesn't take.
     public init?(option: String) {
@@ -97,6 +112,7 @@ public enum ConvertLayout: String, Sendable, CaseIterable {
         case "tab", "ftab", "ou": self = .fullTopAndBottom
         case "htab", "hou": self = .halfTopAndBottom
         case "spatial", "mvhevc": self = .spatial
+        case "2d", "flat": self = .flat
         default: return nil
         }
     }
@@ -113,6 +129,7 @@ public enum ConvertLayout: String, Sendable, CaseIterable {
         case .fullTopAndBottom: ".3D.FTAB.mp4"
         case .halfTopAndBottom: ".3D.HTAB.mp4"
         case .spatial: ".spatial.mov"
+        case .flat: ".mp4"
         }
     }
 }
@@ -205,7 +222,7 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
         case "--header", "-H": try addHeader(value(), to: &o)
         case "--layout", "-f", "--format":
             let v = try value().lowercased()
-            guard ["auto", "sbs", "hsbs", "ou", "hou", "tab", "htab", "fsbs", "ftab", "spatial", "mvhevc"].contains(v) else {
+            guard ["auto", "sbs", "hsbs", "ou", "hou", "tab", "htab", "fsbs", "ftab", "spatial", "mvhevc", "2d", "flat"].contains(v) else {
                 throw UsageError("unknown --layout \(v)")
             }
             o.layout = v
@@ -281,6 +298,18 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
         case "--model": o.model = try value()
         case "--depth-track": o.depthTrack = try value()
         case "--download-model": try flag(); o.downloadModel = true
+        case "--upscale":
+            let v = try value().lowercased()
+            guard ["2x", "2", "×2", "x2"].contains(v) else { throw UsageError("--upscale takes 2x, not \(v)") }
+            o.upscale = 2
+        case "--upscale-model": o.upscaleModel = try value()
+        case "--input-layout":
+            let v = try value().lowercased()
+            guard ["auto", "2d", "flat", "sbs", "fsbs", "hsbs", "tab", "ftab", "ou", "htab", "hou"].contains(v) else {
+                throw UsageError("unknown --input-layout \(v) (auto, 2d, sbs, hsbs, tab or htab)")
+            }
+            o.inputLayout = v == "flat" ? "2d" : v
+        case "--keep-repeated-frames": try flag(); o.keepRepeatedFrames = true
         default: throw UsageError("unknown option \(name)")
         }
     }
@@ -289,12 +318,15 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
     if let last = o.lastSegment, last < o.firstSegment {
         throw UsageError("--last \(last) comes before --first \(o.firstSegment)")
     }
-    if o.command != "convert", ["fsbs", "ftab", "spatial", "mvhevc"].contains(o.layout) {
+    if o.command != "convert", ["fsbs", "ftab", "spatial", "mvhevc", "2d", "flat"].contains(o.layout) {
         throw UsageError("--layout \(o.layout) is for convert")
     }
     if o.command == "convert" {
         if let seek = o.seek, seek < 0 { throw UsageError("--start must be 0 or more") }
         if o.frames != Int.max, o.frames < 1 { throw UsageError("--frames must be 1 or more") }
+        if o.convertLayout == .flat, o.upscale == nil {
+            throw UsageError("--layout 2d makes no 3D, so it needs --upscale (it upscales only)")
+        }
     }
     if let header = environment["VERGENCE_HTTP_HEADER"] { try addHeader(header, to: &o) }
     return o
@@ -331,10 +363,11 @@ public enum OutputNames {
 
     /// `convert`: VIDEO.ext becomes VIDEO.3D.FSBS.mp4 (.3D.HSBS.mp4, .3D.FTAB.mp4,
     /// .3D.HTAB.mp4 or .spatial.mov by --layout); a --sample piece is
-    /// VIDEO.sample.3D.FSBS.mp4.
+    /// VIDEO.sample.3D.FSBS.mp4; upscaled, VIDEO.2x.3D.FSBS.mp4, or VIDEO.2x.mp4
+    /// with --layout 2d.
     public static func converted(for input: URL, _ o: Options, single: Bool) -> URL {
         placed(input.deletingPathExtension().lastPathComponent + (o.sample != nil ? ".sample" : "")
-                   + o.convertLayout.nameSuffix, beside: input, o, single: single)
+                   + (o.upscale.map { ".\($0)x" } ?? "") + o.convertLayout.nameSuffix, beside: input, o, single: single)
     }
 
     /// `sbs --segments DIR`: the folder (the current one for `--info` alone)

@@ -1,11 +1,12 @@
 /*
  Vergence - `convert`: any 2D video to an AI 3D stereo copy
 
-   vergence convert VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab|spatial]
+   vergence convert VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab|spatial|2d]
                     [--strength S] [--convergence C] [--sample SECONDS] [--start S] [--frames N]
                     [--model PATH] [--download-model] [--depth-track FILE.vgat]
                     [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio]
-                    [--dry-run] [--force]
+                    [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab]
+                    [--keep-repeated-frames] [--dry-run] [--force]
 
  The offline path Convolution's Pre-Process takes, run to a file instead of a
  cache, in two passes over the video:
@@ -26,6 +27,18 @@
  spatial` encodes full side by side to a temporary file and makes MV-HEVC
  spatial video from it the way `make` does (VIDEO.spatial.mov, `--preset`
  and friends apply).
+
+ `--upscale 2x` puts Real-ESRGAN's compact network (`FrameUpscaler`) in
+ front of the picture pass: a 2D source is upscaled, then made 3D from depth
+ as above (depth is still made at the source's size), or with `--layout 2d`
+ only upscaled (VIDEO.2x.mp4). A side-by-side or top-and-bottom source
+ (declared, named, or seen in its picture; `--input-layout` to say) is
+ upscaled eye by eye in one batch and packed in the output layout, with no
+ depth at all (VIDEO.2x.3D.FSBS.mp4).
+
+ A source that repeats one frame in five (a pulldown, often at an odd rate
+ after a remux: `RepeatedFrames`) has the repeats dropped and the rest
+ spaced evenly at four fifths of the rate, unless `--keep-repeated-frames`.
 
  Not done here: subtitles (left out), Smooth Motion in-between frames,
  MKV output (audio MP4 can't hold is left out, with a note; a file ffmpeg
@@ -58,14 +71,18 @@ func convert(_ o: Options) async throws {
     }
     // A dry run only says what it would do: no shaders, no model.
     if !o.dryRun { try prepareShaders() }
-    let model = o.dryRun ? nil : try await depthModel(o)
+    // The depth model is looked up when a file first needs depth (an
+    // upscaled 3D source or --layout 2d needs none); a bad one stops the run.
+    let models = ConvertModels(o)
+    if !o.dryRun, o.upscale != nil { _ = try await models.upscaler() }
+    if !o.dryRun, o.upscale == nil || (o.convertLayout != .flat && o.inputLayout == "2d") { _ = try await models.depth() }
     var made = 0, skipped = 0, failed = 0
     for input in inputs {
         let output = OutputNames.converted(for: input, o, single: inputs.count == 1)
         do {
-            if try await convertOne(input, output, model: model, o) { made += 1 } else { skipped += 1 }
+            if try await convertOne(input, output, models: models, o) { made += 1 } else { skipped += 1 }
         } catch {
-            log("vergence: \(input.lastPathComponent): \(error.localizedDescription)")
+            log("vergence: \(input.lastPathComponent): \(describe(error))")
             failed += 1
         }
     }
@@ -75,6 +92,17 @@ func convert(_ o: Options) async throws {
 }
 
 #if canImport(AVFoundation) && os(macOS)
+
+/// An error as a sentence: our own errors say what went wrong in their
+/// description, Foundation's in their localized one.
+func describe(_ error: Error) -> String {
+    switch error {
+    case let e as FormatError: e.description
+    case let e as UpscaleNetwork.Failure: e.description
+    case let e as FrameUpscaler.Failure: e.description
+    default: error.localizedDescription
+    }
+}
 
 /// The warp's shaders. A SwiftPM build compiles no Metal library, so a tool
 /// built that way compiles `StereoShaders.metal` from its source tree (or
@@ -136,8 +164,40 @@ func checkDepthModelLicence(_ url: URL) throws -> URL {
     throw FormatError(manager.errorMessage ?? "the model download failed")
 }
 
+/// The models a run needs, each looked up once.
+@MainActor final class ConvertModels {
+    let options: Options
+    private var depthURL: URL?
+    private var network: UpscaleNetwork?
+    nonisolated init(_ o: Options) { options = o }
+
+    func depth() async throws -> URL {
+        if let depthURL { return depthURL }
+        let url = try await depthModel(options)
+        depthURL = url
+        return url
+    }
+
+    func upscaler() async throws -> UpscaleNetwork {
+        if let network { return network }
+        let made = try await upscaleNetwork(options)
+        network = made
+        return made
+    }
+}
+
+/// What the picture pass makes.
+enum PictureMode {
+    /// Both eyes warped from depth (the frame upscaled first with --upscale).
+    case depth
+    /// A frame-packed 3D source, each eye upscaled; no depth.
+    case stereoUpscale(PackedStereoLayout)
+    /// --layout 2d: upscaled, still 2D.
+    case flatUpscale
+}
+
 /// Converts one file. False when there was nothing to do.
-func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async throws -> Bool {
+func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options) async throws -> Bool {
     let name = input.lastPathComponent
     if FileManager.default.fileExists(atPath: output.path), !o.force {
         log("vergence: \(name): \(output.lastPathComponent) is already made (--force to redo)")
@@ -157,9 +217,16 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
     var readable = input
     // A ProRes intermediate is 10-bit whatever the source was.
     var eightBitSource = false
+    // A layout the container declares that the remux drops (Matroska's StereoMode).
+    var containerLayout: PackedStereoLayout?
     if !FFmpeg.isNative(input) {
         let ffmpeg = try FFmpeg.required(for: "reading .\(input.pathExtension)")
         let probe = try ffmpeg.probe(input)
+        if let video = probe.video, let declared = video.declaredLayout, let w = video.width, let h = video.height {
+            var corrected = declared.correctingResolution(forPacked: CGSize(width: w, height: h))
+            corrected.eyesReversed = declared.eyesReversed
+            containerLayout = corrected
+        }
         let remuxed = work.appendingPathComponent("source.mov")
         let plan = try ffmpeg.remuxPlan(probe, to: remuxed, input: input)
         if !o.dryRun {
@@ -177,13 +244,53 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
     }
     let source = try await SpatialVideoSource.open(readable)
     if source.isMultiviewStereo {
-        log("vergence: \(name): already 3D (MV-HEVC spatial video), skipped")
+        log("vergence: \(name): already 3D (MV-HEVC spatial video)\(o.upscale != nil ? "; upscaling spatial video isn't done yet" : ""), skipped")
         return false
     }
-    if let declared = source.declaredLayout {
-        log("vergence: \(name): already 3D (\(declared.arrangement == .sideBySide ? "side by side" : "over-under")), skipped")
+    // 2D or 3D: what --input-layout says, else what the file declares, and
+    // when upscaling (where a 3D source is worth taking), its name and picture.
+    var stereoSource: PackedStereoLayout?
+    var stereoNote: String?
+    let declared = source.declaredLayout ?? containerLayout
+    switch o.inputLayout {
+    case "auto":
+        if let declared {
+            stereoSource = declared
+            stereoNote = "declared by the file"
+        } else if o.upscale != nil {
+            let pictures = (try? await source.samplePictures()) ?? []
+            let detection = StereoLayoutDetector.detect(declared: nil, fileName: input.lastPathComponent,
+                                                        frameSize: source.frameSize, pictures: pictures)
+            if let found = detection.layout, detection.confidence >= 0.6 {
+                stereoSource = found
+                stereoNote = String(format: "%.0f%% sure: %@", detection.confidence * 100, detection.reasons.joined(separator: "; "))
+            }
+        }
+    case "2d": break
+    default:
+        let given = PackedStereoLayout(arrangement: o.inputLayout.contains("sbs") ? .sideBySide : .overUnder,
+                                       isHalfResolution: o.inputLayout.hasPrefix("h"))
+        stereoSource = given
+        stereoNote = "--input-layout \(o.inputLayout)"
+    }
+    if let stereoSource, o.upscale == nil {
+        log("vergence: \(name): already 3D (\(stereoSource.arrangement == .sideBySide ? "side by side" : "over-under")), skipped"
+            + " (--upscale 2x upscales its eyes)")
         return false
     }
+    let layout = o.convertLayout
+    let mode: PictureMode
+    if let stereoSource {
+        guard layout != .flat else {
+            throw FormatError("it is 3D (\(stereoNote ?? "")); --layout 2d is for 2D sources (--input-layout 2d if it isn't 3D)")
+        }
+        mode = .stereoUpscale(stereoSource)
+    } else {
+        mode = layout == .flat ? .flatUpscale : .depth
+    }
+    let upscaling = o.upscale != nil
+    let network = upscaling ? try await models.upscaler() : nil
+    let model: URL? = if case .depth = mode, !o.dryRun { try await models.depth() } else { nil }
 
     // The part to convert.
     let fps = source.frameRate > 0 ? source.frameRate : 30
@@ -196,30 +303,82 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
     let range = whole ? nil : CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 90_000),
                                           duration: CMTime(seconds: length, preferredTimescale: 90_000))
 
-    let layout = o.convertLayout
-    let eye = eyeSize(source, maxEye: o.maxEye)
-    let packed = layout.isSideBySide ? (width: eye.width * 2, height: eye.height) : (width: eye.width, height: eye.height * 2)
+    // Each eye as it shows (a squeezed eye stretched back out), then as it
+    // is made: twice that with --upscale, capped by --max-eye.
+    let frame = (width: Double(source.frameSize.width), height: Double(source.frameSize.height))
+    let sourceEye: (width: Double, height: Double)
+    var regions: [FrameUpscaler.Region] = [.init(x: 0, y: 0, width: frame.width, height: frame.height)]
+    if case .stereoUpscale(let packing) = mode {
+        let sideBySide = packing.arrangement == .sideBySide
+        let half = (width: sideBySide ? frame.width / 2 : frame.width, height: sideBySide ? frame.height : frame.height / 2)
+        sourceEye = packing.isHalfResolution
+            ? (sideBySide ? (half.width * 2, half.height) : (half.width, half.height * 2)) : half
+        let first = FrameUpscaler.Region(x: 0, y: 0, width: half.width, height: half.height)
+        let second = FrameUpscaler.Region(x: sideBySide ? half.width : 0, y: sideBySide ? 0 : half.height,
+                                          width: half.width, height: half.height)
+        regions = packing.eyesReversed ? [second, first] : [first, second]
+    } else {
+        sourceEye = frame
+    }
+    let eye = eyeSize(width: sourceEye.width * (upscaling ? 2 : 1), height: sourceEye.height * (upscaling ? 2 : 1), maxEye: o.maxEye)
+    // The upscaler's input: half the eye made, even.
+    let modelEye = (width: eye.width / 2 & ~1, height: eye.height / 2 & ~1)
+    let made = upscaling ? (width: modelEye.width * 2, height: modelEye.height * 2) : eye
+    let packed = layout == .flat ? made
+        : layout.isSideBySide ? (width: made.width * 2, height: made.height) : (width: made.width, height: made.height * 2)
     // Half layouts squeeze both eyes into one frame's size.
-    let picture = layout.isHalf ? eye : packed
+    let picture = layout.isHalf ? made : packed
     let tenBit = source.needsTenBit && !eightBitSource
     let strength = Float(o.strength ?? Pseudo3DSettings.default.depthStrength)
     let convergence = Float(o.convergence ?? Pseudo3DSettings.default.convergence)
+
+    // Frames a pulldown repeats, judged on a few stretches across the file.
+    let repeats = o.dryRun ? nil : try await repeatedFrames(readable)
+    let dropRepeats = repeats?.isPulldown == true && !o.keepRepeatedFrames
+    let outputFPS = dropRepeats ? fps * 4 / 5 : fps
+
+    // What the encoder may spend: the source's own rate, scaled for what is new.
+    let sourceShare: Double = switch mode {
+    case .depth: (layout.isHalf ? 1.2 : 2) * (upscaling ? 2.5 : 1)
+    case .stereoUpscale: 2.5 * (layout.isHalf ? 0.6 : 1)
+    case .flatUpscale: 2.5
+    }
     let bitsPerSecond = o.bitrate ?? SpatialBitrate.bitsPerSecond(
-        eyeWidth: picture.width, eyeHeight: picture.height, frameRate: fps,
+        eyeWidth: picture.width, eyeHeight: picture.height, frameRate: outputFPS,
         quality: layout == .spatial ? .max : o.quality,
-        sourceBitsPerSecond: source.videoBitsPerSecond.map { $0 * (layout.isHalf ? 1.2 : 2) }, secondEye: false)
+        sourceBitsPerSecond: source.videoBitsPerSecond.map { $0 * sourceShare }, secondEye: false)
 
     log("vergence: \(name) -> \(output.path)")
-    log(String(format: "  %@, %d×%d (eyes %d×%d%@), HEVC %.1f Mbps%@, strength %.4f, convergence %.2f, model %@",
-               layoutDescription(layout), picture.width, picture.height, eye.width, eye.height,
+    let settings: String = switch mode {
+    case .depth: String(format: "strength %.4f, convergence %.2f, model %@", strength, convergence,
+                        model?.deletingPathExtension().lastPathComponent ?? "not looked up")
+    case .stereoUpscale(let packing):
+        "3D source (\(packing.arrangement == .sideBySide ? "side by side" : "top and bottom")"
+            + "\(packing.isHalfResolution ? ", half" : "")\(packing.eyesReversed ? ", eyes reversed" : ""); \(stereoNote ?? "")), no depth"
+    case .flatUpscale: "2D"
+    }
+    log(String(format: "  %@, %d×%d (%@ %d×%d%@), HEVC %.1f Mbps%@, %@",
+               layout == .flat ? "2D" : layoutDescription(layout), picture.width, picture.height,
+               layout == .flat ? "picture" : "eyes", made.width, made.height,
                layout.isHalf ? ", squeezed to half" : "", Double(bitsPerSecond) / 1_000_000,
-               tenBit ? (source.isHDR ? ", 10-bit HDR" : ", 10-bit") : "", strength, convergence,
-               model?.deletingPathExtension().lastPathComponent ?? "not looked up"))
+               tenBit ? (source.isHDR ? ", 10-bit HDR" : ", 10-bit") : "", settings))
+    if let network {
+        log("  upscaled 2× from \(modelEye.width)×\(modelEye.height) by \(network.name) (Real-ESRGAN, \(network.convolutions) convolutions)")
+    }
+    if let repeats, repeats.isPulldown {
+        log(String(format: "  frames: one in five repeats the one before (%d of %d moving stretches): %@", repeats.repeating,
+                   repeats.moving, dropRepeats ? String(format: "dropped, %.3f fps becomes %.3f", fps, outputFPS)
+                                               : "kept (--keep-repeated-frames)"))
+    }
     if !whole {
         log(String(format: "  from %@ for %.1f s%@", clockTime(start), length,
                    o.frames != Int.max ? ", \(o.frames) frames" : ""))
     }
-    guard !o.dryRun, let model else { return false }
+    guard !o.dryRun else { return false }
+    if case .depth = mode, model == nil { return false }
+    let upscaler: FrameUpscaler? = if let network {
+        try await FrameUpscaler(network: network, width: modelEye.width, height: modelEye.height, eyes: regions.count)
+    } else { nil }
 
     let began = Date()
     // Progress is redrawn in place on a terminal; with VERGENCE_PROGRESS=1 (a
@@ -237,7 +396,8 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
     // Pass 1: depth, or the finished depth of a run that stopped.
     let depthFolder = work.appendingPathComponent("depth")
     let expectedDuration = whole ? source.duration : min(source.duration, start + length) - start
-    let entry: DepthCacheStore.Entry
+    var entry: DepthCacheStore.Entry?
+    if let model {
     if let earlier = DepthCacheStore.entry(at: depthFolder),
        earlier.meta.modelName == model.deletingPathExtension().lastPathComponent,
        abs(earlier.meta.duration - expectedDuration) < 0.05,
@@ -246,19 +406,21 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
         log("  depth: \(earlier.meta.frameCount) frames from an earlier run")
     } else {
         let depthBegan = Date()
-        entry = try await OfflineDepthConversion.convert(video: readable, into: depthFolder, model: model, timeRange: range,
-                                                         progress: report("depth"))
+        let made = try await OfflineDepthConversion.convert(video: readable, into: depthFolder, model: model, timeRange: range,
+                                                            progress: report("depth"))
+        entry = made
         if terminal { FileHandle.standardError.write(Data("\r".utf8)) }
         let seconds = Date().timeIntervalSince(depthBegan)
-        log(String(format: "  depth: %d frames in %.1f s (%.1f fps)", entry.meta.frameCount, seconds,
-                   Double(entry.meta.frameCount) / max(seconds, 0.001)))
+        log(String(format: "  depth: %d frames in %.1f s (%.1f fps)", made.meta.frameCount, seconds,
+                   Double(made.meta.frameCount) / max(seconds, 0.001)))
     }
-    if let path = o.depthTrack {
+    if let path = o.depthTrack, let entry {
         let url = URL(fileURLWithPath: path)
         let records = try await OfflineDepthConversion.writeAnalysisTrack(
             entry, to: url, mediaID: mediaID(of: input), producer: "vergence convert",
             sourceWidth: Int(source.frameSize.width), sourceHeight: Int(source.frameSize.height))
         log("  depth track: \(records) records -> \(url.path)")
+    }
     }
 
     // Pass 2: both eyes, encoded.
@@ -267,15 +429,17 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
     let job = StereoEncodeJob(
         input: readable, output: stereoTarget, fileType: layout == .spatial ? .mov : .mp4, source: source, entry: entry,
         range: range, frameLimit: o.frames == Int.max ? nil : o.frames,
-        arrangement: layout.isSideBySide ? .sideBySide : .topAndBottom, eye: eye, picture: picture,
+        arrangement: layout.isSideBySide ? .sideBySide : .topAndBottom, eye: made, picture: picture,
         strength: strength, convergence: convergence, bitsPerSecond: bitsPerSecond, tenBit: tenBit,
-        includeAudio: o.includeAudio, progress: report("picture"))
+        includeAudio: o.includeAudio, progress: report("picture"), mode: mode, upscaler: upscaler, regions: regions,
+        dropRepeats: dropRepeats, outputFrameRate: outputFPS)
     let result = try await encodeStereo(job)
     if terminal { FileHandle.standardError.write(Data("\r".utf8)) }
     let pictureSeconds = Date().timeIntervalSince(pictureBegan)
-    log(String(format: "  picture: %d frames in %.1f s (%.1f fps)%@; %d audio track(s) copied%@", result.frames, pictureSeconds,
+    log(String(format: "  picture: %d frames in %.1f s (%.1f fps)%@%@; %d audio track(s) copied%@", result.frames, pictureSeconds,
                Double(result.frames) / max(pictureSeconds, 0.001),
-               result.flatFrames > 0 ? ", \(result.flatFrames) without depth (flat)" : "", result.audioCopied,
+               result.flatFrames > 0 ? ", \(result.flatFrames) without depth (flat)" : "",
+               result.droppedRepeats > 0 ? ", \(result.droppedRepeats) repeats dropped" : "", result.audioCopied,
                result.audioSkipped.isEmpty ? "" : ", left out (MP4 can't hold them): \(result.audioSkipped.joined(separator: ", "))"))
 
     if layout == .spatial {
@@ -292,7 +456,7 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
         let made = try await SpatialVideoMaker.make(spatial, progress: report("spatial"))
         if terminal { FileHandle.standardError.write(Data("\r".utf8)) }
         log(String(format: "  spatial video: %d frames, %.1f Mbps", made.frames, Double(made.bitsPerSecond) / 1_000_000))
-    } else {
+    } else if layout != .flat {
         try SphericalMetadata.write(to: output, stereoMode: layout.isSideBySide ? .leftRight : .topBottom)
     }
     try? FileManager.default.removeItem(at: work)
@@ -309,12 +473,17 @@ func layoutDescription(_ layout: ConvertLayout) -> String {
     case .fullTopAndBottom: "full top and bottom"
     case .halfTopAndBottom: "half top and bottom"
     case .spatial: "spatial video (MV-HEVC)"
+    case .flat: "2D"
     }
 }
 
 /// One eye: the frame's size, capped by --max-eye, even.
 func eyeSize(_ source: SpatialVideoSource, maxEye: Int?) -> (width: Int, height: Int) {
-    var w = Double(source.frameSize.width), h = Double(source.frameSize.height)
+    eyeSize(width: Double(source.frameSize.width), height: Double(source.frameSize.height), maxEye: maxEye)
+}
+
+func eyeSize(width: Double, height: Double, maxEye: Int?) -> (width: Int, height: Int) {
+    var w = width, h = height
     if let cap = maxEye, max(w, h) > Double(cap) {
         let scale = Double(cap) / max(w, h)
         w *= scale
@@ -339,7 +508,7 @@ struct StereoEncodeJob: @unchecked Sendable {
     var output: URL
     var fileType: AVFileType
     var source: SpatialVideoSource
-    var entry: DepthCacheStore.Entry
+    var entry: DepthCacheStore.Entry?
     var range: CMTimeRange?
     var frameLimit: Int?
     var arrangement: DepthStereoFrameRenderer.Arrangement
@@ -351,11 +520,20 @@ struct StereoEncodeJob: @unchecked Sendable {
     var tenBit: Bool
     var includeAudio: Bool
     var progress: @Sendable (Double) -> Void
+    var mode: PictureMode = .depth
+    /// Upscales each frame (both eyes of a 3D one) first.
+    var upscaler: FrameUpscaler?
+    /// Where each eye is in the source frame, for the upscaler.
+    var regions: [FrameUpscaler.Region] = []
+    /// Drop one frame in five, the repeat, and space the rest evenly.
+    var dropRepeats = false
+    var outputFrameRate: Double = 30
 }
 
 struct StereoEncodeResult: Sendable {
     var frames = 0
     var flatFrames = 0
+    var droppedRepeats = 0
     var audioCopied = 0
     var audioSkipped: [String] = []
 }
@@ -407,11 +585,16 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
     guard let metal = VergenceMetal.shared, let renderer = DepthStereoFrameRenderer() else {
         throw FormatError("the stereo warp isn't available (no Metal or no shaders)")
     }
+    if case .depth = job.mode, job.entry == nil { throw FormatError("no depth to warp from") }
+    if job.upscaler == nil, !{ if case .depth = job.mode { true } else { false } }() {
+        throw FormatError("nothing to upscale with")
+    }
     let source = job.source
     let hdr = source.isHDR
     let frameFormat = hdr ? FramePixelFormat.hdr : FramePixelFormat.sdr
     let encodeFormat = job.tenBit ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-    let packedSize = job.arrangement.packedSize(width: job.eye.width, height: job.eye.height)
+    let packedSize: (width: Int, height: Int) = if case .flatUpscale = job.mode { job.eye }
+        else { job.arrangement.packedSize(width: job.eye.width, height: job.eye.height) }
 
     let reader = try AVAssetReader(asset: asset)
     if let range = job.range { reader.timeRange = range }
@@ -420,7 +603,8 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
         kCVPixelBufferMetalCompatibilityKey as String: true,
         kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
     ]
-    if job.eye.width != Int(source.frameSize.width) || job.eye.height != Int(source.frameSize.height) {
+    // The upscaler reads the frame as it is; the warp takes it at the eye's size.
+    if job.upscaler == nil, job.eye.width != Int(source.frameSize.width) || job.eye.height != Int(source.frameSize.height) {
         videoSettings[kCVPixelBufferWidthKey as String] = job.eye.width
         videoSettings[kCVPixelBufferHeightKey as String] = job.eye.height
     }
@@ -435,10 +619,12 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
         audioOutputs.append((output, track.format))
     }
     guard reader.startReading() else { throw SpatialVideoError.unreadable(reader.error?.localizedDescription ?? "unknown") }
+    let feed = FrameFeed(videoOutput, dropRepeats: job.dropRepeats,
+                         frameDuration: CMTime(seconds: 1 / job.outputFrameRate, preferredTimescale: 90_000))
     // The first frame, before the encoder is set up: an HDR picture's
     // mastering display and light levels often come only with its frames.
-    var nextVideo = videoOutput.copyNextSampleBuffer()
-    guard let firstFrame = nextVideo.flatMap(CMSampleBufferGetImageBuffer) else {
+    var nextVideo = feed.next()
+    guard let firstFrame = nextVideo.flatMap({ CMSampleBufferGetImageBuffer($0.sample) }) else {
         throw SpatialVideoError.unreadable(reader.error?.localizedDescription ?? "no video frames in the range")
     }
 
@@ -452,7 +638,7 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
     let matrix = source.yCbCrMatrix ?? (hdr ? AVVideoYCbCrMatrix_ITU_R_2020 : AVVideoYCbCrMatrix_ITU_R_709_2)
     var compression: [String: Any] = [
         AVVideoAverageBitRateKey: job.bitsPerSecond,
-        AVVideoExpectedSourceFrameRateKey: source.frameRate > 0 ? source.frameRate : 30,
+        AVVideoExpectedSourceFrameRateKey: job.outputFrameRate,
         AVVideoMaxKeyFrameIntervalDurationKey: 2,
         AVVideoAllowFrameReorderingKey: true,
     ]
@@ -502,6 +688,9 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
 
     guard let packedPool = FramePixelFormat.pool(format: frameFormat, width: packedSize.width, height: packedSize.height)
     else { throw SpatialVideoError.writer("can't make packed buffers") }
+    // A 2D frame upscaled before the warp.
+    let upscaledPool = job.upscaler != nil && { if case .depth = job.mode { true } else { false } }()
+        ? FramePixelFormat.pool(format: frameFormat, width: job.eye.width, height: job.eye.height) : nil
     var transferOut: VTPixelTransferSession?
     VTPixelTransferSessionCreate(allocator: kCFAllocatorDefault, pixelTransferSessionOut: &transferOut)
     guard let transfer = transferOut else { throw SpatialVideoError.writer("can't create a pixel transfer session") }
@@ -511,15 +700,15 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
     VTSessionSetProperty(transfer, key: kVTPixelTransferPropertyKey_DestinationTransferFunction, value: transferFunction as CFString)
     VTSessionSetProperty(transfer, key: kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, value: matrix as CFString)
 
-    let depthSource = CachedDepthSource(entry: job.entry, device: metal.device)
-    defer { depthSource.invalidate() }
+    let depthSource = job.entry.map { CachedDepthSource(entry: $0, device: metal.device) }
+    defer { depthSource?.invalidate() }
 
     guard writer.startWriting() else { throw SpatialVideoError.writer(writer.error?.localizedDescription ?? "unknown") }
 
     var result = StereoEncodeResult(audioCopied: pairs.filter { $0.1 != nil }.count)
     let first = job.range?.start.seconds ?? videoStart.seconds
     let span = max(job.range?.duration.seconds ?? source.duration, 0.001)
-    let frameDuration = CMTime(seconds: 1 / (source.frameRate > 0 ? source.frameRate : 30), preferredTimescale: 90_000)
+    let frameDuration = CMTime(seconds: 1 / job.outputFrameRate, preferredTimescale: 90_000)
     var sessionStarted = false
     var lastEnd: CMTime?
     var videoDone = false
@@ -533,22 +722,38 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
                 if job.frameLimit.map({ result.frames >= $0 }) == true {
                     videoInput.markAsFinished()
                     videoDone = true
-                } else if let sample = nextVideo ?? videoOutput.copyNextSampleBuffer() {
+                } else if let (sample, time) = nextVideo ?? feed.next() {
                     nextVideo = nil
                     if let frame = CMSampleBufferGetImageBuffer(sample) {
-                        let time = CMSampleBufferGetPresentationTimeStamp(sample)
                         if !sessionStarted {
                             writer.startSession(atSourceTime: time)
                             sessionStarted = true
                         }
                         try autoreleasepool {
-                            let depth = depthSource.frameDepth(itemTime: time, frame: frame)
-                            if depth == nil { result.flatFrames += 1 }
                             var packedOut: CVPixelBuffer?
                             CVPixelBufferPoolCreatePixelBuffer(nil, packedPool, &packedOut)
                             guard let packed = packedOut else { throw SpatialVideoError.writer("out of packed buffers") }
-                            try renderer.render(frame: frame, depth: depth, strength: job.strength,
-                                                convergence: job.convergence, arrangement: job.arrangement, into: packed)
+                            switch job.mode {
+                            case .depth:
+                                // Depth by the frame's own time, wherever it lands in the output.
+                                let depth = depthSource?.frameDepth(itemTime: CMSampleBufferGetPresentationTimeStamp(sample), frame: frame)
+                                if depth == nil { result.flatFrames += 1 }
+                                var picture = frame
+                                if let upscaler = job.upscaler, let upscaledPool {
+                                    var upscaledOut: CVPixelBuffer?
+                                    CVPixelBufferPoolCreatePixelBuffer(nil, upscaledPool, &upscaledOut)
+                                    guard let upscaled = upscaledOut else { throw SpatialVideoError.writer("out of upscaled buffers") }
+                                    try upscaler.upscale(frame, regions: job.regions, into: upscaled, at: [(0, 0)])
+                                    picture = upscaled
+                                }
+                                try renderer.render(frame: picture, depth: depth, strength: job.strength,
+                                                    convergence: job.convergence, arrangement: job.arrangement, into: packed)
+                            case .stereoUpscale:
+                                let second = job.arrangement == .sideBySide ? (job.eye.width, 0) : (0, job.eye.height)
+                                try job.upscaler?.upscale(frame, regions: job.regions, into: packed, at: [(0, 0), second])
+                            case .flatUpscale:
+                                try job.upscaler?.upscale(frame, regions: job.regions, into: packed, at: [(0, 0)])
+                            }
                             guard let pool = adaptor.pixelBufferPool else { throw SpatialVideoError.writer("the writer has no buffer pool") }
                             var encodedOut: CVPixelBuffer?
                             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &encodedOut)
@@ -561,8 +766,8 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
                             }
                         }
                         result.frames += 1
-                        lastEnd = time + (CMSampleBufferGetDuration(sample).isValid && CMSampleBufferGetDuration(sample) > .zero
-                                          ? CMSampleBufferGetDuration(sample) : frameDuration)
+                        lastEnd = time + (!job.dropRepeats && CMSampleBufferGetDuration(sample).isValid
+                                          && CMSampleBufferGetDuration(sample) > .zero ? CMSampleBufferGetDuration(sample) : frameDuration)
                         if result.frames % 24 == 0 { job.progress(min(1, (time.seconds - first) / span)) }
                     }
                 } else {
@@ -610,7 +815,107 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
     try? FileManager.default.removeItem(at: job.output)
     try FileManager.default.moveItem(at: partial, to: job.output)
     job.progress(1)
+    result.droppedRepeats = feed.dropped
     return result
+}
+
+/// The video's frames in order, with the times to show them at: their own,
+/// or with a pulldown's repeats dropped (one in five, `RepeatDropper`), the
+/// rest evenly spaced from the first.
+final class FrameFeed {
+    private let output: AVAssetReaderTrackOutput
+    private let dropRepeats: Bool
+    private let frameDuration: CMTime
+    private var dropper = RepeatDropper()
+    private var held: [Int: CMSampleBuffer] = [:]
+    private var ready: [CMSampleBuffer] = []
+    private var previous: [Float]?
+    private var count = 0
+    private var emitted = 0
+    private var first: CMTime?
+    private var ended = false
+    private(set) var dropped = 0
+
+    init(_ output: AVAssetReaderTrackOutput, dropRepeats: Bool, frameDuration: CMTime) {
+        self.output = output
+        self.dropRepeats = dropRepeats
+        self.frameDuration = frameDuration
+    }
+
+    func next() -> (sample: CMSampleBuffer, time: CMTime)? {
+        while ready.isEmpty, !ended { pull() }
+        guard !ready.isEmpty else { return nil }
+        let sample = ready.removeFirst()
+        let own = CMSampleBufferGetPresentationTimeStamp(sample)
+        guard dropRepeats else { return (sample, own) }
+        let start = first ?? own
+        first = start
+        defer { emitted += 1 }
+        return (sample, start + CMTimeMultiply(frameDuration, multiplier: Int32(emitted)))
+    }
+
+    private func pull() {
+        guard let sample = output.copyNextSampleBuffer() else {
+            ended = true
+            for index in dropper.finish() { if let s = held.removeValue(forKey: index) { ready.append(s) } }
+            return
+        }
+        guard let frame = CMSampleBufferGetImageBuffer(sample) else { return }
+        guard dropRepeats else { ready.append(sample); return }
+        let signature = FrameDifference.signature(frame)
+        let difference = zip(previous, signature).flatMap { FrameDifference.between($0, $1) }
+        previous = signature
+        held[count] = sample
+        count += 1
+        let kept = dropper.add(difference)
+        guard !kept.isEmpty else { return }
+        for index in kept { if let s = held.removeValue(forKey: index) { ready.append(s) } }
+        dropped += held.count
+        held.removeAll()
+    }
+}
+
+private func zip(_ a: [Float]?, _ b: [Float]?) -> ([Float], [Float])? {
+    guard let a, let b else { return nil }
+    return (a, b)
+}
+
+/// Whether the video repeats one frame in five: up to six stretches of 60
+/// frames across it, each frame's difference to the one before.
+func repeatedFrames(_ url: URL) async throws -> RepeatedFrames.Verdict? {
+    let asset = AVURLAsset(url: url)
+    guard let track = try await asset.loadTracks(withMediaType: .video).first else { return nil }
+    let (size, rate) = try await track.load(.naturalSize, .nominalFrameRate)
+    let span = try await asset.load(.duration).seconds
+    guard span > 0, size.width > 0 else { return nil }
+    let seconds = min(span, 61 / Double(max(rate, 1)))
+    let stretches = span > 30 ? 6 : 1
+    var runs: [[Float]] = []
+    for i in 0 ..< stretches {
+        let at = (span - seconds) * (stretches == 1 ? 0 : (0.1 + 0.8 * Double(i) / Double(stretches - 1)))
+        let reader = try AVAssetReader(asset: asset)
+        reader.timeRange = CMTimeRange(start: CMTime(seconds: at, preferredTimescale: 90_000),
+                                       duration: CMTime(seconds: seconds, preferredTimescale: 90_000))
+        let width = min(Int(size.width), 384) & ~1
+        let height = max(48, Int((size.height * CGFloat(width) / size.width).rounded()) & ~1)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
+        ])
+        output.alwaysCopiesSampleData = false
+        reader.add(output)
+        guard reader.startReading() else { continue }
+        var previous: [Float]?
+        var run: [Float] = []
+        while let sample = output.copyNextSampleBuffer() {
+            guard let frame = CMSampleBufferGetImageBuffer(sample), let signature = FrameDifference.signature(frame) else { continue }
+            if let previous, let d = FrameDifference.between(previous, signature) { run.append(d) }
+            previous = signature
+        }
+        reader.cancelReading()
+        runs.append(run)
+    }
+    return RepeatedFrames.judge(runs)
 }
 
 /// An HDR picture's mastering display and light levels, for the encoder.
