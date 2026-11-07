@@ -362,13 +362,42 @@ final class DepthProducer: PieceFileProducer {
     let models: [String: String]
     let needsStereo = false
 
-    init(model: URL) throws {
+    init(model: URL) async throws {
         guard OfflineDepthConversion.canLoad(model: model) else { throw WorkerFailure("can't load the depth model at \(model.path)") }
         self.model = model
         // Model and pipeline version: a title keeps one, and the pipeline's own version changes its records.
         // A model under a restrictive licence says so in the profile too, so its titles stay apart.
         let licence = DepthModelLicence.restriction(forModelAt: model).map { " \($0.name)" } ?? ""
-        models = ["depth": "\(model.deletingPathExtension().lastPathComponent)\(licence) offline-v\(DepthCacheStore.pipelineVersion) context-1s"]
+        let name = model.deletingPathExtension().lastPathComponent
+        let compiled = try await InterpolationModelBenchmark.compiledURL(for: model)
+        let image = try MLModel(contentsOf: compiled).modelDescription.inputDescriptionsByName.values
+            .compactMap(\.imageConstraint).first
+        models = ["depth": Self.profile(modelName: name, inputSize: image.map { ($0.pixelsWide, $0.pixelsHigh) },
+                                        licence: licence)]
+    }
+
+    /// The depth profile. Depth Anything V2 Small and Base get one name whatever
+    /// runs them (family, input size, licence, pipeline, context), so a Mac and a
+    /// PC (`vergence-worker`, ONNX Runtime) can split a title: their records
+    /// agree within the tolerance `scripts/check-onnx-workload.sh` measured (Hypnos
+    /// `docs/plans/analysis-workers.md`, question 3). Any other model keeps its
+    /// file's name, as before. The ONNX worker names them the same way
+    /// (`worker/src/workloads.rs`).
+    static func profile(modelName: String, inputSize: (Int, Int)?, licence: String) -> String {
+        let tail = "\(licence) offline-v\(DepthCacheStore.pipelineVersion) context-1s"
+        if let family = sharedDepthFamily(modelName), let (w, h) = inputSize {
+            return "\(family) \(w)x\(h)\(tail)"
+        }
+        return "\(modelName)\(tail)"
+    }
+
+    /// The model families whose depth is shared across engines.
+    static func sharedDepthFamily(_ modelName: String) -> String? {
+        let name = modelName.lowercased().replacingOccurrences(of: "-", with: "").replacingOccurrences(of: "_", with: "")
+        guard name.contains("depthanything"), name.contains("v2"), !name.contains("video") else { return nil }
+        if name.contains("small") { return "Depth Anything V2 Small" }
+        if name.contains("base") { return "Depth Anything V2 Base" }
+        return nil
     }
 
     func track(of input: PieceInput, frames piece: Range<Int64>, frameCount: Int64, ffmpeg: String?,

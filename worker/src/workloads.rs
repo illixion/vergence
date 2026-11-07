@@ -355,11 +355,37 @@ pub fn depth(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Ve
     Ok(track)
 }
 
-/// The depth profile's name: model, size, pipeline and context, as the Mac
-/// worker's says them (plus " onnx" unless shared).
+/// The depth profile's name. Depth Anything V2 Small and Base get one name
+/// whatever runs them (family, input size, licence, pipeline, context), so a
+/// Mac (`vergence worker`, Core ML) and a PC can split a title: their records
+/// agree within the tolerance `scripts/check-onnx-workload.sh` measured (Hypnos
+/// `docs/plans/analysis-workers.md`, question 3); the Swift worker's
+/// `DepthProducer.profile` says the same. Any other model keeps its file's name
+/// and the engine family's suffix. A restrictive licence is in the name either
+/// way, so a non-commercial model's titles never mix with Small's.
 pub fn depth_profile(model: &Path, (w, h): (usize, usize), suffix: &str) -> String {
     let stem = model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    format!("{stem} {w}x{h} offline-v{DEPTH_PIPELINE_VERSION} context-1s{suffix}")
+    let licence = vergence_convert::licence::restriction_of(model).map(|r| format!(" {}", r.name)).unwrap_or_default();
+    let tail = format!("{licence} offline-v{DEPTH_PIPELINE_VERSION} context-1s");
+    match shared_depth_family(&stem) {
+        Some(family) => format!("{family} {w}x{h}{tail}"),
+        None => format!("{stem} {w}x{h}{tail}{suffix}"),
+    }
+}
+
+/// The model families whose depth is shared across engines.
+pub fn shared_depth_family(model_name: &str) -> Option<&'static str> {
+    let name = model_name.to_lowercase().replace(['-', '_'], "");
+    if !name.contains("depthanything") || !name.contains("v2") || name.contains("video") {
+        return None;
+    }
+    if name.contains("small") {
+        Some("Depth Anything V2 Small")
+    } else if name.contains("base") {
+        Some("Depth Anything V2 Base")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -368,7 +394,14 @@ mod tests {
 
     #[test]
     fn names_the_depth_profile() {
+        // Shared with the Mac worker's Core ML names (`DepthProducer.profile`).
         assert_eq!(depth_profile(Path::new("/m/DepthAnythingV2Small.onnx"), (770, 574), " onnx"),
-                   "DepthAnythingV2Small 770x574 offline-v5 context-1s onnx");
+                   "Depth Anything V2 Small 770x574 offline-v5 context-1s");
+        assert_eq!(depth_profile(Path::new("/m/DepthAnythingV2Base.onnx"), (518, 392), " onnx"),
+                   "Depth Anything V2 Base 518x392 CC-BY-NC-4.0 offline-v5 context-1s");
+        // Not checked across engines: its own name and the family's suffix.
+        assert_eq!(depth_profile(Path::new("/m/DepthAnythingV2Large.onnx"), (518, 392), " onnx"),
+                   "DepthAnythingV2Large 518x392 CC-BY-NC-4.0 offline-v5 context-1s onnx");
+        assert_eq!(shared_depth_family("VideoDepthAnythingV2Small"), None);
     }
 }

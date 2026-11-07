@@ -962,6 +962,42 @@ mod tests {
     }
 
     #[test]
+    fn a_mac_and_a_pc_split_a_depth_title_by_its_shared_profile() {
+        // Depth Anything V2 Small has one depth profile on Core ML and ONNX
+        // Runtime; Smooth Motion's flow keeps each family's own.
+        let shared = "Depth Anything V2 Small 770x574 offline-v5 context-1s";
+        let worker = |name: &str, flow: &str, depth: &str| Claim {
+            worker: name.into(),
+            remote: false,
+            models: models(flow),
+            workloads: Some(vec![Workload::SMOOTH_MOTION_3D.into(), Workload::AI_3D_DEPTH.into()]),
+            workload_models: BTreeMap::from([
+                (Workload::SMOOTH_MOTION_3D.to_string(), models(flow)),
+                (Workload::AI_3D_DEPTH.to_string(), [("depth".to_string(), depth.to_string())].into()),
+            ]),
+        };
+        let mac = worker("mac", "RIFE425lite_480x288 480x288", shared);
+        let pc = worker("pc", "RIFE425lite_480x288 480x288 onnx", shared);
+        let mut q = Queue::new();
+        let source = SourceRef::jellyfin("film");
+        q.add(source.clone(), &workload(Workload::AI_3D_DEPTH), mono_info(6.0)).unwrap();
+        let now = Instant::now();
+        let first = q.claim(&mac, now).unwrap();
+        let second = q.claim(&pc, now).unwrap();
+        assert_eq!((first.title.clone(), first.workload.as_str()), (second.title.clone(), Workload::AI_3D_DEPTH));
+        assert_ne!(first.piece, second.piece);
+        // A worker naming its own engine's depth doesn't join the title.
+        let other = worker("other", "RIFE 480x288", "DepthAnythingV2Small 770x574 offline-v5 context-1s onnx");
+        assert!(q.claim(&other, now).is_none());
+        // The 3D flow profiles stay apart: a title one family started is the other's no longer.
+        q.add(SourceRef::jellyfin("sbs"), &workload(Workload::SMOOTH_MOTION_3D), info(4.0)).unwrap();
+        let mac_flow = Claim { workloads: Some(vec![Workload::SMOOTH_MOTION_3D.into()]), ..mac.clone() };
+        let pc_flow = Claim { workloads: Some(vec![Workload::SMOOTH_MOTION_3D.into()]), ..pc.clone() };
+        assert!(q.claim(&mac_flow, now).is_some());
+        assert!(q.claim(&pc_flow, now).is_none());
+    }
+
+    #[test]
     fn checks_gain_grid_uploads() {
         let mut q = Queue::new();
         let source = SourceRef::stash("7");
