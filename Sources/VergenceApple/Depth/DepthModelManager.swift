@@ -37,8 +37,57 @@ public final class DepthModelManager {
         public let displayName: String
         public let subtitle: String
         public let approxBytes: Int64
+        /// Where a model other than Apple's Small comes from: a gzipped tar of
+        /// `<name>.mlpackage` in a Hugging Face repo. Nil: Apple's repo.
+        public let archive: Archive?
+        /// The weights' licence, shown before downloading.
+        public let licence: Licence?
         public var id: String { name }
+
+        public init(name: String, displayName: String, subtitle: String, approxBytes: Int64,
+                    archive: Archive? = nil, licence: Licence? = nil) {
+            self.name = name
+            self.displayName = displayName
+            self.subtitle = subtitle
+            self.approxBytes = approxBytes
+            self.archive = archive
+            self.licence = licence
+        }
     }
+
+    /// A Hugging Face repo and the `.tar.gz` in it that holds the package.
+    public struct Archive: Hashable, Sendable {
+        public let repo: String
+        public let file: String
+        public init(repo: String, file: String) {
+            self.repo = repo
+            self.file = file
+        }
+    }
+
+    public struct Licence: Hashable, Sendable {
+        /// "CC-BY-NC-4.0".
+        public let name: String
+        public let url: URL
+        /// Use is limited to non-commercial purposes.
+        public let nonCommercial: Bool
+        /// Who to credit, as the licence asks.
+        public let attribution: String
+        public init(name: String, url: URL, nonCommercial: Bool, attribution: String) {
+            self.name = name
+            self.url = url
+            self.nonCommercial = nonCommercial
+            self.attribution = attribution
+        }
+    }
+
+    /// Models a host app offers besides `variants`, set once at launch. Only a
+    /// build that is allowed to offer them sets any: a model whose licence
+    /// restricts its use is named only by the app that chose to offer it.
+    public static var additionalVariants: [Variant] = []
+
+    /// Every model on offer.
+    public static var allVariants: [Variant] { variants + additionalVariants }
 
     public static let variants: [Variant] = [
         Variant(name: "DepthAnythingV2SmallF16",
@@ -103,7 +152,7 @@ public final class DepthModelManager {
 
     /// Friendly label for an arbitrary installed model name (falls back to raw).
     public static func displayName(for name: String) -> String {
-        variants.first { $0.name == name }?.displayName ?? name
+        allVariants.first { $0.name == name }?.displayName ?? name
     }
 
     // MARK: Download
@@ -130,6 +179,10 @@ public final class DepthModelManager {
     }
 
     private func performDownload(_ variant: Variant) async throws {
+        if let archive = variant.archive {
+            try await performArchiveDownload(variant, archive)
+            return
+        }
         let fm = FileManager.default
         let pkg = "\(variant.name).mlpackage"
 
@@ -186,6 +239,44 @@ public final class DepthModelManager {
         try fm.moveItem(at: tmpPkg, to: finalURL)
     }
 
+    /// A packaged model as a `.tar.gz`: downloaded (checked against the
+    /// repo's SHA-256 when it says one), unpacked in a temporary folder, then
+    /// moved into the store.
+    private func performArchiveDownload(_ variant: Variant, _ archive: Archive) async throws {
+        let fm = FileManager.default
+        var expected: Int64 = variant.approxBytes
+        var hash: String?
+        if let entries = try? await fetchTree(repo: archive.repo),
+           let entry = entries.first(where: { $0.type == "file" && $0.path == archive.file }) {
+            expected = entry.lfs?.size ?? entry.size ?? expected
+            hash = entry.lfs?.oid
+        }
+        guard let url = URL(string: "https://huggingface.co/\(archive.repo)/resolve/main/\(archive.file)") else {
+            throw DownloadError.badURL
+        }
+        let downloader = ModelFileDownloader(expectedBytes: expected) { [weak self] fraction in
+            // The last tenth is the unpacking.
+            Task { @MainActor in self?.setProgress(variant.name, fraction * 0.9) }
+        }
+        let file = try await downloader.download(from: url)
+        defer { try? fm.removeItem(at: file) }
+        if let hash {
+            guard let got = Self.sha256Hex(of: file), got == hash.lowercased() else {
+                throw DownloadError.checksumMismatch(archive.file)
+            }
+        }
+        let tmpRoot = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: tmpRoot) }
+        try await Task.detached(priority: .utility) { try TarGzExtractor.extract(file, into: tmpRoot) }.value
+        let package = tmpRoot.appendingPathComponent("\(variant.name).mlpackage")
+        guard fm.fileExists(atPath: package.appendingPathComponent("Manifest.json").path) else {
+            throw DownloadError.missingPackage(variant.name)
+        }
+        let finalURL = DepthModelStore.modelsDirectory.appendingPathComponent("\(variant.name).mlpackage")
+        try? fm.removeItem(at: finalURL)
+        try fm.moveItem(at: package, to: finalURL)
+    }
+
     // MARK: HF tree metadata
 
     private struct TreeEntry: Decodable {
@@ -196,8 +287,9 @@ public final class DepthModelManager {
         struct LFS: Decodable { let oid: String; let size: Int64? }
     }
 
-    private func fetchTree() async throws -> [TreeEntry] {
-        guard let url = URL(string: Self.treeAPI) else { throw DownloadError.badURL }
+    private func fetchTree(repo: String? = nil) async throws -> [TreeEntry] {
+        let api = repo.map { "https://huggingface.co/api/models/\($0)/tree/main?recursive=true" } ?? Self.treeAPI
+        guard let url = URL(string: api) else { throw DownloadError.badURL }
         let (data, _) = try await URLSession.shared.data(from: url)
         return try JSONDecoder().decode([TreeEntry].self, from: data)
     }
@@ -219,11 +311,13 @@ public final class DepthModelManager {
     enum DownloadError: LocalizedError {
         case badURL
         case checksumMismatch(String)
+        case missingPackage(String)
 
         var errorDescription: String? {
             switch self {
             case .badURL: return "Invalid download URL."
             case .checksumMismatch(let file): return "Checksum mismatch (\(file))."
+            case .missingPackage(let name): return "The archive has no \(name).mlpackage."
             }
         }
     }

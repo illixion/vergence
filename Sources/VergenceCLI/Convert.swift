@@ -93,6 +93,27 @@ func prepareShaders() throws {
 /// --model, VERGENCE_DEPTH_MODEL, else the installed Depth Anything V2 Small
 /// (downloaded first with --download-model).
 @MainActor func depthModel(_ o: Options) async throws -> URL {
+    try checkDepthModelLicence(try await resolvedDepthModel(o))
+}
+
+/// Refuses a model whose weights restrict their use (`DepthModelLicence`)
+/// unless this build was made to take one (`-Xswiftc
+/// -DVERGENCE_NONCOMMERCIAL_MODELS`), and says the licence when it was.
+func checkDepthModelLicence(_ url: URL) throws -> URL {
+    guard let restriction = DepthModelLicence.restriction(forModelAt: url) else { return url }
+    let name = url.deletingPathExtension().lastPathComponent
+    #if VERGENCE_NONCOMMERCIAL_MODELS
+    log("vergence: \(name)'s weights are \(restriction.name)\(restriction.url.isEmpty ? "" : " (\(restriction.url))"): "
+        + "\(restriction.note). Use it, and what you make with it, for non-commercial work only.")
+    return url
+    #else
+    throw FormatError("\(name)'s weights are \(restriction.name) (\(restriction.note)); this build takes only "
+        + "Apache-2.0 models such as Depth Anything V2 Small. Build with -Xswiftc -DVERGENCE_NONCOMMERCIAL_MODELS "
+        + "to use it for non-commercial work.")
+    #endif
+}
+
+@MainActor private func resolvedDepthModel(_ o: Options) async throws -> URL {
     if let path = o.model ?? ProcessInfo.processInfo.environment["VERGENCE_DEPTH_MODEL"] {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         guard FileManager.default.fileExists(atPath: url.path) else { throw FormatError("no depth model at \(path)") }

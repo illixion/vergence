@@ -214,7 +214,8 @@ func makeProducers(_ config: WorkerConfig) async throws -> [String: PieceProduce
     }
     if wanted?.contains(DepthProducer.workload) ?? (config.depthModel != nil) {
         guard let path = config.depthModel else { throw WorkerFailure("ai-3d-depth needs depthModel in the config") }
-        producers[DepthProducer.workload] = try DepthProducer(model: URL(fileURLWithPath: expandTilde(path)))
+        producers[DepthProducer.workload] = try DepthProducer(
+            model: checkDepthModelLicence(URL(fileURLWithPath: expandTilde(path))))
     }
     guard !producers.isEmpty else { throw WorkerFailure("the config asks for no workload this worker makes") }
     return producers

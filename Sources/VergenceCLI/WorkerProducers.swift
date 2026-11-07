@@ -366,7 +366,9 @@ final class DepthProducer: PieceFileProducer {
         guard OfflineDepthConversion.canLoad(model: model) else { throw WorkerFailure("can't load the depth model at \(model.path)") }
         self.model = model
         // Model and pipeline version: a title keeps one, and the pipeline's own version changes its records.
-        models = ["depth": "\(model.deletingPathExtension().lastPathComponent) offline-v\(DepthCacheStore.pipelineVersion) context-1s"]
+        // A model under a restrictive licence says so in the profile too, so its titles stay apart.
+        let licence = DepthModelLicence.restriction(forModelAt: model).map { " \($0.name)" } ?? ""
+        models = ["depth": "\(model.deletingPathExtension().lastPathComponent)\(licence) offline-v\(DepthCacheStore.pipelineVersion) context-1s"]
     }
 
     func track(of input: PieceInput, frames piece: Range<Int64>, frameCount: Int64, ffmpeg: String?,

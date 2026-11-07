@@ -436,8 +436,14 @@ worker's own `--reference` run over the whole file in one decode. A depth piece 
 a second of the title before it, so the shot anchoring has settled; against a whole-file
 conversion its records differ by 0.005 on average (0.05 at most) in shot-space units. A player
 warps a depth track's maps (`AnalysisDepthSource`) and runs its own model only for frames the
-track doesn't hold yet. Only Apache-2.0 weights belong in a profile (Depth Anything V2 Base and
-Large are CC-BY-NC). An AI HDR piece decodes one keyframe interval either side and matches a whole-file run
+track doesn't hold yet. Vergence ships no weights and is built around Depth Anything V2 Small
+(Apache-2.0). `vergence convert` and `vergence worker` refuse the larger models whose weights
+restrict their use (Depth Anything V2 Base and Large, Video Depth Anything Base and Large:
+CC-BY-NC-4.0; Depth Pro: Apple's research licence) unless built with
+`swift build -c release -Xswiftc -DVERGENCE_NONCOMMERCIAL_MODELS`, and then say the licence; a
+worker's profile names it, so such titles never mix with Small's. On an M2 Max, Base resolved
+fine structure Small missed (fibres, thin stems) at about a third of Small's speed through the
+offline pipeline. An AI HDR piece decodes one keyframe interval either side and matches a whole-file run
 exactly. A player shows each frame's grid (`GainGridPlayback`: ramped in over a second after it
 starts and after a seek, held rather than dropped while a piece is missing, refreshed every half
 second but still snapped at cuts while the device is short of time), its `GainGridPass` holding the
