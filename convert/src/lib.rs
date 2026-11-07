@@ -3,6 +3,7 @@
 //! stored maps and their analysis-track records) and what it stands on.
 //! `vergence-worker` runs it per piece for the `ai-3d-depth` workload.
 
+pub mod antialias;
 pub mod checkpoint;
 pub mod decode;
 pub mod layout;

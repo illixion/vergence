@@ -63,9 +63,10 @@
 //! as `--layout` says (`VIDEO.2x.3D.FSBS.mp4`). Unlike the Mac it runs an
 //! eye in one piece (no tiles).
 //!
-//! `--antialias` smooths an old SD source's stair-stepped edges in every
-//! decoding pass with the Mac's ffmpeg graph (`probe::ANTIALIAS`); `--ai-hdr`
-//! is made on a Mac only for now.
+//! `--antialias` smooths an old SD source's stair-stepped edges along
+//! themselves (`antialias.rs`, the Mac's `EdgeAntialias` on the CPU): each
+//! upscaled eye before it is packed, or the picture before the warp without
+//! `--upscale`; `--ai-hdr` is made on a Mac only for now.
 //!
 //! A video that repeats one frame in five (`repeats.rs`) has the repeats
 //! dropped by ffmpeg's decimate in every pass, at four fifths of the rate,
@@ -447,7 +448,6 @@ fn convert_one(input: &Path, output: &Path, o: &Options, cx: &Context) -> Result
         return Err("--ai-hdr is made on a Mac only for now (vergence convert)".into());
     }
     let mut probe = cx.tools.probe(input)?;
-    probe.antialias = o.antialias;
     let video = probe.video().ok_or("no video stream")?;
     let (width, height) = (video.width.unwrap_or(0), video.height.unwrap_or(0));
     let upscaling = o.upscale.is_some();
@@ -576,7 +576,7 @@ fn convert_one(input: &Path, output: &Path, o: &Options, cx: &Context) -> Result
                     network.convolutions()));
     }
     if o.antialias {
-        log("  antialiased: edges smoothed (both fields by edge-slope tracing, along edges)");
+        log("  antialiased: each eye's straight edges averaged along themselves (edge-tangent AA)");
     }
     if let Some(v) = verdict.filter(|v| v.is_pulldown()) {
         log(format!("  frames: one in five repeats the one before ({} of {} moving stretches): {}", v.repeating, v.moving,
@@ -673,6 +673,7 @@ fn convert_one(input: &Path, output: &Path, o: &Options, cx: &Context) -> Result
         upscale: upscaler.map(|upscaler| UpscaleStage {
             upscaler, regions: regions.clone(), input_eye: model_eye, source: (width, height), mode, flat: layout == Layout::Flat,
         }),
+        antialias: o.antialias,
     })?;
     progress.end();
     let seconds = picture_began.elapsed().as_secs_f64();
@@ -727,6 +728,8 @@ struct PictureJob<'a> {
     expected_frames: usize,
     progress: &'a mut dyn FnMut(f64),
     upscale: Option<UpscaleStage<'a>>,
+    /// --antialias (`antialias.rs`).
+    antialias: bool,
 }
 
 struct PictureResult {
@@ -907,7 +910,7 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
     // beside the network working on the next frame.
     let finishing = job.upscale.as_ref().filter(|_| rgb_out).map(|stage| {
         let (send, receive) = mpsc::sync_channel::<(Vec<Vec<f32>>, Vec<f32>)>(2);
-        let (out_send, (iw, ih), side_by_side) = (out_send.clone(), stage.input_eye, job.side_by_side);
+        let (out_send, (iw, ih), side_by_side, antialias) = (out_send.clone(), stage.input_eye, job.side_by_side, job.antialias);
         let thread = std::thread::spawn(move || -> f64 {
             let mut fusing = 0.0;
             let each = 3 * ew * eh;
@@ -917,6 +920,11 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
                 if eyes_in.len() == 2 {
                     let (a, b) = out.split_at_mut(each);
                     upscale::fuse_eyes([&eyes_in[0], &eyes_in[1]], [a, b], iw, ih);
+                }
+                if antialias {
+                    for eye in out.chunks_exact_mut(each) {
+                        vergence_convert::antialias::rgb(eye, ew, eh);
+                    }
                 }
                 let eyes: Vec<&[f32]> = out.chunks_exact(each).collect();
                 let packed_frame = upscale::pack_gbrp16(&eyes, ew, eh, packed, &places[..eyes.len()]);
@@ -960,6 +968,10 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
             network += network_began.elapsed().as_secs_f64();
             rendering += started.elapsed().as_secs_f64();
             if stage.mode == Mode::Depth {
+                let mut out = out;
+                if job.antialias {
+                    vergence_convert::antialias::rgb(&mut out[..3 * ew * eh], ew, eh);
+                }
                 upscale::rgb_to_yuv420(&out[..3 * ew * eh], ew, eh, gpu::matrix_coefficients(&colour.matrix),
                                        if job.ten_bit { 10 } else { 8 }, &mut yuv);
                 frame = std::mem::take(&mut yuv);
@@ -975,6 +987,9 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
                 }
                 continue;
             }
+        }
+        if job.antialias && job.upscale.is_none() {
+            vergence_convert::antialias::yuv420(&mut frame, ew, eh, job.ten_bit);
         }
         let luma = ew * eh * sample;
         let chroma = luma / 4;

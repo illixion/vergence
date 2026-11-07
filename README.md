@@ -331,29 +331,37 @@ ONNX Runtime. `--upscale-model PATH` (or `VERGENCE_UPSCALE_MODEL`) takes another
 vergence convert "Film sbs.mkv" --upscale 2x --antialias --ai-hdr --gain-model ~/Models/GainMapGMNet.mlpackage
 ```
 
-- `--antialias` (both converters) smooths stair-stepped edges before anything else sees the picture.
-  A 2003 SD CG film after NTSC deinterlacing has diagonals in steps a line tall, which an upscaler
-  sharpens into crisp ragged edges. ffmpeg re-makes each field's missing lines by edge-slope
-  tracing (`estdif`: in every ffmpeg build, LGPL, no weights), averages both fields' versions (old
-  AviSynth scripts' "daa") and uses that only along edges (a blurred Sobel mask), so texture away
-  from edges keeps its detail. On that film's bed edge, after upscaling, a measured edge raggedness
-  (fine-scale gradient direction against the edge's own, on strong coherent edges) went from 0.0655
-  to 0.0564, with 7 % less fine detail elsewhere; NNEDI3 in the same arrangement (GPL weights) gave
-  0.0612, and in both directions 0.0592, losing more detail. The Mac writes the antialiased part to
-  a ProRes intermediate in the work folder (about 75 frames a second for 720×400 pairs); the PC
-  decodes through the same filter graph.
+- `--antialias` (both converters) turns stair-stepped edges back into lines. A 2003 SD CG film
+  after NTSC deinterlacing has diagonals in steps a line or two tall, which an upscaler sharpens into
+  crisp sawtooth edges. The finished picture's structure tensor (luma blurred to σ 2 pixels, so a
+  stair's tread and riser read as the slope they stand for; products blurred to σ 8) says at every
+  pixel which way an edge runs and how straight it is; along strong, straight edges the picture is
+  averaged along the edge (σ 12 over ±24 pixels), never across it, and texture, which isn't straight
+  over that length, stays. It runs on each eye after upscaling, last before AI HDR and the encoder
+  (`EdgeAntialias` on the Mac's GPU, about 5 ms a 2880×800 frame; `antialias.rs` on the PC's CPU,
+  beside the network, without `--upscale` on the picture before the warp). A line drawn in 4-pixel
+  stairs ends 0.12 px RMS off its line (1.14 before); on five aliased spots of that film the sawtooth
+  is gone, a staircase measure (luma's second difference along the edge, through the encoder) drops
+  22–41 %, texture elsewhere within 1–9 %. FXAA-style passes, made for steps a pixel tall, took 3–5 %
+  off; the earlier ffmpeg pre-pass (both fields re-made by `estdif`) at most 30 % for 4–15 % of the texture;
+  Real-ESRGAN's anime model instead of the general one, −21 to +12 %, for 17–32 % of the texture.
 - `--ai-hdr` (Mac for now) makes an SDR source HDR the way the `ai-hdr` workload and the players
   do: the worker's own producer makes GMNet's gain grids (keyframes every half second and at cuts,
-  eased within shots, the 16×9×8 grid), from the left eye of a 3D source, and `GainGridPass`, the
-  players' shader, applies them, holding the frame's average gain to 2.5×. The output is 10-bit
+  eased within shots, the 16×9×8 grid, highlights spread from the mid-tones), from the left eye of
+  a 3D source, and `GainGridPass`, the players' shader, applies them, holding the frame's average gain
+  to 2.5×. On film GMNet's gain is close to one curve over luma (mid-tones 1.3–1.8×, the top 2–3×),
+  so a light rose only about 1.5× over a lit wall; a grid therefore keeps only the gain above each
+  cell's mid-tone gain, doubled up to GMNet's 5× (`GainGrid.expandingHighlights`): mid-tones stay as
+  SDR, highlights reach 800–1,000 nits (per-frame p99.9 685 → 960 nits median over two minutes of the
+  3D film, the frame's mean unchanged). The output is 10-bit
   HEVC in BT.2020 PQ with SDR white at 203 nits, HDR10 mastering display (P3 D65, 1,000 nits) and
   light levels (MaxCLL 1,015, MaxFALL 507), both eyes with one grid and one scale, named
   `VIDEO.hdr.3D.FSBS.mp4`. GMNet is Convolution's Core ML conversion, a worker's `gainModel`:
   `--gain-model PATH` or `VERGENCE_GAIN_MODEL`. The grids take a pass of their own (about 35 frames
   a second); applying them costs the picture pass nothing measurable. A 10-minute piece of the 3D
-  film with `--upscale 2x --antialias --ai-hdr` took 40.6 minutes on the M2 Max: the antialiased
-  intermediate 4.3 min (73 fps), the grids 9.2 min (34 fps), the upscaled HDR picture 26 min (9.6 fps,
-  as fast as without HDR).
+  film with `--upscale 2x --ai-hdr` and the earlier antialiasing took 40.6 minutes on the M2 Max:
+  that antialiased intermediate 4.3 min, the grids 9.2 min (34 fps), the upscaled HDR picture 26 min
+  (9.6 fps, as fast as without HDR); the antialiasing now costs about 5 % of the picture pass instead.
 
 **Repeated frames.** Every `convert` now checks whether a video repeats one frame in five: film made
 30 fps by doubling a frame in four and then retimed, often to an odd rate after a remux (a 3D film

@@ -243,7 +243,7 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
             return false
         }
     }
-    var source = try await SpatialVideoSource.open(readable)
+    let source = try await SpatialVideoSource.open(readable)
     if source.isMultiviewStereo {
         log("vergence: \(name): already 3D (MV-HEVC spatial video)\(o.upscale != nil ? "; upscaling spatial video isn't done yet" : ""), skipped")
         return false
@@ -295,28 +295,15 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
 
     // The part to convert.
     let fps = source.frameRate > 0 ? source.frameRate : 30
-    var start = o.seek ?? o.sample.map { max(0, (source.duration - $0) / 2) } ?? 0
+    let start = o.seek ?? o.sample.map { max(0, (source.duration - $0) / 2) } ?? 0
     guard start < source.duration else { throw FormatError("--start \(start) is past the end (\(clockTime(source.duration)))") }
     var length = min(o.sample ?? .infinity, source.duration - start)
     // The depth window looks two frames ahead; give it those.
     if o.frames != Int.max { length = min(length, (Double(o.frames) + 2.5) / fps) }
-    var whole = start == 0 && length >= source.duration
-    var range = whole ? nil : CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 90_000),
+    let whole = start == 0 && length >= source.duration
+    let range = whole ? nil : CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 90_000),
                                           duration: CMTime(seconds: length, preferredTimescale: 90_000))
     if o.aiHDR, source.isHDR { throw FormatError("--ai-hdr makes SDR video HDR; this is HDR already") }
-    // --antialias: the part, its edges smoothed, as a ProRes intermediate everything after reads.
-    var antialiasSeconds: Double?
-    if o.antialias, !o.dryRun {
-        let began = Date()
-        let antialiased = work.appendingPathComponent("antialiased.mov")
-        try Antialias.make(readable, start: start, length: whole ? nil : length, into: antialiased)
-        if !source.needsTenBit { eightBitSource = true }
-        readable = antialiased
-        source = try await SpatialVideoSource.open(antialiased)
-        (start, length, whole, range) = (0, source.duration, true, nil)
-        antialiasSeconds = Date().timeIntervalSince(began)
-    }
-
     // Each eye as it shows (a squeezed eye stretched back out), then as it
     // is made: twice that with --upscale, capped by --max-eye.
     let frame = (width: Double(source.frameSize.width), height: Double(source.frameSize.height))
@@ -380,10 +367,8 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
     if let network {
         log("  upscaled 2× from \(modelEye.width)×\(modelEye.height) by \(network.name) (Real-ESRGAN, \(network.convolutions) convolutions)")
     }
-    if let antialiasSeconds {
-        log(String(format: "  antialiased: edges smoothed (both fields by edge-slope tracing, along edges) in %.1f s", antialiasSeconds))
-    }
-    if o.aiHDR { log("  AI HDR: GMNet gain grids, BT.2020 PQ, SDR white at 203 nits, average gain held to 2.5×") }
+    if o.antialias { log("  antialiased: each eye's straight edges averaged along themselves (edge-tangent AA, last before encoding)") }
+    if o.aiHDR { log("  AI HDR: GMNet gain grids, highlights spread from the mid-tones, BT.2020 PQ, SDR white at 203 nits, average gain held to 2.5×") }
     if let repeats, repeats.isPulldown {
         log(String(format: "  frames: one in five repeats the one before (%d of %d moving stretches): %@", repeats.repeating,
                    repeats.moving, dropRepeats ? String(format: "dropped, %.3f fps becomes %.3f", fps, outputFPS)
@@ -463,7 +448,8 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
         arrangement: layout.isSideBySide ? .sideBySide : .topAndBottom, eye: made, picture: picture,
         strength: strength, convergence: convergence, bitsPerSecond: bitsPerSecond, tenBit: tenBit,
         includeAudio: o.includeAudio, progress: report("picture"), mode: mode, upscaler: upscaler, regions: regions,
-        dropRepeats: dropRepeats, outputFrameRate: outputFPS, gains: grids)
+        dropRepeats: dropRepeats, outputFrameRate: outputFPS, gains: grids,
+        antialias: o.antialias && !o.dryRun ? try EdgeAntialias() : nil)
     let result = try await encodeStereo(job)
     if terminal { FileHandle.standardError.write(Data("\r".utf8)) }
     let pictureSeconds = Date().timeIntervalSince(pictureBegan)
@@ -561,6 +547,8 @@ struct StereoEncodeJob: @unchecked Sendable {
     var outputFrameRate: Double = 30
     /// AI HDR: each frame's grid, by its time from the part's start.
     var gains: AIHDRGrids?
+    /// --antialias: each eye of the finished picture, before AI HDR.
+    var antialias: EdgeAntialias?
 }
 
 struct StereoEncodeResult: Sendable {
@@ -797,6 +785,19 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
                                 try job.upscaler?.upscale(frame, regions: job.regions, into: packed, at: [(0, 0), second])
                             case .flatUpscale:
                                 try job.upscaler?.upscale(frame, regions: job.regions, into: packed, at: [(0, 0)])
+                            }
+                            if let antialias = job.antialias {
+                                let eyes: [EdgeAntialias.Eye]
+                                if case .flatUpscale = job.mode {
+                                    eyes = [.init(x: 0, y: 0, width: job.eye.width, height: job.eye.height)]
+                                } else if job.arrangement == .sideBySide {
+                                    eyes = [.init(x: 0, y: 0, width: job.eye.width, height: job.eye.height),
+                                            .init(x: job.eye.width, y: 0, width: job.eye.width, height: job.eye.height)]
+                                } else {
+                                    eyes = [.init(x: 0, y: 0, width: job.eye.width, height: job.eye.height),
+                                            .init(x: 0, y: job.eye.height, width: job.eye.width, height: job.eye.height)]
+                                }
+                                try antialias.apply(packed, eyes: eyes)
                             }
                             if let gains = job.gains, let baker,
                                let grid = gains.grid(at: CMSampleBufferGetPresentationTimeStamp(sample).seconds - first) {

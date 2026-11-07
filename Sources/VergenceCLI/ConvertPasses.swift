@@ -2,17 +2,13 @@
  Vergence - `convert`'s optional passes for old SD films: `--antialias` and `--ai-hdr`
 
  `--antialias`: a 2003 SD CG film after NTSC deinterlacing has diagonal
- edges in stairs a line tall (each field line doubled). An upscaler sharpens
- those steps into crisp ragged edges. Before anything else sees the picture,
- ffmpeg re-makes each field's missing lines by edge-slope tracing (`estdif`,
- built into every ffmpeg, LGPL, no weights), both fields' versions are
- averaged (the "daa" anti-aliasing of old AviSynth scripts), and that is used
- only along edges (a Sobel mask, blurred), so texture away from edges keeps
- its detail. On a 3D film's bed edge, against nothing and against NNEDI3 in
- the same arrangement (GPL weights) and both directions: edge raggedness
- 0.0565 (masked 0.0564) against 0.0655 untouched and 0.0612 / 0.0592 with
- NNEDI3, keeping more detail than either. The result goes to a ProRes
- intermediate of the part being converted, in the work folder.
+ edges in stairs a line tall (each field line doubled), which an upscaler
+ sharpens into crisp ragged edges. `EdgeAntialias` (VergenceApple) smooths
+ the finished picture along its straight edges, each eye on its own, just
+ before AI HDR and the encoder. It replaced an ffmpeg pre-pass (both fields
+ re-made by `estdif` and averaged along edges) that took at most 30 % off the
+ staircase for 4–15 % of the texture; this takes off 22–41 %, the sawtooth
+ gone, for 1–9 %.
 
  `--ai-hdr`: GMNet's gain grids made exactly as the `ai-hdr` workload makes
  them (`GainGridProducer`: keyframes every half second and at cuts, eased
@@ -28,28 +24,6 @@ import CoreML
 import Foundation
 import VergenceApple
 import VergenceCommandLine
-
-enum Antialias {
-    /// The ffmpeg filter graph (one input, one output): both fields
-    /// re-interpolated by edge-slope tracing, averaged, kept along edges.
-    /// `vergence-convert` uses the same graph.
-    static let filter = "format=yuv420p10le,split=4[o][a][b][m];"
-        + "[a]estdif=mode=frame:parity=tff:deint=all[t];[b]estdif=mode=frame:parity=bff:deint=all[u];"
-        + "[t][u]blend=all_mode=average[aa];[m]sobel=planes=7:scale=4,gblur=sigma=1.5:planes=7[mk];[o][aa][mk]maskedmerge"
-
-    /// `input` from `start` for `length` seconds (nil: to the end),
-    /// antialiased, its audio copied, into a ProRes 422 file at `output`.
-    static func make(_ input: URL, start: Double, length: Double?, into output: URL) throws {
-        let ffmpeg = try FFmpeg.required(for: "--antialias")
-        var args = ["-nostdin", "-v", "error", "-y"]
-        if start > 0 { args += ["-ss", String(format: "%.6f", start)] }
-        args += ["-i", input.path]
-        if let length, length.isFinite { args += ["-t", String(format: "%.6f", length)] }
-        args += ["-map", "0:v:0", "-map", "0:a?", "-fps_mode", "passthrough", "-vf", filter,
-                 "-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le", "-c:a", "copy", "-f", "mov", output.path]
-        try ffmpeg.run(ffmpeg.ffmpeg, args, capture: false)
-    }
-}
 
 /// GMNet's grid for every frame of a part, by the frame's index from its start.
 struct AIHDRGrids {
