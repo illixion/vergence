@@ -499,7 +499,7 @@ Core ML's float16 run by up to 1 px (p99 0.06 px), as the Mac's ONNX CPU run doe
 (`scripts/check-onnx-worker.sh` on a Mac, then the PC's chunks against its `KEEP_COREML` track with
 `scripts/compare-analysis-tracks.py`). So PCs share one profile, and Core ML titles keep theirs.
 
-The 2D workloads run on the PC worker too, each under its own ONNX profile (`workloads`,
+The 2D workloads run on the PC worker too (`workloads`,
 `depthModel`, `depthSize` and `gainModel` in its config; `worker/src/config.rs`):
 
 | Workload | Model (export) | RTX 3080, a 720p title's pieces | Against the Core ML worker |
@@ -508,6 +508,11 @@ The 2D workloads run on the PC worker too, each under its own ONNX profile (`wor
 | `ai-3d-depth` | Depth Anything V2 Small at 770×574 (any free-size export, e.g. `vergence-convert --download-model`'s), through `vergence-convert`'s depth pipeline | 13 fps of title (CUDA), each piece with its second of context; DirectML about a third of that | mean 0.012, max 0.09 (shot-space depth) |
 | `ai-hdr` | GMNet (`export-gmnet-onnx.py`, MIT) on keyframes | 59 fps (CUDA) | log2 gain within 0.01 |
 
+2D flow and AI HDR keep a profile per engine family. Depth is shared: Depth Anything V2 Small and
+Base have one profile name on both workers (`Depth Anything V2 Small 770x574 offline-v5
+context-1s`), so a Mac and a PC split a title's pieces. Their records differ by about 0.012 on
+average and 0.04 at p99 (Base 0.006 and 0.025), against 0.005 and 0.023 between a Core ML piece
+and a whole-file run: a quarter of a pixel of parallax on average at Convolution's Subtle strength.
 TensorRT builds an engine per input size, so the two free-size models (Depth Anything, GMNet) run on
 CUDA when TensorRT is chosen. `scripts/check-onnx-workload.sh` runs both workers on one title and
 prints the differences.
