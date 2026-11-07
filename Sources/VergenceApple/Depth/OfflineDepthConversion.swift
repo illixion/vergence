@@ -97,6 +97,24 @@ public enum OfflineDepthConversion {
         return count
     }
 
+    /// The depth in `entry` as `depth` records (as `writeAnalysisTrack`
+    /// writes them), in presentation order, deflated or not as `deflate` says.
+    public static func records(_ entry: DepthCacheStore.Entry,
+                               deflate: ((AnalysisRecord) throws -> AnalysisRecord)? = nil) async throws -> [AnalysisRecord] {
+        var records: [AnalysisRecord] = []
+        for file in [entry.depthVideoURL, entry.secondaryDepthVideoURL] where FileManager.default.fileExists(atPath: file.path) {
+            let asset = AVURLAsset(url: file)
+            guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+                throw Failure.unreadable("no depth track in \(file.lastPathComponent)")
+            }
+            try forEachDepthFrame(asset, track) { pts, plane in
+                guard let record = try depthRecord(plane, at: pts, meta: entry.meta) else { return }
+                records.append(try deflate?(record) ?? record)
+            }
+        }
+        return records.sorted { $0.time < $1.time }
+    }
+
     /// One depth frame's luma, valid inside the callback.
     struct LumaPlane {
         let base: UnsafePointer<UInt8>

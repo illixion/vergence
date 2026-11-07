@@ -12,6 +12,9 @@
    each frame's right→left disparity (NeuFlow 512×288), as `vergence analyze`.
  - smooth-motion-2d: the whole picture's flow (RIFE 960×576), for 2D titles
    and AI 3D; offered when the models folder has a RIFE*960x576.
+ - ai-3d-depth: a 2D title's AI 3D depth through the offline pipeline with
+   `depthModel` (Depth Anything V2 Small at 770×574 rather than the headset's
+   518×392); offered when the config names one.
  Design: Hypnos `docs/plans/analysis-workers.md`.
 
  --reference runs one workload over a local file in a single decode and
@@ -28,6 +31,7 @@
      "remote": false,                                     (true: never takes live pieces)
      "models": "~/Models/interp",                         (RIFE*480x288 and NeuFlow*512x288, as for analyze; RIFE*960x576 for 2D)
      "workloads": ["smooth-motion-3d"],                   (default: every one the models allow)
+     "depthModel": "~/Models/DepthAnythingV2Small770x574.mlpackage",   (ai-3d-depth; Apache-2.0 weights only)
      "computeUnits": "all",                               (ane | gpu | cpu | all)
      "ffmpeg": "/opt/homebrew/bin/ffmpeg",                (default: ffmpeg on PATH)
      "jellyfin": { "url": "http://home-server:8096", "apiKeyFile": "~/.config/vergence/jellyfin.key" },
@@ -71,6 +75,8 @@ struct WorkerConfig: Decodable {
     var remote: Bool?
     var models: String
     var workloads: [String]?
+    /// The AI 3D depth model (`ai-3d-depth`), a Core ML Depth Anything V2 Small conversion.
+    var depthModel: String?
     var computeUnits: String?
     var ffmpeg: String?
     var jellyfin: Server?
@@ -155,7 +161,7 @@ func runWorker(_ args: [String]) async throws {
         let producers = try await makeProducers(config)
         guard let producer = producers[workload] else { usage("no \(workload) with these models") }
         let input = try PieceInput.probe(reference, stereo: stereo)
-        let track = try PieceDecoder(ffmpeg: config.ffmpeg.map(expandTilde)).track(
+        let track = try await PieceDecoder(ffmpeg: config.ffmpeg.map(expandTilde)).track(
             of: input, frames: 0 ..< frames, frameCount: frames, producer: producer,
             mediaID: "reference", producerName: "vergence worker --reference")
         try track.write(to: URL(fileURLWithPath: output))
@@ -195,6 +201,10 @@ func makeProducers(_ config: WorkerConfig) async throws -> [String: PieceProduce
         } else if wanted != nil {
             throw WorkerFailure("smooth-motion-2d needs RIFE*\(MonoFlowProducer.modelSize) in \(folder.path)")
         }
+    }
+    if wanted?.contains(DepthProducer.workload) ?? (config.depthModel != nil) {
+        guard let path = config.depthModel else { throw WorkerFailure("ai-3d-depth needs depthModel in the config") }
+        producers[DepthProducer.workload] = try DepthProducer(model: URL(fileURLWithPath: expandTilde(path)))
     }
     guard !producers.isEmpty else { throw WorkerFailure("the config asks for no workload this worker makes") }
     return producers
@@ -354,7 +364,7 @@ final class AnalysisWorker: @unchecked Sendable {
         let input = PieceInput(url: forwarder.url.absoluteString, width: lease.info.width, height: lease.info.height,
                                codec: lease.info.codec, stereo: lease.info.stereo,
                                rate: (lease.info.frameRate.num, lease.info.frameRate.den))
-        return try PieceDecoder(ffmpeg: config.ffmpeg.map(expandTilde)).track(
+        return try await PieceDecoder(ffmpeg: config.ffmpeg.map(expandTilde)).track(
             of: input, frames: lease.firstFrame ..< lease.endFrame, frameCount: lease.frameCount,
             producer: producer, mediaID: lease.title, producerName: "vergence worker")
     }

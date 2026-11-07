@@ -45,6 +45,21 @@ extension PieceProducer {
     func finish(piece: Range<Int64>) throws -> [AnalysisRecord] { [] }
 }
 
+/// A workload that decodes a piece its own way (to a file a pipeline reads
+/// whole, such as the offline depth converter) instead of frame by frame.
+protocol PieceFileProducer: PieceProducer {
+    func track(of input: PieceInput, frames piece: Range<Int64>, frameCount: Int64, ffmpeg: String?,
+               mediaID: String, producerName: String) async throws -> Data
+}
+
+extension PieceFileProducer {
+    var framesBefore: Int64 { 0 }
+    var framesAfter: Int64 { 0 }
+    func frame(_ frame: DecodedFrame, index: Int64, time: AnalysisTime, piece: Range<Int64>) throws -> [AnalysisRecord] {
+        throw WorkerFailure("\(Self.self) decodes its pieces itself")
+    }
+}
+
 /// What a decode reads: a URL or path, and the title as the coordinator described it.
 struct PieceInput {
     var url: String
@@ -93,7 +108,11 @@ struct PieceDecoder {
     /// the records as a track. `frameCount` is the title's (`Int64.max` for a
     /// reference run, which decodes to the end).
     func track(of input: PieceInput, frames piece: Range<Int64>, frameCount: Int64, producer: PieceProducer,
-               mediaID: String, producerName: String) throws -> Data {
+               mediaID: String, producerName: String) async throws -> Data {
+        if let producer = producer as? PieceFileProducer {
+            return try await producer.track(of: input, frames: piece, frameCount: frameCount, ffmpeg: ffmpeg,
+                                            mediaID: mediaID, producerName: producerName)
+        }
         let w = input.width, h = input.height
         let packing: (sideBySide: Bool, stereo: Bool)
         switch input.stereo {
@@ -216,7 +235,7 @@ private final class MessageSink: @unchecked Sendable {
 
 /// smooth-motion-3d: the left eye's flow between frames and each frame's
 /// right→left disparity, exactly as `vergence analyze` makes them.
-final class StereoFlowProducer: PieceProducer {
+final class StereoFlowProducer: PieceProducer, @unchecked Sendable {
     static let workload = "smooth-motion-3d"
     let analyzer: StereoFlowAnalyzer
     let kinds: Set<String> = ["flowPair", "disparity"]
@@ -311,6 +330,98 @@ final class MonoFlowProducer: PieceProducer {
         return [SharedFieldAnalysis.flowPairRecord(flow: flow, mask: mask, width: analyzer.width, height: analyzer.height,
                                                    time: previous.time, endTime: time,
                                                    step: SharedFieldAnalysis.monoFlowStep)]
+    }
+}
+// MARK: - AI 3D depth
+
+/// ai-3d-depth: the pre-processed AI 3D depth of a 2D title (Vergence's
+/// offline depth pipeline, `OfflineDepthConversion`: inference, the
+/// joint-bilateral refinement on the frame's own edges, the cut-aware ±2
+/// frame window and Stable Depth's shot-space anchoring) with a larger model
+/// than a headset runs live, as `depth` records a player warps from.
+///
+/// The pipeline reads a whole file, so each piece is decoded to a short
+/// intermediate (ProRes, at most 1036 px, the size the converter decodes to)
+/// with a second of frames before it, which the anchoring settles over, and
+/// the two the temporal window needs after it; only the piece's records go
+/// up. Time constants in the anchoring run to a few seconds, so a long shot
+/// can still differ slightly from a whole-file conversion around a piece's
+/// start (`scripts/check-worker.sh … ai-3d-depth` measures it).
+final class DepthProducer: PieceFileProducer {
+    static let workload = "ai-3d-depth"
+    /// Frames of context before a piece, in seconds of the title.
+    static let contextSeconds = 1.0
+    let model: URL
+    let kinds: Set<String> = ["depth"]
+    let models: [String: String]
+    let needsStereo = false
+
+    init(model: URL) throws {
+        guard OfflineDepthConversion.canLoad(model: model) else { throw WorkerFailure("can't load the depth model at \(model.path)") }
+        self.model = model
+        // Model and pipeline version: a title keeps one, and the pipeline's own version changes its records.
+        models = ["depth": "\(model.deletingPathExtension().lastPathComponent) offline-v\(DepthCacheStore.pipelineVersion) context-1s"]
+    }
+
+    func track(of input: PieceInput, frames piece: Range<Int64>, frameCount: Int64, ffmpeg: String?,
+               mediaID: String, producerName: String) async throws -> Data {
+        guard input.stereo == "mono" else { throw WorkerFailure("the title is stereo; AI 3D depth is for 2D") }
+        let rate = Double(input.rate.num) / Double(input.rate.den)
+        let before = Int64((Self.contextSeconds * rate).rounded())
+        let first = max(0, piece.lowerBound - before)
+        let (after, overflow) = piece.upperBound.addingReportingOverflow(2)
+        let last = overflow ? frameCount : min(frameCount, after)
+        let wanted = last - first
+        let work = FileManager.default.temporaryDirectory.appendingPathComponent("vergence-depth-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: work) }
+        let intermediate = work.appendingPathComponent("piece.mov")
+
+        let seek = (Double(first) - 0.5) / rate
+        var args = ["-nostdin", "-v", "error"]
+        if input.codec.lowercased() == "h264" { args += ["-bsf:v", "filter_units=remove_types=6"] }
+        if seek > 0 { args += ["-ss", String(format: "%.6f", seek)] }
+        args += ["-i", input.url, "-map", "0:v:0", "-fps_mode", "passthrough"]
+        if wanted < Int64(Int32.max) { args += ["-frames:v", String(wanted)] }
+        args += ["-vf", "scale='min(iw,1036)':'min(ih,1036)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                 "-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le", "-an", "-sn", "-dn",
+                 "-y", intermediate.path]
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffmpeg ?? "/usr/bin/env")
+        process.arguments = ffmpeg == nil ? ["ffmpeg"] + args : args
+        process.qualityOfService = .utility
+        let errors = Pipe()
+        process.standardError = errors
+        process.standardOutput = FileHandle.nullDevice
+        let messages = MessageSink()
+        errors.fileHandleForReading.readabilityHandler = { messages.append($0.availableData) }
+        try process.run()
+        process.waitUntilExit()
+        errors.fileHandleForReading.readabilityHandler = nil
+        guard process.terminationStatus == 0 else {
+            throw WorkerFailure("ffmpeg couldn't make the piece (\(process.terminationStatus)): \(messages.text.prefix(300))")
+        }
+
+        let entry = try await OfflineDepthConversion.convert(video: intermediate, into: work.appendingPathComponent("depth"),
+                                                             model: model)
+        let records = try await OfflineDepthConversion.records(entry)
+        let reference = frameCount == Int64.max
+        guard reference || Int64(records.count) >= min(piece.upperBound, last) - first else {
+            throw WorkerFailure("the depth pass gave \(records.count) of \(wanted) frames")
+        }
+        let header = AnalysisTrackHeader(mediaID: mediaID, producer: producerName, models: models,
+                                         sourceWidth: input.width, sourceHeight: input.height)
+        var track = try AnalysisTrack.header(header)
+        // The intermediate's k-th frame is the title's frame first + k.
+        for (k, record) in records.enumerated() {
+            let index = first + Int64(k)
+            guard piece.contains(index) else { continue }
+            var record = record
+            record.time = AnalysisTime(value: index * Int64(input.rate.den), timescale: Int32(input.rate.num))
+            record.endTime = record.time
+            track.append(AnalysisTrack.record(try record.deflated()))
+        }
+        return track
     }
 }
 #endif

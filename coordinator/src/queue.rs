@@ -53,6 +53,10 @@ impl Workload {
     /// mono). Larger than the 3D workload's (RIFE at 960×576 against
     /// 480×288), since there is no disparity to make.
     pub const SMOOTH_MOTION_2D: &'static str = "smooth-motion-2d";
+    /// AI 3D's depth for a 2D title: the offline pipeline's refined,
+    /// shot-anchored depth with a larger model than a headset runs live, one
+    /// `depth` record per frame (eye mono), which the player warps from.
+    pub const AI_3D_DEPTH: &'static str = "ai-3d-depth";
 
     pub fn defaults() -> Vec<Workload> {
         vec![
@@ -68,6 +72,7 @@ impl Workload {
                 needs_stereo: false,
                 mono_only: true,
             },
+            Workload { name: Self::AI_3D_DEPTH.into(), kinds: vec![Kind::Depth], needs_stereo: false, mono_only: true },
         ]
     }
 }
@@ -916,5 +921,39 @@ mod tests {
         assert!(matches!(q.check(lease.lease, "a", &track::parse(&short).unwrap()), Err(UploadError::Count { .. })));
         q.complete(lease.lease, (1920, 1080), now);
         assert_eq!(q.status(&key).unwrap().pieces_done, 1);
+    }
+
+    #[test]
+    fn checks_depth_uploads() {
+        let mut q = Queue::new();
+        let source = SourceRef::jellyfin("flat");
+        let depth = workload(Workload::AI_3D_DEPTH);
+        assert_eq!(q.add(SourceRef::jellyfin("sbs"), &depth, info(4.0)), Err(AddError::Stereo));
+        q.add(source.clone(), &depth, mono_info(4.0)).unwrap();
+        let now = Instant::now();
+        let profile: Profile = [("depth".to_string(), "DA2 Small 770x574".to_string())].into();
+        // A Smooth Motion worker doesn't get depth work.
+        assert!(q.claim(&claim("flow", false), now).is_none());
+        let worker = Claim { models: profile.clone(), ..claim("a", false) };
+        let lease = q.claim(&worker, now).unwrap();
+        assert_eq!(lease.kinds, vec![Kind::Depth]);
+        let upload = |eye: u8, frames: std::ops::Range<i64>| {
+            let mut data = track::write_header(&Header {
+                media_id: "x".into(),
+                producer: "test".into(),
+                models: profile.clone(),
+                source_width: 1280,
+                source_height: 720,
+            });
+            for k in frames {
+                data.extend(record(Kind::Depth, eye, k, k, 24, 8, 4));
+            }
+            track::parse(&data).unwrap()
+        };
+        // One depth record a frame, every frame of the piece (none needs a next frame).
+        assert!(q.check(lease.lease, "a", &upload(0, 0..48)).is_ok());
+        assert_eq!(q.check(lease.lease, "a", &upload(2, 0..48)), Err(UploadError::Eye("depth")));
+        // The context frames before and after a piece stay with the worker.
+        assert!(matches!(q.check(lease.lease, "a", &upload(0, 0..50)), Err(UploadError::Time(_))));
     }
 }
