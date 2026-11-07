@@ -358,7 +358,8 @@ the experiment, but needs a flow model per frame.
 
 **Speed.** In `convert` on the M2 Max both eyes of a 720×400 pair take about 100 ms (one eye on the
 Neural Engine, the other on the GPU, at once): 9.3 frames a second for 3D, 14 for a 2D picture
-(cut in two between them) with the warp and HEVC encode included. On a Windows PC with an
+(cut in two between them) with the warp and HEVC encode included. The whole 81-minute 3D film
+(121,493 frames once its repeats were dropped) took 3 h 36 min, 9.4 frames a second. On a Windows PC with an
 RTX 3080 and a 6-core CPU the same 3D clips go at 6.9 frames a second with DirectML and 6.5 with CUDA
 (the network in float16 about 85–120 ms a pair, the eyes' fusion on the CPU about 140 ms beside it,
 which sets the pace), so a feature takes about five hours there. The two converters' copies agree at
