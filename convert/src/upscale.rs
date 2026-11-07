@@ -14,7 +14,7 @@
 //! block matching on the source-size luma (7×7, ±4 % of the width, sub-pixel,
 //! a texture floor, a uniqueness test and a left-right check), and each eye's
 //! detail band (the picture less a σ 1.5 Gaussian of it) moved halfway
-//! towards the other eye's where both see the point.
+//! towards the other eye's where both see the point, by at most 10 code values.
 
 use std::path::{Path, PathBuf};
 
@@ -455,6 +455,8 @@ fn block_match(own: &[f32], other: &[f32], w: usize, h: usize, radius: i32) -> V
 }
 
 const TEXTURE_FLOOR: f32 = 0.008;
+/// The most the fusion moves a value, 10 code values of 255.
+const LIMIT: f32 = 10.0 / 255.0;
 
 /// Sums over a 7×7 window, edges clamped, as the Metal kernel reads them.
 fn box7(input: &[f32], w: usize, h: usize, out: &mut [f32]) {
@@ -576,7 +578,8 @@ pub fn fuse_eyes(low: [&[f32]; 2], high: [&mut Vec<f32>; 2], w: usize, h: usize)
                     if c_weight > 0.01 && there >= 0.0 && there <= hw as f32 - 1.0 {
                         let detail = mine[i] - mine_blurred[i];
                         let other = sample(theirs, c, there, y) - sample(theirs_blurred, c, there, y);
-                        *value = (mine[i] + 0.5 * c_weight * (other - detail)).clamp(0.0, 1.0);
+                        // Held to ±10 code values: a wrong match moves a little detail, never a speck.
+                        *value = (mine[i] + 0.5 * c_weight * (other - detail).clamp(-LIMIT, LIMIT)).clamp(0.0, 1.0);
                     }
                 }
             }

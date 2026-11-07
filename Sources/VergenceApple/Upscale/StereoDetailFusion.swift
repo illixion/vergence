@@ -17,11 +17,14 @@
  2. Each upscaled eye's detail band: the picture less a Gaussian blur of it
     (σ 1.5 output pixels), blurred within its own eye.
  3. out = eye + ½ · confidence · (other eye's detail, warped by the
-    disparity − this eye's detail).
+    disparity − this eye's detail), the difference held to ±10 code values
+    (a match that is wrong but passed the checks would otherwise leave a
+    speck of the wrong texture).
  The coarse picture of each eye is untouched, so nothing moves in depth;
  where the disparity is unknown the eye stays as the network made it. On
- the same film this took the disagreement down by about a third against an
- independent flow measurement (DIS), for 5 % less detail.
+ the same film this took the disagreement down by a quarter in a dialogue
+ scene and 8 % in a dark, fast one, against an independent flow measurement
+ (DIS), for 2-4 % less detail.
  */
 
 #if canImport(Metal) && canImport(CoreVideo)
@@ -35,6 +38,7 @@ final class StereoDetailFusion {
         var weight: Float = 0.5
         var textureFloor: Float = 0.008
         var direction: UInt32 = 0
+        var limit: Float = 10.0 / 255
     }
 
     private let device: MTLDevice
@@ -122,6 +126,7 @@ final class StereoDetailFusion {
         float weight;
         float textureFloor;
         uint direction;
+        float limit;
     };
 
     // Both eyes' luma at the source's eye size, stacked: eye e at rows e·H.
@@ -245,7 +250,8 @@ final class StereoDetailFusion {
         if (c.y > 0.01 && x >= 0 && x <= float(size.x) - 1) {
             float2 there = (float2(other) + float2(x, float(gid.y)) + 0.5) / float2(p.destination);
             float3 theirs = float3(picture.sample(linear, there).rgb) - float3(blurred.sample(linear, there).rgb);
-            out = mine + p.weight * c.y * (theirs - detail);
+            // Held to ±limit: a wrong match moves a little detail, never a speck.
+            out = mine + p.weight * c.y * clamp(theirs - detail, -p.limit, p.limit);
         }
         destination.write(float4(saturate(out), 1.0), at);
     }
