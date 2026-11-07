@@ -201,11 +201,15 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
     guard !o.dryRun, let model else { return false }
 
     let began = Date()
-    let interactive = isatty(STDERR_FILENO) != 0
+    // Progress is redrawn in place on a terminal; with VERGENCE_PROGRESS=1 (a
+    // caller reading a pipe, as the desktop app on Windows does) it comes as lines.
+    let terminal = isatty(STDERR_FILENO) != 0
+    let interactive = terminal || ProcessInfo.processInfo.environment["VERGENCE_PROGRESS"] == "1"
     func report(_ label: String) -> @Sendable (Double) -> Void {
         { fraction in
             guard interactive else { return }
-            FileHandle.standardError.write(Data(String(format: "\r  %@ %3.0f%%", label, fraction * 100).utf8))
+            FileHandle.standardError.write(Data(String(format: terminal ? "\r  %@ %3.0f%%" : "  %@ %3.0f%%\n", label,
+                                                       fraction * 100).utf8))
         }
     }
 
@@ -223,7 +227,7 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
         let depthBegan = Date()
         entry = try await OfflineDepthConversion.convert(video: readable, into: depthFolder, model: model, timeRange: range,
                                                          progress: report("depth"))
-        if interactive { FileHandle.standardError.write(Data("\r".utf8)) }
+        if terminal { FileHandle.standardError.write(Data("\r".utf8)) }
         let seconds = Date().timeIntervalSince(depthBegan)
         log(String(format: "  depth: %d frames in %.1f s (%.1f fps)", entry.meta.frameCount, seconds,
                    Double(entry.meta.frameCount) / max(seconds, 0.001)))
@@ -246,7 +250,7 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
         strength: strength, convergence: convergence, bitsPerSecond: bitsPerSecond, tenBit: tenBit,
         includeAudio: o.includeAudio, progress: report("picture"))
     let result = try await encodeStereo(job)
-    if interactive { FileHandle.standardError.write(Data("\r".utf8)) }
+    if terminal { FileHandle.standardError.write(Data("\r".utf8)) }
     let pictureSeconds = Date().timeIntervalSince(pictureBegan)
     log(String(format: "  picture: %d frames in %.1f s (%.1f fps)%@; %d audio track(s) copied%@", result.frames, pictureSeconds,
                Double(result.frames) / max(pictureSeconds, 0.001),
@@ -265,7 +269,7 @@ func convertOne(_ input: URL, _ output: URL, model: URL?, _ o: Options) async th
                                       camera: camera, quality: o.quality, bitsPerSecond: o.bitrate,
                                       includeAudio: o.includeAudio, tenBit: tenBit)
         let made = try await SpatialVideoMaker.make(spatial, progress: report("spatial"))
-        if interactive { FileHandle.standardError.write(Data("\r".utf8)) }
+        if terminal { FileHandle.standardError.write(Data("\r".utf8)) }
         log(String(format: "  spatial video: %d frames, %.1f Mbps", made.frames, Double(made.bitsPerSecond) / 1_000_000))
     } else {
         try SphericalMetadata.write(to: output, stereoMode: layout.isSideBySide ? .leftRight : .topBottom)

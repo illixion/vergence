@@ -230,6 +230,52 @@ On an M2 Max a 1080p24 video converts at about 30 frames a second, 1.2× realtim
 film takes about 100 minutes: depth runs at 30-35 frames a second (the Neural Engine's model is
 nearly all of it) and the picture at about 180.
 
+`VERGENCE_PROGRESS=1` makes `convert` print its progress as lines (`  depth  42%`) when stderr
+isn't a terminal, for a caller reading a pipe.
+
+#### On Windows and Linux: `vergence-convert`
+
+`convert/` is the same command for a PC: ONNX Runtime runs the depth model (CUDA, TensorRT or
+DirectML on Windows, Core ML or CPU on a Mac), wgpu draws the eyes (Direct3D 12 or Vulkan), and an
+ffmpeg executable decodes and encodes (NVENC, then AMF, Quick Sync or x265). It takes the same flags
+and writes the same files and stderr lines as `vergence convert`, so the desktop app's convert queue
+runs either; `--layout spatial` is Mac only (no MV-HEVC encoder exists on Windows yet). The contract,
+including the environment it reads, is at the top of `convert/src/main.rs`.
+
+```powershell
+cargo build --release -p vergence-convert --features cuda     # ORT_CUDA_VERSION=13: CUDA 13 + cuDNN 9 DLLs on PATH
+$env:VERGENCE_FFMPEG = "C:\ffmpeg\bin\ffmpeg.exe"              # an LGPL build with hevc_nvenc; ffprobe beside it
+target\release\vergence-convert.exe Film.mkv --download-model  # Film.3D.FSBS.mp4 beside it
+```
+
+- **Model:** Depth Anything V2 Small as ONNX. `--download-model` fetches the Apache-2.0 export from
+  [onnx-community](https://huggingface.co/onnx-community/depth-anything-v2-small) (pinned and
+  checksummed) into `%LOCALAPPDATA%\Vergence\DepthModels`; `scripts/export-depth-onnx.py` makes the
+  same file from the original weights and checks it against the Core ML model (correlation 0.99997
+  on a film frame, the largest difference under 1 % of the range).
+- **Depth:** the pre-processed pipeline ported from VergenceCore and VergenceApple: the same
+  letterboxed model input, robust ranges, joint-bilateral refinement and guided ×2 upsample (as
+  WGSL compute), Stable Depth anchoring, cut detection, the ±2-frame window and the shot-locked
+  display mapping. The maths is Rust (`convert/src/maths.rs`), tested against fixtures VergenceCore
+  itself writes (`scripts/make-convert-fixtures.sh`). One deliberate difference: depth is made in one
+  sweep at every frame rate, where the Mac sweeps 48 fps and faster sources twice to make its cache
+  playable sooner.
+- **Picture:** the dense depth-displaced mesh with the soft-knee budget and edge feather, 4×
+  multisampled, drawn on the YCbCr code values (HDR stays PQ or HLG; 10-bit sources are encoded
+  10-bit with their colour tags). HDR10 mastering metadata is copied with x265 only; NVENC output
+  keeps the tags without it.
+- **Audio:** MP4's own codecs copied; TrueHD, DTS-HD MA, FLAC and PCM to ALAC; other lossy audio to
+  AAC, as the Mac's remux does. The output is always MP4.
+- **Parity:** `scripts/check-convert.sh CLIP MODEL.onnx` runs a clip through both and compares each
+  eye. On a 10 s 1080p film clip the copies agree at 48 dB PSNR (luma) and SSIM 0.984 per eye (SDR
+  full side by side), 50.7 dB and 0.991 (HDR10), 43.7–45.4 dB and 0.982–0.988 (half side by side);
+  each tool's own copy is about 44 dB from its source, so the two differ by less than either loses to
+  its encoder. The tolerance is 40 dB and SSIM 0.97: the depth model's output is the same within
+  float16, but anchoring and cut decisions sit on thresholds (a fit needs 15 % of the pixels to hold
+  still), and a frame that lands on the other side of one gives its shot a different depth scale
+  until the next cut, which moves pixels by up to the strength (0.8 % of the width) but never
+  reshapes the depth.
+
 ### Spatial audio
 
 ```sh

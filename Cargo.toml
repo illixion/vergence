@@ -4,7 +4,7 @@
 # MIT like the rest. Design: Hypnos `docs/plans/analysis-workers.md`.
 [workspace]
 resolver = "3"
-members = ["coordinator", "companion", "worker", "desktop"]
+members = ["coordinator", "companion", "worker", "desktop", "convert"]
 
 [workspace.package]
 version = "0.1.0"
