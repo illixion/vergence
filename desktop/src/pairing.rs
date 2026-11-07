@@ -170,6 +170,10 @@ impl Pairing {
 
     fn listen(self: Arc<Self>, listener: TcpListener, config: HostConfig, stop: Arc<AtomicBool>) {
         let until = Instant::now() + OPEN_FOR;
+        // Found by headsets browsing for `_vergence-pair._tcp` while the port is open.
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or_default();
+        let announcement = crate::announce::Announcement::pairing(&config.host_name, port, &config.host_id);
+        tracing::info!(port, announced = announcement.is_announced(), "pairing open");
         while !stop.load(Ordering::SeqCst) && Instant::now() < until {
             let stream = match listener.accept() {
                 Ok((stream, _)) => stream,
