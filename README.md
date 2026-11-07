@@ -20,9 +20,9 @@ It contains no AACS or BD+ code.
 
 | Module | What | Builds on |
 | --- | --- | --- |
-| `VergenceCore` | Stereo layouts (`PackedStereoLayout`) and telling them from a file name or picture (`StereoLayoutDetector`), spatial-video camera metadata and presets (`SpatialCameraMetadata`, `SpatialPreset`), bitrates (`SpatialBitrate`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Analysis tracks (`AnalysisTrack`: flow, disparity and depth fields keyed by media time, made on one machine for another) and the producer's half of stereo Smooth Motion (`SharedFieldAnalysis`). Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
+| `VergenceCore` | Stereo layouts (`PackedStereoLayout`) and telling them from a file name or picture (`StereoLayoutDetector`), spatial-video camera metadata and presets (`SpatialCameraMetadata`, `SpatialPreset`), bitrates (`SpatialBitrate`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Analysis tracks (`AnalysisTrack`: flow, disparity and depth fields keyed by media time, made on one machine for another) and the producer's half of stereo Smooth Motion (`SharedFieldAnalysis`). Reading PyTorch checkpoints without Python (`TorchCheckpoint`) and finding a pulldown's repeated frames (`RepeatedFrames`). Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
 | `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
-| `VergenceApple` | The Apple-framework half: spatial video making and inspection (`SpatialVideoMaker`, `SpatialVideoInspector`), realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox, Smooth Motion (frame interpolation, and `StereoFlowAnalyzer`: the flow and disparity models with Core ML). Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
+| `VergenceApple` | The Apple-framework half: spatial video making and inspection (`SpatialVideoMaker`, `SpatialVideoInspector`), realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox, Smooth Motion (frame interpolation, and `StereoFlowAnalyzer`: the flow and disparity models with Core ML), 2× upscaling with Real-ESRGAN's compact network built from its weights (`FrameUpscaler`, with `StereoDetailFusion` for a stereo pair). Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
 | `vergence` | The command line tool. | macOS, Linux (disc commands only, without PNG or audio output) |
 | `VergenceCommandLine` | The tool's option parsing and output names, apart from the executable so its tests can import them (not a product). Foundation only. | Apple platforms, Linux (tested) |
 | `coordinator/` (Rust) | `vergenced`, the analysis coordinator: queues work for Jellyfin and Stash titles in 2 s pieces, nearest a player's playhead first, checks and keeps workers' results, serves them in 10 s chunks. | macOS, Linux, Windows |
@@ -291,6 +291,79 @@ target\release\vergence-convert.exe Film.mkv --download-model  # Film.3D.FSBS.mp
   SDK 13 encodes two-view MV-HEVC through its own API, but ffmpeg's `hevc_nvenc` exposes none of it,
   and x265 4's `--multiview-config` needs its own (GPL) executable and an Apple spatial-metadata
   muxer on top; either would be new work.
+
+#### Upscaling: `--upscale 2x`
+
+```sh
+vergence convert "Film sbs.mkv" --upscale 2x --download-model   # a 3D film: each eye 2×, Film sbs.2x.3D.FSBS.mp4
+vergence convert Film.mkv --upscale 2x                          # 2D: upscaled, then AI 3D as above
+vergence convert Film.mkv --upscale 2x --layout 2d              # 2D: upscaled only, Film.2x.mp4
+```
+
+Both converters take the same flags (`vergence-convert` on Windows and Linux too). The network is
+Real-ESRGAN's compact general model, `realesr-general-x4v3` (BSD-3-Clause, 4.9 MB), run at 4× and
+averaged to 2×. Vergence ships no weights and no converted model: `--download-model` fetches the
+authors' own `.pth` from [github.com/xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
+(checked by SHA-256) into `Vergence/UpscaleModels` beside the depth models, and each converter builds
+the network from it, without Python: the Mac writes the Core ML model itself and compiles it once per
+size, splitting each batch between the Neural Engine and the GPU; the PC writes the ONNX graph for
+ONNX Runtime. `--upscale-model PATH` (or `VERGENCE_UPSCALE_MODEL`) takes another compact Real-ESRGAN
+`.pth`; `realesr-animevideov3.pth` from the same release is about twice as fast and smoother.
+
+- **A 2D source** is upscaled in the picture pass and then warped from depth as before (depth is
+  still made at the source's size), or with `--layout 2d` only upscaled.
+- **A side-by-side or top-and-bottom source** (declared by the file, named so, or on the Mac seen in
+  its picture; `--input-layout sbs|hsbs|tab|htab|2d` to say) has each eye upscaled, with no depth,
+  and packed as `--layout` asks (full or half side by side, top and bottom, or spatial video on the
+  Mac). A half-width eye is stretched back to its real shape first. Then the eyes' fine detail is
+  brought into agreement: an upscaler run on each eye alone invents texture in each on its own, so
+  where block matching on the source finds the same point in both eyes (SAD on luma, a left-right
+  check), each eye's detail band is moved halfway towards the other's. The coarse picture, and so
+  the depth, is untouched.
+- **Names:** `VIDEO.2x.3D.FSBS.mp4` (and the other layouts), `VIDEO.2x.mp4` for `--layout 2d`.
+- HDR, audio, `--quality`, `--max-eye` (applied to the upscaled eye), `--sample` and the rest work as
+  without it. The bitrate is worked out for the bigger picture; `--quality high` keeps more of the
+  new detail.
+
+**Repeated frames.** Every `convert` now checks whether a video repeats one frame in five: film made
+30 fps by doubling a frame in four and then retimed, often to an odd rate after a remux (a 3D film
+read as 31.24 fps: NTSC's 29.97 sped up 25/23.976 to fit PAL audio). Those repeats judder in a headset
+and cost a fifth more work. It drops one frame in five, the one most like its predecessor (ffmpeg's
+`decimate` on the PC), so the rest keep their place against the audio, and writes four fifths of the
+rate (31.24 → 24.99 fps). `--keep-repeated-frames` keeps them.
+
+**What was measured** on that film (720×400 per eye, H.264 at 7.8 Mbps), two 10 s clips (a dialogue
+scene and a dark, fast one), each eye 2×, against Lanczos: the detail added (mean high-pass energy),
+the left/right disagreement of that detail after warping the right eye onto the left by optical flow
+(DIS, independent of the converter's matcher), and the frame-to-frame flicker of it along the flow.
+
+| Method (licence) | Detail | L/R disagreement | Flicker | Per eye (M2 Max GPU, PyTorch) |
+| --- | --- | --- | --- | --- |
+| Lanczos | 1 | 1 | 1 | |
+| realesr-animevideov3 (BSD-3) | 1.13–1.26 | 0.89–0.98 | 0.95–1.00 | 49 ms |
+| **realesr-general-x4v3 (BSD-3)** | 1.36–1.48 | 1.23–1.29 | 1.23–1.36 | 83 ms |
+| **the same, eyes' detail fused** (what `convert` does) | 1.31–1.44 | 0.92–1.20 | 1.16–1.34 | a few ms |
+| RealESRGAN_x2plus, RRDB (BSD-3) | 1.23–1.28 | 1.20–1.28 | 1.39–1.71 | 323 ms |
+| RealESRGAN_x4plus, RRDB (BSD-3) | 1.30–1.42 | 1.34–1.39 | 1.64–1.69 | 1.0 s |
+| RealBasicVSR, a video model (Apache-2.0) | 1.54–1.84 | 1.51–2.10 | 1.46–1.99 | 0.8 s |
+
+The RRDB networks are slower and flicker more than the compact one; RealBasicVSR invents the most
+texture but differently in each eye and from frame to frame on this compressed source. The compact
+general network adds the most detail for its cost, and relative to the detail it adds it disagrees
+less between the eyes than Lanczos does; the fusion takes that down to Lanczos's level or below
+for a few percent of the detail. A stereo network (NAFSSR: MIT code, weights trained on Flickr1024
+with clean bicubic downscaling) wasn't tried: it isn't trained for compressed video. Not built yet:
+the same detail blend along motion (flow-warped from the frame before) cut the flicker by a third in
+the experiment, but needs a flow model per frame.
+
+**Speed.** In `convert` on the M2 Max both eyes of a 720×400 pair take about 100 ms (one eye on the
+Neural Engine, the other on the GPU, at once): 9.3 frames a second for 3D, 14 for a 2D picture
+(cut in two between them) with the warp and HEVC encode included. On a Windows PC with an
+RTX 3080 and a 6-core CPU the same 3D clips go at 6.9 frames a second with DirectML and 6.5 with CUDA
+(the network in float16 about 85–120 ms a pair, the eyes' fusion on the CPU about 140 ms beside it,
+which sets the pace), so a feature takes about five hours there. The two converters' copies agree at
+about 40–43 dB PSNR (luma) frame for frame; where the Mac and ffmpeg's `decimate` drop a different
+frame of a five, the frames there differ.
 
 ### Spatial audio
 
