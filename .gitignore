@@ -9,3 +9,6 @@ DerivedData/
 *.264
 !Tests/**/Fixtures/*.264
 /target/
+# ONNX exports of third-party weights (scripts/export-onnx-models.py); never committed
+/onnx-models/
+/.venv/
