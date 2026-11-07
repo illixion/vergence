@@ -21,6 +21,11 @@ cuda = ["ort/cuda"]
 tensorrt = ["ort/tensorrt"]
 directml = ["ort/directml"]
 coreml = ["ort/coreml"]
+# The larger depth models, whose weights are CC-BY-NC-4.0 (Depth Anything V2
+# Base and Large) or research-only: off by default, for builds made for
+# non-commercial use (sideloaded, never a store's). Without it they are
+# refused, and --download-model names only Small.
+noncommercial-models = []
 
 [dependencies]
 ort = "=2.0.0-rc.15"

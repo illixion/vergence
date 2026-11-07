@@ -16,6 +16,7 @@ mod announce;
 mod commands;
 mod convert;
 mod coordinator;
+mod models;
 mod pairing;
 mod settings;
 mod sidecar;
@@ -81,6 +82,8 @@ fn main() {
             commands::convert_clear_finished,
             commands::convert_reveal,
             commands::set_launch_at_login,
+            commands::depth_variants,
+            commands::choose_depth_variant,
             commands::update_status,
             commands::check_update,
             commands::install_update,

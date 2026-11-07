@@ -44,3 +44,8 @@ libc = "0.2"
 [features]
 # Serves the bundled ui/ instead of a dev server. `cargo tauri build` turns it on.
 custom-protocol = ["tauri/custom-protocol"]
+# Offer the larger depth models, whose weights are CC-BY-NC-4.0 (Depth
+# Anything V2 Base and Large), for conversions on Windows and Linux, after
+# showing their licence: off by default, for builds made for non-commercial
+# use only (with vergence-convert built with the same feature).
+noncommercial-models = []

@@ -163,7 +163,14 @@ fn wanted(config: &Config) -> Result<Wanted, String> {
     let depth = match (asked(workloads::AI_3D_DEPTH).unwrap_or(config.depth_model.is_some()), &config.depth_model) {
         (false, _) => None,
         (true, None) => return Err("ai-3d-depth needs depthModel in the config".into()),
-        (true, Some(path)) => Some((expand_tilde(path), config.depth_size()?)),
+        (true, Some(path)) => {
+            let path = expand_tilde(path);
+            // Refused without the noncommercial-models feature; its licence said with it.
+            if let Some(line) = vergence_convert::licence::check(&path)? {
+                log(line);
+            }
+            Some((path, config.depth_size()?))
+        }
     };
     let gain = match (asked(workloads::AI_HDR).unwrap_or(config.gain_model.is_some()), &config.gain_model) {
         (false, _) => None,

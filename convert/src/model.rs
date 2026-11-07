@@ -19,13 +19,82 @@ pub const HEIGHT: usize = 392;
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
-/// The Apache-2.0 ONNX export `--download-model` fetches: the same weights,
-/// inputs and outputs as `scripts/export-depth-onnx.py` makes (checked equal),
-/// pinned to a revision and checksum.
-pub const DOWNLOAD_NAME: &str = "DepthAnythingV2Small";
-const DOWNLOAD_URL: &str = "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/\
-                            4472b7362082ad9968fee890ca0f1e5aca36b93d/onnx/model.onnx";
-const DOWNLOAD_SHA256: &str = "afb6a5c28f3b6bf1618c6e43f02073ef9dfdc70e937502d51603e57b0a1df10c";
+/// A model `--download-model` fetches: an onnx-community export (free input
+/// size, `pixel_values` → `predicted_depth`), pinned to a revision and checksum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Download {
+    /// What `--variant` calls it.
+    pub variant: &'static str,
+    /// The file it is kept as (the name the licence rule reads).
+    pub name: &'static str,
+    pub display: &'static str,
+    pub repo: &'static str,
+    pub url: &'static str,
+    pub sha256: &'static str,
+    pub megabytes: u32,
+    pub licence: &'static str,
+}
+
+/// Depth Anything V2 Small (Apache-2.0): the same weights, inputs and outputs
+/// as `scripts/export-depth-onnx.py` makes (checked equal).
+pub const SMALL: Download = Download {
+    variant: "small",
+    name: "DepthAnythingV2Small",
+    display: "Depth Anything V2 Small",
+    repo: "huggingface.co/onnx-community/depth-anything-v2-small",
+    url: "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/\
+          4472b7362082ad9968fee890ca0f1e5aca36b93d/onnx/model.onnx",
+    sha256: "afb6a5c28f3b6bf1618c6e43f02073ef9dfdc70e937502d51603e57b0a1df10c",
+    megabytes: 100,
+    licence: "Apache-2.0",
+};
+
+/// The models this build can fetch: Small, and with the `noncommercial-models`
+/// feature the larger CC-BY-NC-4.0 ones (a default build names none of them).
+pub fn downloads() -> Vec<Download> {
+    #[allow(unused_mut)]
+    let mut all = vec![SMALL];
+    #[cfg(feature = "noncommercial-models")]
+    all.extend([
+        Download {
+            variant: "base",
+            name: "DepthAnythingV2Base",
+            display: "Depth Anything V2 Base",
+            repo: "huggingface.co/onnx-community/depth-anything-v2-base",
+            url: "https://huggingface.co/onnx-community/depth-anything-v2-base/resolve/\
+                  dd4557d492cd7b563738ac8d9ccff9094620983c/onnx/model.onnx",
+            sha256: "dab40f67d5ead5e0ed52acfae41a717a708b02bc57f6cb761c5de828f26a7289",
+            megabytes: 390,
+            licence: "CC-BY-NC-4.0",
+        },
+        Download {
+            variant: "large",
+            name: "DepthAnythingV2Large",
+            display: "Depth Anything V2 Large",
+            repo: "huggingface.co/onnx-community/depth-anything-v2-large",
+            url: "https://huggingface.co/onnx-community/depth-anything-v2-large/resolve/\
+                  1fa1591c7b080e98da9655827c3a33a3972a4a83/onnx/model.onnx",
+            sha256: "a93aa89b5e92e30e0afbe0f7c3ec692b35cfca791ae9004a190fb0ca2010e905",
+            megabytes: 1340,
+            licence: "CC-BY-NC-4.0",
+        },
+    ]);
+    all
+}
+
+/// A download by its `--variant` name.
+pub fn download_named(variant: &str) -> Result<Download, String> {
+    let all = downloads();
+    all.iter().copied().find(|d| d.variant.eq_ignore_ascii_case(variant)).ok_or_else(|| {
+        let names: Vec<&str> = all.iter().map(|d| d.variant).collect();
+        let more = if crate::licence::NONCOMMERCIAL_MODELS {
+            ""
+        } else {
+            " (the larger, non-commercial models need a build with --features noncommercial-models)"
+        };
+        format!("unknown --variant {variant}: this build has {}{more}", names.join(", "))
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
@@ -206,22 +275,23 @@ pub fn models_dir() -> PathBuf {
     }
 }
 
-pub fn installed() -> Option<PathBuf> {
-    let path = models_dir().join(format!("{DOWNLOAD_NAME}.onnx"));
+pub fn installed(model: &Download) -> Option<PathBuf> {
+    let path = models_dir().join(format!("{}.onnx", model.name));
     path.is_file().then_some(path)
 }
 
 /// Fetches the model with curl (on Windows 10 and later, macOS and Linux
 /// alike) and checks its digest before keeping it.
-pub fn download() -> Result<PathBuf, String> {
+pub fn download(model: &Download) -> Result<PathBuf, String> {
     let dir = models_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let target = dir.join(format!("{DOWNLOAD_NAME}.onnx"));
-    let partial = dir.join(format!("{DOWNLOAD_NAME}.onnx.partial"));
+    let target = dir.join(format!("{}.onnx", model.name));
+    let partial = dir.join(format!("{}.onnx.partial", model.name));
+    let url: String = model.url.split_whitespace().collect();
     let status = crate::probe::Tools::command(Path::new(if cfg!(windows) { "curl.exe" } else { "curl" }))
         .args(["-fsSL", "--retry", "3", "-o"])
         .arg(&partial)
-        .arg(DOWNLOAD_URL)
+        .arg(&url)
         .status()
         .map_err(|e| format!("the download needs curl: {e}"))?;
     if !status.success() {
@@ -230,7 +300,7 @@ pub fn download() -> Result<PathBuf, String> {
     }
     let bytes = std::fs::read(&partial).map_err(|e| e.to_string())?;
     let digest: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
-    if digest != DOWNLOAD_SHA256 {
+    if digest != model.sha256 {
         let _ = std::fs::remove_file(&partial);
         return Err("the downloaded model isn't the expected file (checksum)".into());
     }

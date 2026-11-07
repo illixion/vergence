@@ -8,7 +8,7 @@
 //! ```text
 //! vergence-convert [convert] VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab]
 //!                  [--strength S] [--convergence C] [--sample SECONDS] [--start S] [--frames N]
-//!                  [--model PATH.onnx] [--download-model] [--depth-track FILE.vgat]
+//!                  [--model PATH.onnx] [--download-model] [--variant small|base|large] [--depth-track FILE.vgat]
 //!                  [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio]
 //!                  [--dry-run] [--force]
 //! ```
@@ -40,7 +40,11 @@
 //!   `DepthAnythingV2Small.onnx` in the models folder (`%LOCALAPPDATA%\Vergence\DepthModels`,
 //!   `~/Library/Application Support/Vergence/DepthModels`, `~/.local/share/vergence/DepthModels`),
 //!   which `--download-model` fills from huggingface.co/onnx-community/depth-anything-v2-small
-//!   (Apache-2.0, about 100 MB). `VERGENCE_DEPTH_EP` picks the execution provider
+//!   (Apache-2.0, about 100 MB). `--variant base|large` (an addition of this
+//!   tool's, only in a build with the `noncommercial-models` feature) names
+//!   Depth Anything V2 Base or Large instead, CC-BY-NC-4.0: refused without
+//!   the feature, its licence said with it (`vergence_convert::licence`).
+//!   `VERGENCE_DEPTH_EP` picks the execution provider
 //!   (auto: CUDA, DirectML, Core ML, CPU, the first that loads), `VERGENCE_HEVC_ENCODER`
 //!   the encoder (auto: NVENC, VideoToolbox, AMF, Quick Sync, x265).
 //!
@@ -71,7 +75,7 @@ use vergence_convert::probe::{Probe, Tools};
 
 const USAGE: &str = "usage: vergence-convert [convert] VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab]
          [--strength S] [--convergence C] [--sample SECONDS] [--start S] [--frames N]
-         [--model PATH.onnx] [--download-model] [--depth-track FILE.vgat]
+         [--model PATH.onnx] [--download-model] [--variant small|base|large] [--depth-track FILE.vgat]
          [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio] [--dry-run] [--force]";
 
 /// `Pseudo3DSettings`' defaults: Convolution's Subtle.
@@ -217,9 +221,19 @@ fn name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// --model, VERGENCE_DEPTH_MODEL, else the installed Depth Anything V2 Small
-/// (downloaded first with --download-model).
+/// --model, VERGENCE_DEPTH_MODEL, else the installed model of `--variant`
+/// (Depth Anything V2 Small; downloaded first with --download-model). A model
+/// whose weights restrict their use is refused unless this build takes them,
+/// and its licence is said when it does (`licence`).
 fn depth_model(o: &Options) -> Result<PathBuf, String> {
+    let path = resolved_depth_model(o)?;
+    if let Some(line) = vergence_convert::licence::check(&path)? {
+        log(format!("vergence: {line}"));
+    }
+    Ok(path)
+}
+
+fn resolved_depth_model(o: &Options) -> Result<PathBuf, String> {
     if let Some(path) = o.model.clone().or_else(|| std::env::var("VERGENCE_DEPTH_MODEL").ok()) {
         let path = PathBuf::from(path);
         if !path.is_file() {
@@ -231,17 +245,17 @@ fn depth_model(o: &Options) -> Result<PathBuf, String> {
         }
         return Ok(path);
     }
-    if let Some(path) = model::installed() {
+    let wanted = model::download_named(o.variant.as_deref().unwrap_or("small"))?;
+    if let Some(path) = model::installed(&wanted) {
         return Ok(path);
     }
     if !o.download_model {
-        return Err("no depth model: pass --model PATH (Depth Anything V2 Small as .onnx), set VERGENCE_DEPTH_MODEL, \
-                    or add --download-model to fetch it from huggingface.co/onnx-community/depth-anything-v2-small \
-                    (Apache-2.0, about 100 MB)"
-            .into());
+        return Err(format!("no depth model: pass --model PATH (Depth Anything V2 Small as .onnx), set VERGENCE_DEPTH_MODEL, \
+                            or add --download-model to fetch {} from {} ({}, about {} MB)",
+                           wanted.display, wanted.repo, wanted.licence, wanted.megabytes));
     }
-    log("vergence: downloading Depth Anything V2 Small from huggingface.co/onnx-community/depth-anything-v2-small");
-    model::download()
+    log(format!("vergence: downloading {} from {} ({})", wanted.display, wanted.repo, wanted.licence));
+    model::download(&wanted)
 }
 
 type SharedModel = std::sync::Arc<std::sync::Mutex<model::DepthModel>>;

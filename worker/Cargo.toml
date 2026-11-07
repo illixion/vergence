@@ -16,6 +16,9 @@ cuda = ["ort/cuda", "vergence-convert/cuda"]
 tensorrt = ["ort/tensorrt", "vergence-convert/tensorrt"]
 directml = ["ort/directml", "vergence-convert/directml"]
 coreml = ["ort/coreml", "vergence-convert/coreml"]
+# Depth models whose weights are CC-BY-NC-4.0 or research-only (Depth
+# Anything V2 Base, Large): off by default; see vergence-convert's.
+noncommercial-models = ["vergence-convert/noncommercial-models"]
 
 [dependencies]
 ort = "=2.0.0-rc.15"

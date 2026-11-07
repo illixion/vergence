@@ -118,7 +118,13 @@ pub struct ConvertJob {
 
 impl ConvertJob {
     /// The converter's arguments for this job (after `convert`, on a Mac).
+    #[cfg(test)]
     pub fn arguments(&self, model: Option<&str>) -> Vec<OsString> {
+        self.arguments_with(model, crate::models::SMALL.variant)
+    }
+
+    /// The same, downloading `variant` when no model is given (`--variant`: `vergence-convert` only).
+    pub fn arguments_with(&self, model: Option<&str>, variant: &str) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec![self.input.clone().into(), "--layout".into(), self.options.layout.option().into()];
         if let Some(s) = self.options.strength {
             args.extend(["--strength".into(), format!("{s}").into()]);
@@ -137,8 +143,14 @@ impl ConvertJob {
         }
         match model {
             Some(model) => args.extend(["--model".into(), model.into()]),
-            // Fetches Depth Anything V2 Small (Apache-2.0) once, if no model is installed.
-            None => args.push("--download-model".into()),
+            // Fetches Depth Anything V2 Small (Apache-2.0) once, if no model is installed; or
+            // the larger model the person chose and whose licence they accepted (`models`).
+            None => {
+                if variant != crate::models::SMALL.variant {
+                    args.extend(["--variant".into(), variant.into()]);
+                }
+                args.push("--download-model".into());
+            }
         }
         if self.options.force {
             args.push("--force".into());
@@ -568,7 +580,8 @@ impl ConvertQueue {
             return;
         };
         let cli = tool.program.clone();
-        let args = tool.arguments(job.arguments(settings.depth_model.as_deref()));
+        let variant = crate::models::effective(settings.depth_variant.as_deref(), &settings.licences_accepted);
+        let args = tool.arguments(job.arguments_with(settings.depth_model.as_deref(), variant.variant));
         tracing::info!(id = job.id, "converting");
         let mut child = match sidecar::spawn(&cli, &args, true) {
             Ok(child) => child,
@@ -668,6 +681,12 @@ mod tests {
             strings(job(ConvertOptions::default()).arguments(None)),
             ["/films/Film.mkv", "--layout", "fsbs", "--download-model"]
         );
+        // A larger model the person chose (and accepted) is downloaded by name; a given one wins.
+        assert_eq!(
+            strings(job(ConvertOptions::default()).arguments_with(None, "base")),
+            ["/films/Film.mkv", "--layout", "fsbs", "--variant", "base", "--download-model"]
+        );
+        assert_eq!(strings(job(ConvertOptions::default()).arguments_with(Some("/m/x.onnx"), "base")).last().unwrap(), "/m/x.onnx");
         let mut j = job(ConvertOptions { layout: Layout::Spatial, strength: Some(0.012), convergence: Some(0.5), sample: true, force: true });
         j.output_dir = Some(PathBuf::from("/out/3D"));
         assert_eq!(

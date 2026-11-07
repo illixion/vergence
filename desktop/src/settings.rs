@@ -91,6 +91,13 @@ pub struct Settings {
     pub vergence_cli: Option<String>,
     /// The Core ML depth model for conversions (empty: the one `vergence convert` finds itself).
     pub depth_model: Option<String>,
+    /// The model a conversion downloads when no `depth_model` is given (`models`): Small unless
+    /// a build with `noncommercial-models` offers more and its licence was accepted.
+    #[serde(default)]
+    pub depth_variant: Option<String>,
+    /// The restricted models whose licence the person accepted.
+    #[serde(default)]
+    pub licences_accepted: Vec<String>,
     /// The worker's name towards the coordinator (empty: this computer's name).
     pub worker_name: Option<String>,
     /// Start the worker with the app.
@@ -115,6 +122,8 @@ impl Default for Settings {
             models_folder: None,
             vergence_cli: None,
             depth_model: None,
+            depth_variant: None,
+            licences_accepted: Vec::new(),
             worker_name: None,
             worker_at_start: false,
             check_updates: false,

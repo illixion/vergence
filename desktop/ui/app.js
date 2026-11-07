@@ -356,12 +356,49 @@ async function loadSettings() {
   $("cli-path").value = s.vergenceCli || "";
   $("cli-path").placeholder = v.cli ? `Found: ${v.cli}` : "Not found: give its path";
   $("depth-model").value = s.depthModel || "";
+  await loadDepthVariants();
   $("login").checked = v.launchAtLogin;
   $("updates").checked = s.checkUpdates;
   $("data-dir").textContent = `Data: ${v.dataDir}`;
   const u = await invoke("update_status");
   $("update-line").textContent = u.message || "";
 }
+
+// The models a conversion can download: only Small, unless this build offers the larger,
+// non-commercial ones; each of those is chosen only after its licence was shown and accepted.
+let depthVariants = { variants: [], chosen: "small" };
+
+async function loadDepthVariants() {
+  depthVariants = await invoke("depth_variants");
+  const select = $("depth-variant");
+  select.replaceChildren(...depthVariants.variants.map((v) => {
+    const option = document.createElement("option");
+    option.value = v.variant;
+    option.textContent = `${v.display} (${v.licence}, about ${v.megabytes} MB)`;
+    return option;
+  }));
+  select.value = depthVariants.chosen;
+  $("depth-variant-row").hidden = depthVariants.variants.length < 2;
+}
+
+$("depth-variant").addEventListener("change", async () => {
+  const select = $("depth-variant");
+  const v = depthVariants.variants.find((x) => x.variant === select.value);
+  let accept = false;
+  if (v && v.restricted && !depthVariants.accepted.includes(v.variant)) {
+    accept = confirm(`${v.display}'s weights are licensed ${v.licence} (${v.licenceUrl}).\n\n${v.note}\n\n` +
+                     `Accept this licence and download about ${v.megabytes} MB at the next conversion?`);
+    if (!accept) {
+      select.value = depthVariants.chosen;
+      return;
+    }
+  }
+  try {
+    depthVariants = await call("choose_depth_variant", { variant: select.value, acceptLicence: accept });
+  } catch {
+    select.value = depthVariants.chosen;
+  }
+});
 
 function settingsFromForm() {
   const s = { ...loaded.settings };

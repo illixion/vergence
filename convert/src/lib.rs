@@ -6,6 +6,7 @@
 pub mod decode;
 pub mod depth;
 pub mod gpu;
+pub mod licence;
 pub mod maths;
 pub mod model;
 pub mod probe;

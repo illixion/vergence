@@ -443,7 +443,12 @@ CC-BY-NC-4.0; Depth Pro: Apple's research licence) unless built with
 `swift build -c release -Xswiftc -DVERGENCE_NONCOMMERCIAL_MODELS`, and then say the licence; a
 worker's profile names it, so such titles never mix with Small's. On an M2 Max, Base resolved
 fine structure Small missed (fibres, thin stems) at about a third of Small's speed through the
-offline pipeline. An AI HDR piece decodes one keyframe interval either side and matches a whole-file run
+offline pipeline. The Rust tools follow the same rule behind a cargo feature, off by default:
+`cargo build --release -p vergence-convert -p vergence-worker --features
+vergence-convert/noncommercial-models,vergence-worker/noncommercial-models`; such a build of
+`vergence-convert` also downloads them (`--download-model --variant base|large`, the
+onnx-community exports, pinned and checked), and the desktop app built with its own
+`noncommercial-models` feature offers them on Windows only after showing the licence. An AI HDR piece decodes one keyframe interval either side and matches a whole-file run
 exactly. A player shows each frame's grid (`GainGridPlayback`: ramped in over a second after it
 starts and after a seek, held rather than dropped while a piece is missing, refreshed every half
 second but still snapped at cuts while the device is short of time), its `GainGridPass` holding the

@@ -68,6 +68,8 @@ pub struct Options {
     pub frames: Option<usize>,
     pub model: Option<String>,
     pub download_model: bool,
+    /// Which model `--download-model` fetches and an installed one is looked up by.
+    pub variant: Option<String>,
     pub depth_track: Option<String>,
     pub quality: Quality,
     pub bitrate: Option<u64>,
@@ -90,6 +92,7 @@ impl Default for Options {
             frames: None,
             model: None,
             download_model: false,
+            variant: None,
             depth_track: None,
             quality: Quality::Standard,
             bitrate: None,
@@ -184,6 +187,7 @@ pub fn parse(args: &[String]) -> Result<Options, UsageError> {
                 flag(&inline, &name)?;
                 o.download_model = true;
             }
+            "--variant" => o.variant = Some(value()?),
             "--depth-track" => o.depth_track = Some(value()?),
             "--quality" | "-q" => {
                 let v = value()?.to_lowercase();

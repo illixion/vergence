@@ -414,3 +414,32 @@ pub fn add_files(app: &AppHandle, paths: Vec<PathBuf>) {
     let result = state.convert.add(&paths);
     let _ = app.emit("convert-added", json!({ "added": result.as_ref().ok(), "error": result.err() }));
 }
+
+/// The depth models a conversion can download, the chosen one, and whose licence was accepted.
+#[tauri::command]
+pub fn depth_variants(state: Shared<'_>) -> Value {
+    let settings = state.settings();
+    let effective = crate::models::effective(settings.depth_variant.as_deref(), &settings.licences_accepted);
+    json!({ "variants": crate::models::variants(), "chosen": effective.variant, "accepted": settings.licences_accepted })
+}
+
+/// Chooses the model conversions download. A restricted one needs `accept_licence`: the page
+/// has shown its licence and the person agreed.
+#[tauri::command]
+pub fn choose_depth_variant(state: Shared<'_>, variant: String, accept_licence: bool) -> Reply {
+    let Some(chosen) = crate::models::variants().into_iter().find(|v| v.variant == variant) else {
+        return Err(format!("This build doesn't offer {variant}."));
+    };
+    let mut settings = state.settings();
+    if chosen.restricted && !settings.licences_accepted.contains(&variant) {
+        if !accept_licence {
+            return Err(format!("{} is {}: accept its licence first.", chosen.display, chosen.licence));
+        }
+        settings.licences_accepted.push(variant.clone());
+    }
+    settings.depth_variant = Some(variant).filter(|v| v != crate::models::SMALL.variant);
+    settings.save(&state.paths).map_err(|e| format!("Couldn't save the settings: {e}"))?;
+    *state.settings.lock().unwrap() = settings;
+    Ok(depth_variants(state))
+}
+
