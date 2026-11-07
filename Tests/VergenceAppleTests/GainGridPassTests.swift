@@ -74,5 +74,35 @@ struct GainGridPassTests {
         let expected = pow(Float(128) / 255, 2.4) * 2
         #expect(abs(Self.red(out, 10, 10) - expected) / expected < 0.01)
     }
+
+    @Test func aiThreeDEyesBecomeBT2020PQWithTheRampAndCap() throws {
+        // ×2 everywhere; a mid-grey SDR eye (0.5) → 0.5^2.4 × 2 × 203 nits, in BT.2020 (grey stays grey), PQ.
+        let grid = GainGrid(log2Gain: [Float](repeating: 1, count: GainGrid.count))
+        let pass = try #require(GainGridPass())
+        let sdr = Self.buffer(kCVPixelFormatType_32BGRA) { _, _ in 128 }
+        func pq(_ nits: Float) -> Float {
+            let m1: Float = 0.1593017578125, m2: Float = 78.84375, c1: Float = 0.8359375, c2: Float = 18.8515625, c3: Float = 18.6875
+            let y = pow(nits / 10000, m1)
+            return pow((c1 + c2 * y) / (1 + c3 * y), m2)
+        }
+        let grey = Float(128) / 255
+        for (strength, gain) in [(Float(1), Float(2)), (0.5, sqrt(2)), (0, 1)] {
+            let eye = Self.buffer(kCVPixelFormatType_64RGBAHalf)
+            Self.fillHalf(eye, grey)
+            #expect(pass.applyPQ(grid, source: sdr, eye: eye, cap: 3, strength: strength))
+            let expected = pq(pow(grey, 2.4) * gain * GainGridPass.sdrWhiteNits)
+            #expect(abs(Self.red(eye, 20, 20) - expected) < 0.003, "strength \(strength)")
+        }
+    }
+
+    static func fillHalf(_ buffer: CVPixelBuffer, _ value: Float) {
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        for y in 0 ..< height {
+            let row = (CVPixelBufferGetBaseAddress(buffer)! + y * CVPixelBufferGetBytesPerRow(buffer))
+                .assumingMemoryBound(to: UInt16.self)
+            for x in 0 ..< 4 * width { row[x] = HalfFloat.bits(from: x % 4 == 3 ? 1 : value) }
+        }
+    }
 }
 #endif

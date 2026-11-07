@@ -145,6 +145,11 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
         self.init(wrapping: inner, tiers: [Tier(interpolator, upTo: maxSourceFrameRate)], thresholds: thresholds)
     }
 
+    /// The governor has paused the in-between frames (the device is out of
+    /// time). Work that steps down after interpolation, such as AI HDR's grid
+    /// updates, reads it.
+    public var isBackedOff: Bool { lock.withLock { governor.isPaused } }
+
     /// The fastest source any tier interpolates.
     public var highestSourceFrameRate: Double { tiers.last?.maxSourceFrameRate ?? 0 }
 

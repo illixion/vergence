@@ -438,8 +438,11 @@ conversion its records differ by 0.005 on average (0.05 at most) in shot-space u
 warps a depth track's maps (`AnalysisDepthSource`) and runs its own model only for frames the
 track doesn't hold yet. Only Apache-2.0 weights belong in a profile (Depth Anything V2 Base and
 Large are CC-BY-NC). An AI HDR piece decodes one keyframe interval either side and matches a whole-file run
-exactly; a player's `GainGridPass` looks each pixel's gain up with its own luma and holds the
-frame's average gain to a cap.
+exactly. A player shows each frame's grid (`GainGridPlayback`: ramped in over a second after it
+starts and after a seek, held rather than dropped while a piece is missing, refreshed every half
+second but still snapped at cuts while the device is short of time), its `GainGridPass` holding the
+frame's average gain to a cap: AI 3D's pump warps in SDR and writes each eye as BT.2020 PQ into its
+10-bit eyes; Convolution's flat player does the lookup in its final pass into an EDR drawable.
 
 A Mac worker gives the same records as `vergence analyze` over the whole file (disparity
 identical, flow within Core ML's run-to-run noise; `scripts/check-worker.sh`), at about 37 fps

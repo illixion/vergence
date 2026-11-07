@@ -128,8 +128,24 @@ public final class StereoPump: @unchecked Sendable {
     /// a 10-bit compositor buffer holds what half float carries.
     private let hdrWarp = StereoWarpResources.sharedHDR
     private lazy var hdrMeshWarp = hdrWarp.map { StereoMeshWarp(resources: $0) }
-    /// Pump-queue only: the frame being drawn is HDR (half-float RGBA).
+    /// Pump-queue only: the frame being drawn is HDR (half-float RGBA), or an
+    /// SDR one being made HDR (`drawingAIHDR`).
     private var drawingHDR = false
+    /// Pump-queue only: the frame is SDR and goes out as BT.2020 PQ through
+    /// a worker's gain grids (`gainGrids`).
+    private var drawingAIHDR = false
+    /// AI HDR for an SDR picture: a worker's gain grids (the `ai-hdr`
+    /// workload). Set it any time; the next frame is drawn with it. The SDR
+    /// warp draws into the half-float eyes, then one pass per eye looks each
+    /// pixel's gain up and writes BT.2020 PQ, so the eyes leave through the
+    /// same 10-bit `xf20` path as an HDR picture's.
+    public var gainGrids: GainGridPlayback? {
+        get { gainLock.withLock { _gainGrids } }
+        set { gainLock.withLock { _gainGrids = newValue } }
+    }
+    private var _gainGrids: GainGridPlayback?
+    private let gainLock = NSLock()
+    private lazy var gainPass = GainGridPass(device: device)
     /// The warp resources for the frame being drawn.
     private var activeWarp: StereoWarpResources { drawingHDR ? (hdrWarp ?? warp) : warp }
     private let device: MTLDevice
@@ -1025,7 +1041,9 @@ public final class StereoPump: @unchecked Sendable {
             ?? CGSize(width: width, height: height)
         let eyeWidth = Int(eyeSize.width)
         let eyeHeight = Int(eyeSize.height)
-        drawingHDR = CVPixelBufferGetPixelFormatType(src) == FramePixelFormat.hdr
+        let gains = CVPixelBufferGetPixelFormatType(src) == FramePixelFormat.sdr && hdrWarp != nil ? gainGrids : nil
+        drawingAIHDR = gains != nil && gainPass != nil
+        drawingHDR = CVPixelBufferGetPixelFormatType(src) == FramePixelFormat.hdr || drawingAIHDR
         guard width > 0, height > 0, eyeWidth > 0, eyeHeight > 0,
               ensurePools(width: eyeWidth, height: eyeHeight, hdr: drawingHDR),
               let bgraPool, let outPool,
@@ -1040,7 +1058,8 @@ public final class StereoPump: @unchecked Sendable {
               let leftBGRA, let rightBGRA,
               // The eyes are the source's colour (BT.2020 PQ for HDR): tagged
               // before the conversion below, which reads the tags.
-              tagIntermediate(leftBGRA, from: src), tagIntermediate(rightBGRA, from: src),
+              tagIntermediate(leftBGRA, from: src, aiHDR: drawingAIHDR),
+              tagIntermediate(rightBGRA, from: src, aiHDR: drawingAIHDR),
               let leftTex = makeTexture(from: leftBGRA, cache: cache),
               let rightTex = makeTexture(from: rightBGRA, cache: cache),
               let cmdBuf = commandQueue.makeCommandBuffer() else { return nil }
@@ -1079,13 +1098,25 @@ public final class StereoPump: @unchecked Sendable {
         // The depth budget keeps depth inside [0, 1], so no warped pixel shifts further than
         // (1 - convergence) × strength; the margin in front of that keeps the
         // strength the ramp is heading for, so text doesn't sink mid-ramp.
+        // AI HDR: the warped eyes are SDR code values in half float; one pass
+        // each makes them BT.2020 PQ with the frame's gain grid (after the
+        // warp, before the subtitles, which are then drawn as PQ).
+        if drawingAIHDR, let gains, let gainPass {
+            // Interpolation backs off before HDR updates do (depth never does).
+            let steppedDown = (frameSource as? InterpolatingFrameSource)?.isBackedOff ?? false
+            let frame = gains.grid(at: itemTime.seconds, steppedDown: steppedDown)
+            if let slot = gainPass.encodeMean(of: srcTexture, grid: frame.grid, cap: gains.cap,
+                                              strength: frame.strength, into: cmdBuf) {
+                _ = gainPass.encodePQEyes([leftTex, rightTex], slot: slot, into: cmdBuf)
+            }
+        }
         let capture = StereoEyeCapture.takeRequest()
             ? StereoEyeCapture.encodeDepthReadback(frameDepth, device: device, commandBuffer: cmdBuf) : nil
         subtitles?.encode(
             left: leftTex, right: rightTex, packed: layout != nil && !cfg.isFlat,
             maxContentShift: (1 - cfg.convergence) * cfg.depthStrength,
             depthStrength: fullDepthStrength,
-            transfer: StereoSubtitleCompositor.transferMode(of: src), commandBuffer: cmdBuf
+            transfer: drawingAIHDR ? 1 : StereoSubtitleCompositor.transferMode(of: src), commandBuffer: cmdBuf
         )
         cmdBuf.commit()
         // Safe here: this runs on the background pump queue, never main. The warp
@@ -1116,10 +1147,10 @@ public final class StereoPump: @unchecked Sendable {
         let transferState = signposter.beginInterval("pump-transfer")
         defer { signposter.endInterval("pump-transfer", transferState) }
         guard let left = try? outPool.makeMutablePixelBuffer() else { return nil }
-        tagColor(left, from: src)
+        tagColor(left, from: src, aiHDR: drawingAIHDR)
         guard transfer(from: leftBGRA, to: left) else { return nil }
         guard let right = try? outPool.makeMutablePixelBuffer() else { return nil }
-        tagColor(right, from: src)
+        tagColor(right, from: src, aiHDR: drawingAIHDR)
         guard transfer(from: rightBGRA, to: right) else { return nil }
         let eyes = Eyes(left: CVReadOnlyPixelBuffer(left), right: CVReadOnlyPixelBuffer(right))
 
@@ -1197,7 +1228,11 @@ public final class StereoPump: @unchecked Sendable {
     }
 
     /// The source's colour tags on a warp target. Always true (for a guard).
-    private func tagIntermediate(_ buffer: CVPixelBuffer, from src: CVPixelBuffer) -> Bool {
+    private func tagIntermediate(_ buffer: CVPixelBuffer, from src: CVPixelBuffer, aiHDR: Bool = false) -> Bool {
+        if aiHDR {
+            for (key, value) in Self.aiHDRColorTags { CVBufferSetAttachment(buffer, key, value, .shouldPropagate) }
+            return true
+        }
         for key in [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrixKey] {
             if let value = CVBufferGetAttachment(src, key, nil)?.takeUnretainedValue() {
                 CVBufferSetAttachment(buffer, key, value, .shouldPropagate)
@@ -1235,7 +1270,27 @@ public final class StereoPump: @unchecked Sendable {
     /// Copy the source frame's color primaries / transfer function / YCbCr matrix
     /// onto the eye buffer (defaulting to Rec.709). Without these the compositor
     /// guesses the color space and renders the eyes washed out.
-    private func tagColor(_ dest: borrowing CVMutablePixelBuffer, from src: CVPixelBuffer) {
+    /// What an SDR picture made HDR is: BT.2020 PQ (`GainGridPass` writes it).
+    private static var aiHDRColorTags: [(CFString, CFTypeRef)] {[
+        (kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020),
+        (kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ),
+        (kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020),
+    ]}
+
+    private func tagColor(_ dest: borrowing CVMutablePixelBuffer, from src: CVPixelBuffer, aiHDR: Bool = false) {
+        if aiHDR {
+            dest.withUnsafeBuffer { d in
+                for (key, value) in Self.aiHDRColorTags { CVBufferSetAttachment(d, key, value, .shouldPropagate) }
+                // Static metadata, so the compositor maps the picture to the
+                // display rather than guessing its peak: GMNet's 5× over 203 nits.
+                let metadata = GainGridPass.staticMetadata
+                CVBufferSetAttachment(d, kCVImageBufferMasteringDisplayColorVolumeKey, metadata.masteringDisplay as CFData,
+                                      .shouldPropagate)
+                CVBufferSetAttachment(d, kCVImageBufferContentLightLevelInfoKey, metadata.contentLightLevel as CFData,
+                                      .shouldPropagate)
+            }
+            return
+        }
         dest.withUnsafeBuffer { d in
             let primaries = CVBufferGetAttachment(src, kCVImageBufferColorPrimariesKey, nil)?.takeUnretainedValue()
                 ?? kCVImageBufferColorPrimaries_ITU_R_709_2
