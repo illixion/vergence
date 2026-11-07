@@ -6,24 +6,31 @@
 # run over the same file in one go. The two must hold the same records with
 # the same values (within Core ML's run-to-run noise).
 #
-#   scripts/check-worker.sh JELLYFIN_URL KEY_FILE ITEM_ID LOCAL_FILE MODELS_DIR
+#   scripts/check-worker.sh JELLYFIN_URL KEY_FILE ITEM_ID LOCAL_FILE MODELS_DIR [WORKLOAD [TOLERANCE]]
 #
 # LOCAL_FILE is the item's file as this Mac sees it (for the reference run);
-# MODELS_DIR holds RIFE*480x288 and NeuFlow*512x288 (as for `analyze`).
-# Half or full side by side only (the reference crops the halves).
+# MODELS_DIR holds RIFE*480x288 and NeuFlow*512x288 (as for `analyze`), and
+# RIFE*960x576 for smooth-motion-2d. WORKLOAD is smooth-motion-3d (the
+# default: half or full side by side only, the reference crops the halves)
+# or another of the coordinator's, whose reference is the worker's own
+# `--reference` run over the whole file in one decode.
 set -euo pipefail
-if [ "$#" -ne 5 ]; then
-    sed -n '2,15p' "$0" >&2
+if [ "$#" -lt 5 ] || [ "$#" -gt 7 ]; then
+    sed -n '2,19p' "$0" >&2
     exit 2
 fi
-jellyfin="$1"; key_file="$2"; item="$3"; file="$4"; models="$5"
+jellyfin="$1"; key_file="$2"; item="$3"; file="$4"; models="$5"; workload="${6:-smooth-motion-3d}"
+tolerance="${7:-0.5}"
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 work=$(mktemp -d)
 port=$((20000 + RANDOM % 20000))
 echo "check-worker: building"
-(cd "$root" && swift build -c release --product vergence >/dev/null && cargo build -q --release -p vergence-coordinator)
-vergence="$root/.build/release/vergence"
-vergenced="$root/target/release/vergenced"
+# Build directories can be moved (SWIFT_SCRATCH, CARGO_TARGET_DIR) so concurrent checks don't collide.
+swift_scratch="${SWIFT_SCRATCH:-$root/.build}"
+(cd "$root" && swift build -c release --product vergence --scratch-path "$swift_scratch" >/dev/null &&
+    cargo build -q --release -p vergence-coordinator)
+vergence="$swift_scratch/release/vergence"
+vergenced="${CARGO_TARGET_DIR:-$root/target}/release/vergenced"
 
 cat > "$work/vergenced.json" <<JSON
 {"listen": "127.0.0.1:$port", "store": "$work/store",
@@ -33,7 +40,7 @@ JSON
 "$vergenced" token add player --grants play --config "$work/vergenced.json" > "$work/play.token"
 cat > "$work/worker.json" <<JSON
 {"coordinator": "http://127.0.0.1:$port", "tokenFile": "$work/work.token", "name": "check",
- "models": "$models", "jellyfin": {"url": "$jellyfin", "apiKeyFile": "$key_file"}}
+ "models": "$models", "workloads": ["$workload"], "jellyfin": {"url": "$jellyfin", "apiKeyFile": "$key_file"}}
 JSON
 
 "$vergenced" serve --config "$work/vergenced.json" > "$work/vergenced.log" 2>&1 &
@@ -42,6 +49,23 @@ trap 'kill "$coordinator" 2>/dev/null || true' EXIT
 for _ in $(seq 50); do curl -sf "http://127.0.0.1:$port/v1/health" >/dev/null && break; sleep 0.1; done
 
 auth="Authorization: Bearer $(cat "$work/play.token")"
+if [ "$workload" != smooth-motion-3d ]; then
+    title="http://127.0.0.1:$port/v1/titles/jellyfin/$item/$workload"
+    echo "check-worker: queued: $(curl -sf -X POST "$title" -H "$auth")"
+    started=$(date +%s)
+    while "$vergence" worker --config "$work/worker.json" --once 2>&1 | grep -v "nothing to do"; do
+        case "$(curl -sf "$title" -H "$auth")" in *'"ready"'*) break ;; esac
+    done
+    echo "check-worker: analysed in $(($(date +%s) - started)) s (one process per piece, models loaded each time)"
+    chunks=$(curl -sf "$title" -H "$auth" | python3 -c 'import json,sys; print(json.load(sys.stdin)["chunks"])')
+    for ((n = 0; n < chunks; n++)); do
+        curl -sf -o "$work/chunk$n.vgat" "$title/chunks/$n" -H "$auth"
+    done
+    echo "check-worker: the reference, analysed whole"
+    "$vergence" worker --config "$work/worker.json" --reference "$file" --workload "$workload" --output "$work/whole.vgat"
+    python3 -I "$root/scripts/compare-analysis-tracks.py" "$work/whole.vgat" "$work"/chunk*.vgat --tolerance "$tolerance"
+    exit
+fi
 status=$(curl -sf -X POST "http://127.0.0.1:$port/SmoothMotion/$item/Analyze" -H "$auth")
 echo "check-worker: queued: $status"
 while "$vergence" worker --config "$work/worker.json" --once 2>&1 | grep -v "nothing to do"; do

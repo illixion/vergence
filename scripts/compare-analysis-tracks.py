@@ -70,14 +70,18 @@ def main():
     for path in args[1:]:
         other.update(records(path)[1])
     missing, extra = set(reference) - set(other), set(other) - set(reference)
-    worst = {}
+    worst, total, count = {}, {}, {}
     for key in set(reference) & set(other):
-        difference = max((abs(a - b) for a, b in zip(reference[key], other[key])), default=0)
-        worst[KINDS.get(key[0], key[0])] = max(worst.get(KINDS.get(key[0], key[0]), 0), difference)
+        name = KINDS.get(key[0], key[0])
+        differences = [abs(a - b) for a, b in zip(reference[key], other[key])]
+        worst[name] = max(worst.get(name, 0), max(differences, default=0))
+        total[name] = total.get(name, 0) + sum(differences)
+        count[name] = count.get(name, 0) + len(differences)
     print(f"{len(reference)} records in the reference, {len(other)} in the others, "
           f"{len(missing)} missing, {len(extra)} extra")
     print("largest difference by kind (in the record's own units):",
           ", ".join(f"{k} {v:.3f}" for k, v in sorted(worst.items())))
+    print("mean difference by kind:", ", ".join(f"{k} {total[k] / max(count[k], 1):.6f}" for k in sorted(total)))
     if missing or extra or any(v > tolerance for v in worst.values()):
         print("DIFFERENT")
         sys.exit(1)

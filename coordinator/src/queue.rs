@@ -41,17 +41,34 @@ pub struct Workload {
     pub kinds: Vec<Kind>,
     /// Only stereo titles (both eyes are read).
     pub needs_stereo: bool,
+    /// Only flat (2D) titles: the whole picture is one eye.
+    #[serde(default)]
+    pub mono_only: bool,
 }
 
 impl Workload {
     pub const SMOOTH_MOTION_3D: &'static str = "smooth-motion-3d";
+    /// Smooth Motion for 2D titles, flat or played as AI 3D: the whole
+    /// picture's flow between frames, one `flowPair` record per pair (eye
+    /// mono). Larger than the 3D workload's (RIFE at 960×576 against
+    /// 480×288), since there is no disparity to make.
+    pub const SMOOTH_MOTION_2D: &'static str = "smooth-motion-2d";
 
     pub fn defaults() -> Vec<Workload> {
-        vec![Workload {
-            name: Self::SMOOTH_MOTION_3D.into(),
-            kinds: vec![Kind::FlowPair, Kind::Disparity],
-            needs_stereo: true,
-        }]
+        vec![
+            Workload {
+                name: Self::SMOOTH_MOTION_3D.into(),
+                kinds: vec![Kind::FlowPair, Kind::Disparity],
+                needs_stereo: true,
+                mono_only: false,
+            },
+            Workload {
+                name: Self::SMOOTH_MOTION_2D.into(),
+                kinds: vec![Kind::FlowPair],
+                needs_stereo: false,
+                mono_only: true,
+            },
+        ]
     }
 }
 
@@ -166,6 +183,17 @@ pub struct Claim {
     /// Workloads it takes; all it can do when absent.
     #[serde(default)]
     pub workloads: Option<Vec<String>>,
+    /// Models for particular workloads, where they differ from `models`
+    /// (the 2D workload's RIFE runs at another size than the 3D one's).
+    #[serde(default)]
+    pub workload_models: BTreeMap<String, Profile>,
+}
+
+impl Claim {
+    /// The models this worker runs for `workload`.
+    pub fn models_for(&self, workload: &str) -> &Profile {
+        self.workload_models.get(workload).unwrap_or(&self.models)
+    }
 }
 
 /// A piece handed to a worker.
@@ -239,6 +267,10 @@ pub enum UploadError {
     Time(f64),
     #[error("{kind} has {got} records where {expected} were expected")]
     Count { kind: &'static str, got: usize, expected: i64 },
+    #[error("a {0} record is on the wrong eye")]
+    Eye(&'static str),
+    #[error("{0} records differ in size or channels within the piece")]
+    Shape(&'static str),
 }
 
 #[derive(Debug, PartialEq)]
@@ -253,6 +285,8 @@ pub enum AddOutcome {
 pub enum AddError {
     #[error("the title isn't stereo, and this workload needs both eyes")]
     NotStereo,
+    #[error("the title is stereo, and this workload is for 2D titles")]
+    Stereo,
     #[error("the title's length or frame rate is unknown")]
     NoTiming,
     #[error("Blu-ray discs aren't read by workers yet")]
@@ -318,6 +352,9 @@ impl Queue {
     pub fn add(&mut self, source: SourceRef, workload: &Workload, info: MediaInfo) -> Result<AddOutcome, AddError> {
         if workload.needs_stereo && !info.stereo.is_stereo() {
             return Err(AddError::NotStereo);
+        }
+        if workload.mono_only && info.stereo.is_stereo() {
+            return Err(AddError::Stereo);
         }
         if info.stereo == crate::source::StereoLayout::Mvc {
             return Err(AddError::Disc);
@@ -402,11 +439,12 @@ impl Queue {
             {
                 continue;
             }
-            if !title.workload.kinds.iter().all(|k| claim.models.contains_key(k.name())) {
+            let models = claim.models_for(&title.workload.name);
+            if !title.workload.kinds.iter().all(|k| models.contains_key(k.name())) {
                 continue;
             }
             if let Some(profile) = &title.profile
-                && profile.iter().any(|(k, m)| claim.models.get(k) != Some(m))
+                && profile.iter().any(|(k, m)| models.get(k) != Some(m))
             {
                 continue;
             }
@@ -424,9 +462,9 @@ impl Queue {
         let title = self.titles.get_mut(&key).expect("the title was just found");
         title.pieces[rank.piece] = PieceState::Leased;
         if title.profile.is_none() {
-            title.profile = Some(
-                title.workload.kinds.iter().map(|k| (k.name().to_string(), claim.models[k.name()].clone())).collect(),
-            );
+            let models = claim.models_for(&title.workload.name);
+            title.profile =
+                Some(title.workload.kinds.iter().map(|k| (k.name().to_string(), models[k.name()].clone())).collect());
         }
         self.leases.insert(
             id,
@@ -532,9 +570,17 @@ impl Queue {
         let frames = title.piece_frames(state.piece);
         let fps = title.info.frame_rate.fps();
         let mut counts: BTreeMap<Kind, usize> = BTreeMap::new();
+        let mut shapes: BTreeMap<Kind, (u8, u16, u16)> = BTreeMap::new();
         for record in &track.records {
             if !title.workload.kinds.contains(&record.kind) {
                 return Err(UploadError::Kind(record.kind.name()));
+            }
+            if record.eye != record.kind.eye() {
+                return Err(UploadError::Eye(record.kind.name()));
+            }
+            let shape = (record.channels, record.width, record.height);
+            if *shapes.entry(record.kind).or_insert(shape) != shape {
+                return Err(UploadError::Shape(record.kind.name()));
             }
             let seconds = record.time.seconds();
             let position = seconds * fps;
@@ -654,7 +700,13 @@ mod tests {
     }
 
     fn claim(worker: &str, remote: bool) -> Claim {
-        Claim { worker: worker.into(), remote, models: models("RIFE 480x288"), workloads: None }
+        Claim {
+            worker: worker.into(),
+            remote,
+            models: models("RIFE 480x288"),
+            workloads: None,
+            workload_models: BTreeMap::new(),
+        }
     }
 
     fn queue_with(seconds: f64) -> (Queue, String) {
@@ -675,7 +727,7 @@ mod tests {
         });
         for k in lease.first_frame..lease.end_frame {
             if k + 1 < lease.frame_count {
-                data.extend(record(Kind::FlowPair, 1, k, k + 1, 24, 2, 2));
+                data.extend(record(Kind::FlowPair, 0, k, k + 1, 24, 2, 2));
             }
             data.extend(record(Kind::Disparity, 2, k, k, 24, 2, 2));
         }
@@ -779,5 +831,90 @@ mod tests {
         assert_eq!(q.add(SourceRef::jellyfin("abc"), &Workload::defaults()[0], replaced), Ok(AddOutcome::Reset));
         assert_eq!(q.status(&key).unwrap().pieces_done, 0);
         assert!(q.title(&key).unwrap().profile.is_none());
+    }
+
+    fn mono_info(seconds: f64) -> MediaInfo {
+        MediaInfo { stereo: StereoLayout::Mono, ..info(seconds) }
+    }
+
+    fn workload(name: &str) -> Workload {
+        Workload::defaults().into_iter().find(|w| w.name == name).unwrap()
+    }
+
+    /// A 2D worker's result: one mono flow pair per frame.
+    fn mono_result(lease: &Lease, flow: &str, eye: u8) -> ParsedTrack {
+        let mut data = track::write_header(&Header {
+            media_id: "x".into(),
+            producer: "test".into(),
+            models: [("flowPair".to_string(), flow.to_string())].into(),
+            source_width: 1920,
+            source_height: 1080,
+        });
+        for k in lease.first_frame..lease.end_frame {
+            if k + 1 < lease.frame_count {
+                data.extend(record(Kind::FlowPair, eye, k, k + 1, 24, 4, 2));
+            }
+        }
+        track::parse(&data).unwrap()
+    }
+
+    #[test]
+    fn the_2d_workload_takes_only_flat_titles() {
+        let mut q = Queue::new();
+        let flat = workload(Workload::SMOOTH_MOTION_2D);
+        assert_eq!(q.add(SourceRef::jellyfin("sbs"), &flat, info(10.0)), Err(AddError::Stereo));
+        assert_eq!(q.add(SourceRef::jellyfin("flat"), &flat, mono_info(10.0)), Ok(AddOutcome::Added));
+    }
+
+    #[test]
+    fn a_worker_runs_other_models_for_the_2d_workload() {
+        let mut q = Queue::new();
+        let source = SourceRef::jellyfin("flat");
+        q.add(source.clone(), &workload(Workload::SMOOTH_MOTION_2D), mono_info(4.0)).unwrap();
+        let key = Title::key_for(&source, Workload::SMOOTH_MOTION_2D);
+        let now = Instant::now();
+        // One worker, two sizes of RIFE: 480×288 for 3D titles, 960×576 for 2D ones.
+        let mut both = claim("mac", false);
+        both.workload_models.insert(
+            Workload::SMOOTH_MOTION_2D.into(),
+            [("flowPair".to_string(), "RIFE 960x576".to_string())].into(),
+        );
+        let lease = q.claim(&both, now).unwrap();
+        assert_eq!((lease.workload.as_str(), lease.kinds.clone()), (Workload::SMOOTH_MOTION_2D, vec![Kind::FlowPair]));
+        assert_eq!(q.title(&key).unwrap().profile.as_ref().unwrap()["flowPair"], "RIFE 960x576");
+        // The title's profile now holds: a worker offering only the 3D size skips it.
+        assert!(q.claim(&claim("other", false), now).is_none());
+    }
+
+    #[test]
+    fn checks_2d_uploads() {
+        let mut q = Queue::new();
+        let source = SourceRef::jellyfin("flat");
+        q.add(source.clone(), &workload(Workload::SMOOTH_MOTION_2D), mono_info(5.0)).unwrap();
+        let key = Title::key_for(&source, Workload::SMOOTH_MOTION_2D);
+        let now = Instant::now();
+        let worker = Claim { models: [("flowPair".to_string(), "RIFE 960x576".to_string())].into(), ..claim("a", false) };
+        let lease = q.claim(&worker, now).unwrap();
+        assert_eq!(q.check(lease.lease, "a", &mono_result(&lease, "RIFE 960x576", 0)), Ok((key.clone(), 0)));
+        // Flow on the left eye isn't what a 2D player looks up.
+        assert_eq!(q.check(lease.lease, "a", &mono_result(&lease, "RIFE 960x576", 1)), Err(UploadError::Eye("flowPair")));
+        // Nor are disparity records part of it.
+        assert_eq!(q.check(lease.lease, "a", &result(&lease, "RIFE 960x576")), Err(UploadError::Kind("disparity")));
+        // Records of one kind must share a shape.
+        let good = mono_result(&lease, "RIFE 960x576", 0);
+        let mut data = track::write_header(&good.header);
+        for k in lease.first_frame..lease.end_frame {
+            let w = if k == 10 { 8 } else { 4 };
+            data.extend(record(Kind::FlowPair, 0, k, k + 1, 24, w, 2));
+        }
+        assert_eq!(q.check(lease.lease, "a", &track::parse(&data).unwrap()), Err(UploadError::Shape("flowPair")));
+        // Too few records (a decode that stopped early).
+        let mut short = track::write_header(&good.header);
+        for k in lease.first_frame..lease.first_frame + 20 {
+            short.extend(record(Kind::FlowPair, 0, k, k + 1, 24, 4, 2));
+        }
+        assert!(matches!(q.check(lease.lease, "a", &track::parse(&short).unwrap()), Err(UploadError::Count { .. })));
+        q.complete(lease.lease, (1920, 1080), now);
+        assert_eq!(q.status(&key).unwrap().pieces_done, 1);
     }
 }

@@ -127,7 +127,7 @@ fn piece(lease: &Value, width: u32) -> Vec<u8> {
         (lease["firstFrame"].as_i64().unwrap(), lease["endFrame"].as_i64().unwrap(), lease["frameCount"].as_i64().unwrap());
     for k in first..end {
         if k + 1 < count {
-            data.extend(record(1, 1, k, k + 1));
+            data.extend(record(1, 0, k, k + 1));
         }
         data.extend(record(2, 2, k, k));
     }

@@ -96,6 +96,73 @@ struct SharedFieldInterpolatorTests {
         #expect(Self.read(mid, eye: 0, x: 50, y: 10).0 == 40)
     }
 
+    /// Hands out fixed fields, or none.
+    final class FixedProvider: SharedFieldProvider, @unchecked Sendable {
+        let value: SharedFields?
+        init(_ value: SharedFields?) { self.value = value }
+        func fields(from start: Double, to end: Double) -> SharedFields? { value }
+    }
+
+    /// Stands in for the on-device interpolator: a grey frame, and a count.
+    final class CountingFallback: MidFrameInterpolator, @unchecked Sendable {
+        var calls = 0
+        var prepared = false
+        let frame = SharedFieldInterpolatorTests.frame { _, _, _ in (77, 77, 77) }
+        func prepare(width: Int, height: Int, scale: Double) -> Bool { prepared = true; return true }
+        func midFrame(between previous: CVPixelBuffer, and current: CVPixelBuffer,
+                      completion: @escaping @Sendable (CVPixelBuffer?, Double) -> Void) {
+            calls += 1
+            nonisolated(unsafe) let frame = frame
+            completion(frame, 1)
+        }
+    }
+
+    @Test func aMonoPictureMovesAsAWhole() throws {
+        // The whole 64×64 frame is one picture: a ramp moving (+8, +4), its
+        // field 16×16 (a stored pixel is 4 across and 4 down); no eye split.
+        let width = Self.eyeWidth, height = 2 * Self.eyeHeight
+        func ramp(_ x: Int, _ y: Int) -> (UInt8, UInt8, UInt8) { (UInt8(clamping: 4 * x), UInt8(clamping: 4 * y), 0) }
+        let a = Self.frame { eye, x, y in ramp(x, y + eye * Self.eyeHeight) }
+        let b = Self.frame { eye, x, y in ramp(x - 8, y + eye * Self.eyeHeight - 4) }
+        let n = 16 * 16
+        let flow = [Float](repeating: 2, count: n) + [Float](repeating: 1, count: n)
+            + [Float](repeating: -2, count: n) + [Float](repeating: -1, count: n) + [Float](repeating: 0.5, count: n)
+        let interpolator = try #require(SharedFieldInterpolator(provider: NoProvider(), packing: .mono))
+        #expect(interpolator.prepare(width: width, height: height, scale: 1))
+        let mid = try #require(interpolator.midFrame(between: a, and: b,
+                                                     fields: SharedFields(monoFlow: flow, flowWidth: 16, flowHeight: 16)))
+        // Rows past the old top/bottom split move like the rest: one picture.
+        for (x, row) in [(12, 6), (30, 40), (50, 58)] {
+            let (blue, green, _) = Self.read(mid, eye: row / Self.eyeHeight, x: x, y: row % Self.eyeHeight)
+            #expect(abs(blue - 4 * (x - 4)) <= 1 && abs(green - 4 * (row - 2)) <= 1, "(\(x), \(row)): \(blue), \(green)")
+        }
+    }
+
+    @Test func aMonoPairWithoutFieldsGoesToTheFallback() async throws {
+        let fallback = CountingFallback()
+        let a = Self.frame { _, _, _ in (200, 200, 200) }
+        let b = Self.frame { _, _, _ in (40, 40, 40) }
+        let n = 16 * 16
+        let fields = SharedFields(monoFlow: [Float](repeating: 0, count: 4 * n) + [Float](repeating: 1, count: n),
+                                  flowWidth: 16, flowHeight: 16)
+        func blue(_ provider: SharedFieldProvider) async throws -> Int? {
+            let interpolator = try #require(SharedFieldInterpolator(provider: provider, packing: .mono, fallback: fallback))
+            #expect(interpolator.prepare(width: Self.eyeWidth, height: 2 * Self.eyeHeight, scale: 0.5))
+            nonisolated(unsafe) let (a, b) = (a, b)
+            let frame = await withCheckedContinuation { (done: CheckedContinuation<CVPixelBuffer?, Never>) in
+                interpolator.midFrame(between: a, at: 0, and: b, at: 1.0 / 24) { frame, _ in
+                    nonisolated(unsafe) let frame = frame
+                    done.resume(returning: frame)
+                }
+            }
+            return frame.map { Self.read($0, eye: 0, x: 5, y: 5).0 }
+        }
+        #expect(try await blue(FixedProvider(fields)) == 200)       // the mask takes frame 0
+        #expect(fallback.calls == 0 && fallback.prepared)
+        #expect(try await blue(FixedProvider(nil)) == 77)           // no fields: the device's own
+        #expect(fallback.calls == 1)
+    }
+
     @Test func withoutFieldsOrTimesItMakesNothing() async throws {
         let interpolator = try Self.interpolator()
         let a = Self.frame { _, _, _ in (0, 0, 0) }

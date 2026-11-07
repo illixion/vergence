@@ -360,6 +360,16 @@ HKDF-SHA256(pairing token, `Vergence-API-PSK-v1`, `psk`), then plain HTTP/1.1). 
 plain HTTP on port 8420 are for scripts, workers set up by hand and the Jellyfin plugin
 (`vergenced token add`); a paired device may use a token derived from its pairing there too.
 
+Workloads (`coordinator/src/queue.rs`; a player names one when it reports where it plays):
+
+| Workload | Titles | Records | Mac worker's model |
+| --- | --- | --- | --- |
+| `smooth-motion-3d` | frame-packed 3D | `flowPair` (left eye), `disparity` (right) | RIFE 4.25 lite 480×288, NeuFlow v2 512×288 |
+| `smooth-motion-2d` | 2D, flat or AI 3D | `flowPair` (whole picture, 240×144 stored) | RIFE 4.25 lite 960×576 on the GPU, about 40 fps for 720p |
+
+`scripts/check-worker.sh … smooth-motion-2d` checks any workload but the first against the
+worker's own `--reference` run over the whole file in one decode.
+
 A Mac worker gives the same records as `vergence analyze` over the whole file (disparity
 identical, flow within Core ML's run-to-run noise; `scripts/check-worker.sh`), at about 37 fps
 for 1080p 3D on an M2 Max. The ONNX worker agrees on disparity; its RIFE flow differs from Core

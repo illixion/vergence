@@ -151,9 +151,14 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
     /// `inner` wrapped with the interpolators `engine` names that exist here,
     /// or `inner` itself where none does. VideoToolbox's exists only on a
     /// device or a Mac (not the simulator); the GPU one wherever Metal does.
+    /// - Parameter sharedFields: a 2D picture's fields made ahead (an analysis
+    ///   coordinator's `smooth-motion-2d` track). Pairs that have them get
+    ///   `SharedFieldInterpolator`'s mono pass; the rest the tier's own
+    ///   interpolator, so the picture doesn't wait for the track.
     public static func wrappingIfSupported(_ inner: LookaheadFrameSource,
                                            thresholds: InterpolationGovernor.Thresholds = .depthPump,
-                                           engine: Engine = .videoToolbox) -> LookaheadFrameSource {
+                                           engine: Engine = .videoToolbox,
+                                           sharedFields: SharedFieldProvider? = nil) -> LookaheadFrameSource {
         var tiers: [Tier] = []
         if engine != .gpu, let vt = makeVideoToolboxInterpolator() {
             tiers.append(Tier(vt, upTo: maxSourceFrameRate))
@@ -163,6 +168,21 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
                 tiers.append(Tier(flow, upTo: maxFastSourceFrameRate))
             } else {
                 VergenceLog.pipeline.error("frame interpolation: GPU interpolator unavailable (no Metal, or its kernels failed)")
+            }
+        }
+        if let sharedFields {
+            // The fields' pass is a single warp, fast enough for any rate a tier takes.
+            let fast = max(tiers.last?.maxSourceFrameRate ?? 0, maxFastSourceFrameRate)
+            let wrapped = tiers.isEmpty
+                ? [SharedFieldInterpolator(provider: sharedFields, packing: .mono).map { Tier($0, upTo: fast) }]
+                : tiers.map { tier in
+                    SharedFieldInterpolator(provider: sharedFields, packing: .mono, fallback: tier.interpolator)
+                        .map { Tier($0, upTo: tier.maxSourceFrameRate) }
+                }
+            if wrapped.allSatisfy({ $0 != nil }) {
+                tiers = wrapped.compactMap { $0 }
+            } else {
+                VergenceLog.pipeline.error("frame interpolation: the fields' pass is unavailable, interpolating on the device")
             }
         }
         guard !tiers.isEmpty else {

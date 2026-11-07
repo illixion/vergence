@@ -41,6 +41,27 @@ struct SharedFieldTrackTests {
         #expect(provider.misses == 0)
     }
 
+    @Test func aTwoDimensionalTrackNeedsNoDisparity() throws {
+        // A 2D title's track (smooth-motion-2d) has flow pairs only: a stereo
+        // provider finds nothing in it, a mono one finds every pair.
+        let header = AnalysisTrackHeader(mediaID: "t", producer: "test", models: [:], sourceWidth: 1280, sourceHeight: 720)
+        var data = try AnalysisTrack.header(header)
+        for k in 0 ..< 3 {
+            let flow = (0 ..< 5).flatMap { c in [Float](repeating: Float(c + k), count: 6 * 3) }
+            data.append(AnalysisTrack.record(AnalysisRecord.encoding(
+                flow, kind: .flowPair, as: .int16, channels: 5, width: 6, height: 3,
+                time: AnalysisTime(seconds: Double(k) / 24), endTime: AnalysisTime(seconds: Double(k + 1) / 24),
+                maxMagnitude: 1024)))
+        }
+        let index = try AnalysisTrackIndex(data)
+        let stereo = AnalysisTrackFieldProvider(index: index, inflate: AnalysisTrackTests.identity)
+        #expect(stereo.fields(from: 1.0 / 24, to: 2.0 / 24) == nil)
+        let mono = AnalysisTrackFieldProvider(index: index, needsDisparity: false, inflate: AnalysisTrackTests.identity)
+        let fields = try #require(mono.fields(from: 1.0 / 24, to: 2.0 / 24))
+        #expect(!fields.hasDisparity && fields.flowWidth == 6 && abs(fields.flow[0] - 1) < 0.01)
+        #expect(mono.frameRate.map { abs($0 - 24) < 0.001 } == true)
+    }
+
     @Test func framesTheTrackDoesNotHoldFindNothing() throws {
         let provider = AnalysisTrackFieldProvider(index: try Self.track(), inflate: AnalysisTrackTests.identity)
         // Past the end, between real frames, and a pair two frames apart.

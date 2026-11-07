@@ -1,6 +1,6 @@
 /*
  Vergence - Smooth Motion for true stereo on the player: both in-between eyes
- from one motion field
+ from one motion field (and a 2D picture's in-between frame from its own)
 
  Makes the frame halfway between two packed stereo frames (a 3D Blu-ray's
  top/bottom pair) from fields computed ahead, off the headset
@@ -24,6 +24,12 @@
  bilinearly and clamped to each eye's edge (RIFE's warp, border padding).
  Blending is in the frames' own encoding, as RIFE's was.
 
+ A 2D picture (`Packing.mono`, the `smooth-motion-2d` workload: RIFE at
+ 960×576 on a worker) is the left eye alone, the whole frame. Its fields come
+ and go with the coordinator's pieces, so a mono interpolator can hold the
+ player's own on-device one as a `fallback` and use it for any pair without
+ fields: the picture keeps its in-between frames while pieces arrive.
+
  The kernel is compiled from source at first use rather than taken from the
  package's metallib: the SwiftPM command line never builds `.metal` files,
  and the `vergence interpolate` check runs this same code on a Mac.
@@ -42,16 +48,24 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
         /// Left eye on top (a 3D Blu-ray as `MVCPictureSource` packs it).
         case topAndBottom
         case sideBySide
+        /// A 2D picture: the whole frame, flow only.
+        case mono
     }
 
     public let provider: SharedFieldProvider
     public let packing: Packing
+    /// Makes the in-between frame of a pair without fields (a mono picture's
+    /// on-device interpolator), or nil to pass such pairs through.
+    public let fallback: MidFrameInterpolator?
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
-    private var outputPool: CVPixelBufferPool?
+    private var outputPools: [OSType: CVPixelBufferPool] = [:]
+    private var fallbackReady = false
+    /// Which made the last in-between frame, for a line when that changes.
+    private var lastSource: String?
     private var width = 0
     private var height = 0
     /// Field textures, remade when a record's size changes. One request at a
@@ -62,7 +76,9 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
     private var disparityTextures: [MTLTexture] = []
 
     /// nil without Metal or if the kernel doesn't compile.
-    public init?(provider: SharedFieldProvider, packing: Packing = .topAndBottom) {
+    /// - Parameter fallback: for `.mono`, the interpolator a pair without fields goes to.
+    public init?(provider: SharedFieldProvider, packing: Packing = .topAndBottom,
+                 fallback: MidFrameInterpolator? = nil) {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else { return nil }
         do {
             let library = try device.makeLibrary(source: Self.source, options: nil)
@@ -76,48 +92,64 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
         self.queue = queue
         self.provider = provider
         self.packing = packing
+        self.fallback = fallback
     }
 
-    /// The governor's `scale` is ignored: a warp pass costs the same at any
-    /// field size and the real frames are full size.
+    /// The governor's `scale` is ignored here (a warp pass costs the same at
+    /// any field size and the real frames are full size); the fallback gets it.
     public func prepare(width: Int, height: Int, scale: Double) -> Bool {
         switch packing {
         case .topAndBottom: guard height % 2 == 0 else { return false }
         case .sideBySide: guard width % 2 == 0 else { return false }
+        case .mono: break
         }
         var cache: CVMetalTextureCache?
         CVMetalTextureCacheCreate(nil, nil, device, nil, &cache)
+        guard let cache else { return false }
+        textureCache = cache
+        outputPools = [:]
+        self.width = width
+        self.height = height
+        fallbackReady = fallback?.prepare(width: width, height: height, scale: scale) ?? false
+        return true
+    }
+
+    /// An output pool for frames of `format` (8-bit BGRA, or half-float RGBA for HDR).
+    private func outputPool(_ format: OSType) -> CVPixelBufferPool? {
+        if let pool = outputPools[format] { return pool }
         var pool: CVPixelBufferPool?
         let attributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: format,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferMetalCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
         ]
         CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
-        guard let cache, let pool else { return false }
-        textureCache = cache
-        outputPool = pool
-        self.width = width
-        self.height = height
-        return true
+        outputPools[format] = pool
+        return pool
     }
 
     public func midFrame(between previous: CVPixelBuffer, and current: CVPixelBuffer,
                          completion: @escaping @Sendable (CVPixelBuffer?, Double) -> Void) {
         // Without times there is nothing to look fields up by.
-        completion(nil, .nan)
+        guard let fallback, fallbackReady else { completion(nil, .nan); return }
+        fallback.midFrame(between: previous, and: current, completion: completion)
     }
 
     public func midFrame(between previous: CVPixelBuffer, at previousTime: Double, and current: CVPixelBuffer,
                          at currentTime: Double,
                          completion: @escaping @Sendable (CVPixelBuffer?, Double) -> Void) {
         let started = CACurrentMediaTime()
-        guard let fields = provider.fields(from: previousTime, to: currentTime) else {
-            completion(nil, .nan)
+        guard let fields = provider.fields(from: previousTime, to: currentTime),
+              packing != .mono || !fields.hasDisparity else {
+            noteSource(fallback != nil && fallbackReady ? "on-device" : "none")
+            guard let fallback, fallbackReady else { completion(nil, .nan); return }
+            fallback.midFrame(between: previous, at: previousTime, and: current, at: currentTime, completion: completion)
             return
         }
+        noteSource("fields")
+        guard packing == .mono || fields.hasDisparity else { completion(nil, .nan); return }
         if encode(previous: previous, current: current, fields: fields, completion: { out in
             completion(out, (CACurrentMediaTime() - started) * 1000)
         }) == nil {
@@ -140,6 +172,13 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
 
     private final class ResultBox: @unchecked Sendable { var buffer: CVPixelBuffer? }
 
+    /// A line when the in-between frames start coming from somewhere else.
+    private func noteSource(_ source: String) {
+        guard source != lastSource, packing == .mono else { return }
+        lastSource = source
+        VergenceLog.pipeline.notice("Smooth Motion 2D: in-between frames from \(source, privacy: .public)")
+    }
+
     // MARK: The pass
 
     struct Params {
@@ -160,9 +199,9 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
         guard width > 0,
               CVPixelBufferGetWidth(previous) == width, CVPixelBufferGetHeight(previous) == height,
               CVPixelBufferGetWidth(current) == width, CVPixelBufferGetHeight(current) == height,
-              CVPixelBufferGetPixelFormatType(previous) == kCVPixelFormatType_32BGRA,
-              CVPixelBufferGetPixelFormatType(current) == kCVPixelFormatType_32BGRA,
-              let pool = outputPool else { return nil }
+              CVPixelBufferGetPixelFormatType(previous) == CVPixelBufferGetPixelFormatType(current),
+              Self.textureFormat(CVPixelBufferGetPixelFormatType(current)) != nil,
+              let pool = outputPool(CVPixelBufferGetPixelFormatType(current)) else { return nil }
         var output: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &output)
         guard let output,
@@ -173,13 +212,17 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
               let encoder = commands.makeComputeCommandEncoder() else { return nil }
         CVBufferPropagateAttachments(current, output)
 
-        let eye: SIMD2<Float> = packing == .topAndBottom
-            ? SIMD2(Float(width), Float(height / 2)) : SIMD2(Float(width / 2), Float(height))
+        let eye: SIMD2<Float> = switch packing {
+        case .topAndBottom: SIMD2(Float(width), Float(height / 2))
+        case .sideBySide: SIMD2(Float(width / 2), Float(height))
+        case .mono: SIMD2(Float(width), Float(height))
+        }
         var params = Params(
             eyeSize: eye,
+            // A mono picture's "right eye" starts past the frame, so no pixel is one.
             eyeOffset: packing == .topAndBottom ? SIMD2(0, eye.y) : SIMD2(eye.x, 0),
             flowScale: SIMD2(eye.x / Float(fields.flowWidth), eye.y / Float(fields.flowHeight)),
-            disparityScale: eye.x / Float(fields.disparityWidth),
+            disparityScale: fields.hasDisparity ? eye.x / Float(fields.disparityWidth) : 0,
             t: 0.5)
         encoder.setComputePipelineState(pipeline)
         encoder.setTexture(a.texture, index: 0)
@@ -218,11 +261,19 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
     }
     private struct OutputBox: @unchecked Sendable { let buffer: CVPixelBuffer }
 
+    static func textureFormat(_ pixelFormat: OSType) -> MTLPixelFormat? {
+        switch pixelFormat {
+        case kCVPixelFormatType_32BGRA: .bgra8Unorm
+        case kCVPixelFormatType_64RGBAHalf: .rgba16Float
+        default: nil
+        }
+    }
+
     private func texture(_ buffer: CVPixelBuffer) -> (texture: MTLTexture, held: CVMetalTexture)? {
-        guard let textureCache else { return nil }
+        guard let textureCache, let format = Self.textureFormat(CVPixelBufferGetPixelFormatType(buffer)) else { return nil }
         var cvTexture: CVMetalTexture?
         guard CVMetalTextureCacheCreateTextureFromImage(
-            nil, textureCache, buffer, nil, .bgra8Unorm,
+            nil, textureCache, buffer, nil, format,
             CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer), 0, &cvTexture) == kCVReturnSuccess,
             let cvTexture, let texture = CVMetalTextureGetTexture(cvTexture) else { return nil }
         return (texture, cvTexture)
@@ -232,7 +283,8 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
     /// for any motion under 64 stored pixels (1,000 at 1080p).
     private func uploadFields(_ fields: SharedFields) -> Bool {
         let fw = fields.flowWidth, fh = fields.flowHeight, n = fw * fh
-        let dw = fields.disparityWidth, dh = fields.disparityHeight
+        // A 2D picture's fields have no disparity: the kernel still binds two (unread) textures.
+        let dw = max(fields.disparityWidth, 1), dh = max(fields.disparityHeight, 1)
         func make(_ format: MTLPixelFormat, _ w: Int, _ h: Int, _ existing: MTLTexture?) -> MTLTexture? {
             if let existing, existing.width == w, existing.height == h { return existing }
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: w, height: h,
@@ -260,7 +312,7 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
                             bytesPerRow: 8 * fw)
         maskTexture.replace(region: MTLRegionMake2D(0, 0, fw, fh), mipmapLevel: 0, withBytes: mask,
                             bytesPerRow: 2 * fw)
-        for (texture, values) in zip(disparityTextures, [fields.disparity0, fields.disparity1]) {
+        for (texture, values) in zip(disparityTextures, [fields.disparity0, fields.disparity1]) where fields.hasDisparity {
             let bits = values.map { HalfFloat.bits(from: $0) }
             texture.replace(region: MTLRegionMake2D(0, 0, dw, dh), mipmapLevel: 0, withBytes: bits,
                             bytesPerRow: 2 * dw)

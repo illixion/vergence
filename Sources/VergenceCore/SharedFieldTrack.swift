@@ -42,6 +42,15 @@ public struct SharedFields: Sendable {
         self.disparityWidth = disparityWidth
         self.disparityHeight = disparityHeight
     }
+
+    /// A 2D picture's fields: its flow pair alone (the `smooth-motion-2d` workload).
+    public init(monoFlow flow: [Float], flowWidth: Int, flowHeight: Int) {
+        self.init(flow: flow, flowWidth: flowWidth, flowHeight: flowHeight, disparity0: [], disparity1: [],
+                  disparityWidth: 0, disparityHeight: 0)
+    }
+
+    /// Whether the fields carry disparity (a stereo pair's) or are a 2D picture's.
+    public var hasDisparity: Bool { disparityWidth > 0 && disparityHeight > 0 }
 }
 
 /// Finds the fields for a pair of real frames by their presentation times on
@@ -103,20 +112,27 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
     private var lastDisparity: (time: AnalysisTime, values: [Float], width: Int, height: Int)?
     public private(set) var misses = 0
     public let frameRate: Double?
+    /// A stereo track's: each pair needs the disparity at both ends. A 2D
+    /// track (`smooth-motion-2d`) has flow pairs only.
+    public let needsDisparity: Bool
 
     /// - Parameter inflate: raw DEFLATE, as `AnalysisRecord.inflated(using:)` takes it.
-    public convenience init(index: AnalysisTrackIndex, timeOffset: Double = 0,
+    public convenience init(index: AnalysisTrackIndex, timeOffset: Double = 0, needsDisparity: Bool = true,
                             inflate: @escaping (Data, Int) throws -> Data) {
-        self.init(lookup: index, frameRate: Self.frameRate(of: index), timeOffset: timeOffset, inflate: inflate)
+        self.init(lookup: index, frameRate: Self.frameRate(of: index), timeOffset: timeOffset,
+                  needsDisparity: needsDisparity, inflate: inflate)
     }
 
-    /// - Parameter frameRate: the rate the track was made at, when its producer says so.
+    /// - Parameters:
+    ///   - frameRate: the rate the track was made at, when its producer says so.
+    ///   - needsDisparity: false for a 2D track, whose fields are flow pairs alone.
     public init(lookup: any AnalysisRecordLookup, frameRate: Double?, timeOffset: Double = 0,
-                inflate: @escaping (Data, Int) throws -> Data) {
+                needsDisparity: Bool = true, inflate: @escaping (Data, Int) throws -> Data) {
         self.lookup = lookup
         self.timeOffset = timeOffset
         self.inflate = inflate
         self.frameRate = frameRate
+        self.needsDisparity = needsDisparity
     }
 
     /// The track's first pairs' mean spacing, as a rate: each pair's own
@@ -159,8 +175,11 @@ public final class AnalysisTrackFieldProvider: SharedFieldProvider, @unchecked S
         guard let (index, pairEntry) = lookup.nearestRecord(.flowPair, eye: .mono, to: t0, within: tolerance),
               abs(pairEntry.endTime.seconds - end) <= tolerance,
               let pair = try? index.record(pairEntry).inflated(using: inflate),
-              pair.channels == 5,
-              let d0 = disparity(at: t0, within: tolerance),
+              pair.channels == 5 else { return nil }
+        guard needsDisparity else {
+            return SharedFields(monoFlow: pair.values(), flowWidth: pair.width, flowHeight: pair.height)
+        }
+        guard let d0 = disparity(at: t0, within: tolerance),
               let d1 = disparity(at: t1, within: tolerance),
               d0.width == d1.width, d0.height == d1.height else { return nil }
         return SharedFields(flow: pair.values(), flowWidth: pair.width, flowHeight: pair.height,

@@ -106,7 +106,7 @@ public final class StereoFlowAnalyzer: @unchecked Sendable {
 
     // MARK: - Half-float tensors (bit patterns: `Float16` doesn't exist on Intel Macs)
 
-    private static func halfArray(_ shape: [Int], values: [Float], scale: Float = 1) throws -> MLMultiArray {
+    static func halfArray(_ shape: [Int], values: [Float], scale: Float = 1) throws -> MLMultiArray {
         let array = try MLMultiArray(shape: shape.map { NSNumber(value: $0) }, dataType: .float16)
         precondition(values.count == array.count, "tensor size")
         let strides = array.strides.map(\.intValue)
@@ -124,7 +124,7 @@ public final class StereoFlowAnalyzer: @unchecked Sendable {
     }
 
     /// Any output as floats in logical (row-major) order, whatever its strides and type.
-    private static func floats(_ array: MLMultiArray) -> [Float] {
+    static func floats(_ array: MLMultiArray) -> [Float] {
         let shape = array.shape.map(\.intValue)
         let strides = array.strides.map(\.intValue)
         var out = [Float](repeating: 0, count: array.count)

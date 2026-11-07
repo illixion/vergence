@@ -2,13 +2,22 @@
  vergence worker: analysis for a coordinator (`vergenced`)
 
    vergence worker --config FILE [--once]
+   vergence worker --config FILE --reference INPUT --workload NAME [--stereo LAYOUT] [--frames N] --output FILE.vgat
 
  Claims 2 s pieces of titles from the coordinator, reads each piece from the
  media server itself (with its own credentials; the coordinator hands out no
- media URLs), runs the same models as `vergence analyze`, and uploads the
- records as a small track. Smooth Motion for 3D titles first: the left eye's
- flow between frames and each frame's right→left disparity. Design: Hypnos
- `docs/plans/analysis-workers.md`.
+ media URLs), runs the workload's models, and uploads the records as a small
+ track. Workloads (`WorkerProducers.swift`):
+ - smooth-motion-3d: the left eye's flow between frames (RIFE 480×288) and
+   each frame's right→left disparity (NeuFlow 512×288), as `vergence analyze`.
+ - smooth-motion-2d: the whole picture's flow (RIFE 960×576), for 2D titles
+   and AI 3D; offered when the models folder has a RIFE*960x576.
+ Design: Hypnos `docs/plans/analysis-workers.md`.
+
+ --reference runs one workload over a local file in a single decode and
+ writes the track, the reference `scripts/check-worker.sh` compares a
+ coordinator's chunks with (LAYOUT as the coordinator names it, mono by
+ default).
 
  FILE is JSON:
 
@@ -17,7 +26,8 @@
      "tokenFile": "~/.config/vergence/worker.token",      (or "token")
      "name": "m2max",                                     (default: the host name)
      "remote": false,                                     (true: never takes live pieces)
-     "models": "~/Models/interp",                         (RIFE*480x288 and NeuFlow*512x288, as for analyze)
+     "models": "~/Models/interp",                         (RIFE*480x288 and NeuFlow*512x288, as for analyze; RIFE*960x576 for 2D)
+     "workloads": ["smooth-motion-3d"],                   (default: every one the models allow)
      "computeUnits": "all",                               (ane | gpu | cpu | all)
      "ffmpeg": "/opt/homebrew/bin/ffmpeg",                (default: ffmpeg on PATH)
      "jellyfin": { "url": "http://home-server:8096", "apiKeyFile": "~/.config/vergence/jellyfin.key" },
@@ -60,6 +70,7 @@ struct WorkerConfig: Decodable {
     var name: String?
     var remote: Bool?
     var models: String
+    var workloads: [String]?
     var computeUnits: String?
     var ffmpeg: String?
     var jellyfin: Server?
@@ -95,6 +106,7 @@ struct WorkLease: Decodable {
     var lease: UInt64
     var title: String
     var source: Source
+    var workload: String
     var kinds: [String]
     var piece: Int
     var firstFrame: Int64
@@ -113,22 +125,79 @@ struct WorkerFailure: Error, CustomStringConvertible {
 func runWorker(_ args: [String]) async throws {
     var configPath: String?
     var once = false
+    var reference: String?, workload: String?, stereo = "mono", output: String?
+    var frames = Int64.max
     var i = 0
+    func value() -> String {
+        guard i + 1 < args.count else { usage("\(args[i]) needs a value") }
+        i += 1
+        return args[i]
+    }
     while i < args.count {
         switch args[i] {
-        case "--config":
-            guard i + 1 < args.count else { usage("--config needs a value") }
-            configPath = args[i + 1]
-            i += 1
+        case "--config": configPath = value()
         case "--once": once = true
+        case "--reference": reference = value()
+        case "--workload": workload = value()
+        case "--stereo": stereo = value()
+        case "--output", "-o": output = value()
+        case "--frames":
+            guard let n = Int64(value()) else { usage("--frames needs a number") }
+            frames = n
         default: usage("worker doesn't take \(args[i])")
         }
         i += 1
     }
     guard let configPath else { usage("worker needs --config FILE") }
     let config = try JSONDecoder().decode(WorkerConfig.self, from: Data(contentsOf: URL(fileURLWithPath: expandTilde(configPath))))
+    if let reference {
+        guard let workload, let output else { usage("--reference needs --workload and --output") }
+        let producers = try await makeProducers(config)
+        guard let producer = producers[workload] else { usage("no \(workload) with these models") }
+        let input = try PieceInput.probe(reference, stereo: stereo)
+        let track = try PieceDecoder(ffmpeg: config.ffmpeg.map(expandTilde)).track(
+            of: input, frames: 0 ..< frames, frameCount: frames, producer: producer,
+            mediaID: "reference", producerName: "vergence worker --reference")
+        try track.write(to: URL(fileURLWithPath: output))
+        log("vergence worker: \(workload) reference, \(track.count / 1024) KB -> \(output)")
+        return
+    }
     let worker = try await AnalysisWorker(config: config)
     try await worker.run(once: once)
+}
+
+/// The workloads this config's models make, by name.
+func makeProducers(_ config: WorkerConfig) async throws -> [String: PieceProducer] {
+    let folder = URL(fileURLWithPath: expandTilde(config.models))
+    let units: MLComputeUnits = switch config.computeUnits {
+    case "ane": .cpuAndNeuralEngine
+    case "gpu": .cpuAndGPU
+    case "cpu": .cpuOnly
+    default: .all
+    }
+    let wanted = config.workloads.map(Set.init)
+    var producers: [String: PieceProducer] = [:]
+    if wanted?.contains(StereoFlowProducer.workload) ?? true {
+        let flowURL = try findModel(in: folder, prefix: "RIFE", size: "480x288")
+        let disparityURL = try findModel(in: folder, prefix: "NeuFlow", size: "512x288")
+        let analyzer = try await StereoFlowAnalyzer(flowModel: flowURL, disparityModel: disparityURL, computeUnits: units)
+        producers[StereoFlowProducer.workload] = StereoFlowProducer(analyzer: analyzer)
+    }
+    if wanted?.contains(MonoFlowProducer.workload) ?? true {
+        // Optional unless asked for by name: without the larger RIFE, 2D titles are left to others.
+        // RIFE 4.25 lite, the family the 3D workload and the ONNX export use, before any other RIFE.
+        if let url = (try? findModel(in: folder, prefix: "RIFE425lite", size: MonoFlowProducer.modelSize))
+            ?? (try? findModel(in: folder, prefix: "RIFE", size: MonoFlowProducer.modelSize)) {
+            // At 960×576 the GPU is the fast place on an M2 Max (40 fps a title, against 16 on the
+            // Neural Engine or with Core ML choosing), so it goes there unless the config says otherwise.
+            producers[MonoFlowProducer.workload] = MonoFlowProducer(
+                analyzer: try await MonoFlowAnalyzer(flowModel: url, computeUnits: config.computeUnits == nil ? .cpuAndGPU : units))
+        } else if wanted != nil {
+            throw WorkerFailure("smooth-motion-2d needs RIFE*\(MonoFlowProducer.modelSize) in \(folder.path)")
+        }
+    }
+    guard !producers.isEmpty else { throw WorkerFailure("the config asks for no workload this worker makes") }
+    return producers
 }
 
 final class AnalysisWorker: @unchecked Sendable {
@@ -136,8 +205,7 @@ final class AnalysisWorker: @unchecked Sendable {
     let coordinator: URL
     let token: String
     let name: String
-    let analyzer: StereoFlowAnalyzer
-    let models: [String: String]
+    let producers: [String: PieceProducer]
     let session = URLSession(configuration: .ephemeral)
 
     init(config: WorkerConfig) async throws {
@@ -152,26 +220,15 @@ final class AnalysisWorker: @unchecked Sendable {
             throw WorkerFailure("the config needs token or tokenFile")
         }
         name = config.name ?? ProcessInfo.processInfo.hostName
-        let folder = URL(fileURLWithPath: expandTilde(config.models))
-        let flowURL = try findModel(in: folder, prefix: "RIFE", size: "480x288")
-        let disparityURL = try findModel(in: folder, prefix: "NeuFlow", size: "512x288")
-        let units: MLComputeUnits = switch config.computeUnits {
-        case "ane": .cpuAndNeuralEngine
-        case "gpu": .cpuAndGPU
-        case "cpu": .cpuOnly
-        default: .all
-        }
-        analyzer = try await StereoFlowAnalyzer(flowModel: flowURL, disparityModel: disparityURL, computeUnits: units)
-        let flowSize = SharedFieldAnalysis.flowModelSize, disparitySize = SharedFieldAnalysis.disparityModelSize
-        // Exactly what `vergence analyze` writes, so tracks from either agree on the profile.
-        models = ["flowPair": "\(analyzer.flowModelName) \(flowSize.width)x\(flowSize.height)",
-                  "disparity": "\(analyzer.disparityModelName) \(disparitySize.width)x\(disparitySize.height)"]
+        producers = try await makeProducers(config)
         // Below the user's own work.
         setpriority(PRIO_PROCESS, 0, 10)
     }
 
     func run(once: Bool) async throws {
-        log("vergence worker: \(name), \(models["flowPair"]!), \(models["disparity"]!)")
+        for (workload, producer) in producers.sorted(by: { $0.key < $1.key }) {
+            log("vergence worker: \(name), \(workload): \(producer.models.sorted(by: { $0.key < $1.key }).map(\.value).joined(separator: ", "))")
+        }
         var idle: UInt64 = 2
         while true {
             let lease: WorkLease?
@@ -237,9 +294,13 @@ final class AnalysisWorker: @unchecked Sendable {
     func claim() async throws -> WorkLease? {
         var request = request("v1/work/claim", method: "POST")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Each workload with its own models (RIFE runs at two sizes); `models` for an older coordinator.
+        let byWorkload = producers.mapValues(\.models)
         request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "worker": name, "remote": config.remote ?? false, "models": models,
-        ])
+            "worker": name, "remote": config.remote ?? false,
+            "models": byWorkload[StereoFlowProducer.workload] ?? byWorkload.values.first ?? [:],
+            "workloads": producers.keys.sorted(), "workloadModels": byWorkload,
+        ] as [String: Any])
         let (data, response) = try await session.data(for: request)
         switch (response as? HTTPURLResponse)?.statusCode {
         case 200: return try JSONDecoder().decode(WorkLease.self, from: data)
@@ -279,136 +340,24 @@ final class AnalysisWorker: @unchecked Sendable {
         }
     }
 
-    /// Runs the models over the piece's frames; returns the piece as a track.
+    /// Runs the workload's models over the piece's frames; returns the piece as a track.
     func analyze(_ lease: WorkLease) async throws -> Data {
-        guard Set(lease.kinds) == ["flowPair", "disparity"] else {
-            throw WorkerFailure("this worker makes Smooth Motion fields only, not \(lease.kinds)")
+        guard let producer = producers[lease.workload] else {
+            throw WorkerFailure("this worker doesn't make \(lease.workload)")
         }
-        let w = lease.info.width, h = lease.info.height
-        let sideBySide: Bool
-        switch lease.info.stereo {
-        case "halfSideBySide", "fullSideBySide": sideBySide = true
-        case "halfTopAndBottom", "fullTopAndBottom": sideBySide = false
-        default: throw WorkerFailure("the title's layout (\(lease.info.stereo)) isn't frame-packed stereo")
+        guard Set(lease.kinds) == producer.kinds else {
+            throw WorkerFailure("\(lease.workload) wants \(lease.kinds), this worker makes \(producer.kinds.sorted())")
         }
-        guard w > 0, h > 0, w % 4 == 0, h % 4 == 0 else { throw WorkerFailure("the picture's size (\(w)x\(h)) is unusable") }
-        let eyeW = sideBySide ? w / 2 : w, eyeH = sideBySide ? h : h / 2
-
         let (url, headers) = try mediaRequest(lease)
         let forwarder = try LoopbackForwarder(target: url, headers: headers)
         defer { forwarder.stop() }
-        let rate = lease.info.frameRate
-        // One frame past the piece when there is one: the last flow pair reaches it.
-        let wanted = Int(lease.endFrame - lease.firstFrame) + (lease.endFrame < lease.frameCount ? 1 : 0)
-        // Half a frame early, so the first frame out is exactly firstFrame.
-        let seek = (Double(lease.firstFrame) - 0.5) * Double(rate.den) / Double(rate.num)
-        var args = ["-nostdin", "-v", "error"]
-        // A frame-packing SEI makes ffmpeg 8 and 9 fail filter graphs; drop SEI before decoding.
-        if lease.info.codec.lowercased() == "h264" { args += ["-bsf:v", "filter_units=remove_types=6"] }
-        if seek > 0 { args += ["-ss", String(format: "%.6f", seek)] }
-        // Passthrough: rawvideo's default constant-rate sync would repeat the first frame after a seek.
-        args += ["-i", forwarder.url.absoluteString, "-map", "0:v:0", "-fps_mode", "passthrough",
-                 "-frames:v", String(wanted), "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: config.ffmpeg.map(expandTilde) ?? "/usr/bin/env")
-        process.arguments = config.ffmpeg == nil ? ["ffmpeg"] + args : args
-        process.qualityOfService = .utility
-        let output = Pipe(), errors = Pipe()
-        process.standardOutput = output
-        process.standardError = errors
-        try process.run()
-        defer { if process.isRunning { process.terminate() } }
-
-        let header = AnalysisTrackHeader(mediaID: lease.title, producer: "vergence worker",
-                                         models: models, sourceWidth: eyeW, sourceHeight: eyeH)
-        var track = try AnalysisTrack.header(header)
-        let flowSize = SharedFieldAnalysis.flowModelSize, disparitySize = SharedFieldAnalysis.disparityModelSize
-        let frameBytes = w * h * 3 / 2
-        let reader = output.fileHandleForReading
-        var previous: (left: [Float], time: AnalysisTime)?
-        var index = lease.firstFrame
-        while index < lease.firstFrame + Int64(wanted) {
-            var data = Data()
-            while data.count < frameBytes {
-                guard let chunk = try reader.read(upToCount: frameBytes - data.count), !chunk.isEmpty else { break }
-                data.append(chunk)
-            }
-            guard data.count == frameBytes else { break }
-            let time = AnalysisTime(value: index * Int64(rate.den), timescale: Int32(rate.num))
-            let inPiece = index < lease.endFrame
-            try autoreleasepool {
-                try data.withUnsafeBytes { raw in
-                    let base = raw.bindMemory(to: UInt8.self).baseAddress!
-                    let (left, right) = Self.eyes(base: base, width: w, height: h, sideBySide: sideBySide)
-                    let leftFlow = SharedFieldAnalysis.rgbPlanar(y: left[0], cb: left[1], cr: left[2],
-                                                                 width: flowSize.width, height: flowSize.height)
-                    let runs = PieceRuns()
-                    DispatchQueue.concurrentPerform(iterations: 2) { job in
-                        do {
-                            if job == 0, let previous {
-                                runs.flow = try analyzer.flow(from: previous.left, to: leftFlow)
-                            } else if job == 1, inPiece {
-                                let l = SharedFieldAnalysis.rgbPlanar(y: left[0], cb: left[1], cr: left[2],
-                                                                      width: disparitySize.width, height: disparitySize.height)
-                                let r = SharedFieldAnalysis.rgbPlanar(y: right[0], cb: right[1], cr: right[2],
-                                                                      width: disparitySize.width, height: disparitySize.height)
-                                runs.disparity = try analyzer.disparity(left: l, right: r)
-                            }
-                        } catch {
-                            runs.error = error
-                        }
-                    }
-                    if let error = runs.error { throw error }
-                    if let previous, let (flow, mask) = runs.flow {
-                        track.append(AnalysisTrack.record(try SharedFieldAnalysis.flowPairRecord(
-                            flow: flow, mask: mask, width: flowSize.width, height: flowSize.height,
-                            time: previous.time, endTime: time).deflated()))
-                    }
-                    if let disparity = runs.disparity {
-                        track.append(AnalysisTrack.record(try SharedFieldAnalysis.disparityRecord(
-                            rightToLeft: disparity, width: disparitySize.width, height: disparitySize.height,
-                            time: time).deflated()))
-                    }
-                    previous = (leftFlow, time)
-                }
-            }
-            index += 1
-        }
-        process.waitUntilExit()
-        let decoded = index - lease.firstFrame
-        guard decoded >= Int64(lease.endFrame - lease.firstFrame) else {
-            let message = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            throw WorkerFailure("ffmpeg gave \(decoded) of \(wanted) frames (\(process.terminationStatus)): \(message.prefix(300))")
-        }
-        return track
+        let input = PieceInput(url: forwarder.url.absoluteString, width: lease.info.width, height: lease.info.height,
+                               codec: lease.info.codec, stereo: lease.info.stereo,
+                               rate: (lease.info.frameRate.num, lease.info.frameRate.den))
+        return try PieceDecoder(ffmpeg: config.ffmpeg.map(expandTilde)).track(
+            of: input, frames: lease.firstFrame ..< lease.endFrame, frameCount: lease.frameCount,
+            producer: producer, mediaID: lease.title, producerName: "vergence worker")
     }
-
-    /// The two eyes of a packed I420 picture, read in place.
-    static func eyes(base: UnsafePointer<UInt8>, width w: Int, height h: Int,
-                     sideBySide: Bool) -> (left: [AnalysisPlane], right: [AnalysisPlane]) {
-        let cb = base + w * h, cr = cb + (w / 2) * (h / 2)
-        if sideBySide {
-            func eye(_ e: Int) -> [AnalysisPlane] {
-                [AnalysisPlane(base: base + e * w / 2, width: w / 2, height: h, stride: w),
-                 AnalysisPlane(base: cb + e * w / 4, width: w / 4, height: h / 2, stride: w / 2),
-                 AnalysisPlane(base: cr + e * w / 4, width: w / 4, height: h / 2, stride: w / 2)]
-            }
-            return (eye(0), eye(1))
-        }
-        func eye(_ e: Int) -> [AnalysisPlane] {
-            [AnalysisPlane(base: base + e * w * h / 2, width: w, height: h / 2, stride: w),
-             AnalysisPlane(base: cb + e * (w / 2) * (h / 4), width: w / 2, height: h / 4, stride: w / 2),
-             AnalysisPlane(base: cr + e * (w / 2) * (h / 4), width: w / 2, height: h / 4, stride: w / 2)]
-        }
-        return (eye(0), eye(1))
-    }
-}
-
-/// What one frame's two concurrent model runs produced.
-private final class PieceRuns: @unchecked Sendable {
-    var flow: (flow: [Float], mask: [Float])?
-    var disparity: [Float]?
-    var error: Error?
 }
 
 /// An HTTP endpoint on 127.0.0.1, at a random path, that passes each

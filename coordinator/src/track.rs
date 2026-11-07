@@ -78,6 +78,16 @@ impl Kind {
     pub fn is_pair(self) -> bool {
         self == Kind::FlowPair
     }
+
+    /// The eye a workload's records of this kind are laid out on (VergenceCore's
+    /// `AnalysisEye`): disparity on the right eye (right→left), everything
+    /// else on the left eye or the whole picture, written as mono (0).
+    pub fn eye(self) -> u8 {
+        match self {
+            Kind::Disparity => 2,
+            _ => 0,
+        }
+    }
 }
 
 /// A track's opening JSON, as VergenceCore's `AnalysisTrackHeader`.
@@ -273,7 +283,7 @@ pub(crate) mod tests {
     #[test]
     fn reads_back_what_it_writes() {
         let mut data = write_header(&header(&[("flowPair", "RIFE 480x288")]));
-        data.extend(record(Kind::FlowPair, 1, 0, 1001, 24000, 4, 2));
+        data.extend(record(Kind::FlowPair, 0, 0, 1001, 24000, 4, 2));
         data.extend(record(Kind::Disparity, 2, 1001, 1001, 24000, 4, 2));
         let track = parse(&data).unwrap();
         assert_eq!(track.header.models["flowPair"], "RIFE 480x288");

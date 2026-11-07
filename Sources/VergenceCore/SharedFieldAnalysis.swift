@@ -125,12 +125,20 @@ public enum SharedFieldAnalysis {
         return out
     }
 
+    /// A 2D picture's flow (`smooth-motion-2d`): RIFE at 960×576, stored at
+    /// 240×144. A stored pixel there is half the 3D track's, so the step is
+    /// twice as coarse for the same half pixel at 1080p (and about a third
+    /// smaller a frame).
+    public static let monoFlowStep: Float = 1.0 / 16
+
     /// RIFE's output at t = ½ as a `flowPair` record.
     /// - Parameters:
     ///   - flow: 4 planar channels at the model's size, F½→0 (x, y) then F½→1 (x, y), model pixels.
     ///   - mask: frame 0's blend weight at ½, 0…1.
+    ///   - step: the stored step, in stored pixels.
     public static func flowPairRecord(flow: [Float], mask: [Float], width: Int, height: Int,
-                                      time: AnalysisTime, endTime: AnalysisTime) -> AnalysisRecord {
+                                      time: AnalysisTime, endTime: AnalysisTime,
+                                      step: Float = SharedFieldAnalysis.step) -> AnalysisRecord {
         let f = storageFactor
         let small = areaDownsample(flow, channels: 4, width: width, height: height, factor: f)
         let m = areaDownsample(mask, channels: 1, width: width, height: height, factor: f)
