@@ -1,0 +1,32 @@
+[package]
+name = "vergence-companion"
+description = "RAVECompanion pairing in Rust: Bonjour knock, six-digit pairing, per-device TLS-PSK channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["tls"]
+# The TLS 1.2 external-PSK channel, on OpenSSL (rustls has no external PSK).
+# Off, the crate is the pure protocol: wire format, exchange, store.
+tls = ["dep:openssl"]
+# Build OpenSSL from source instead of linking the system's (Homebrew's on a Mac).
+vendored-openssl = ["tls", "openssl/vendored"]
+
+[dependencies]
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+openssl = { version = "0.10", optional = true }
+percent-encoding = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+tempfile = "3"
