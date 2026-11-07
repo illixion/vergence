@@ -1,0 +1,13 @@
+# The Rust half of Vergence: the analysis coordinator (headless as `vergenced`,
+# or inside the desktop app), the RAVECompanion pairing port, and later the
+# desktop app itself and the ONNX Runtime worker. Beside the Swift package,
+# MIT like the rest. Design: Hypnos `docs/plans/analysis-workers.md`.
+[workspace]
+resolver = "3"
+members = ["coordinator"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/illixion/vergence"

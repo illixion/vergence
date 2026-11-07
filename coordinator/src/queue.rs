@@ -1,0 +1,783 @@
+//! The work queue, without I/O: titles cut into 2 s pieces, leases for the
+//! workers that claim them, and priorities from where the players are.
+//!
+//! - **Unit of work:** a piece, 2 s of one title for one workload (a set of
+//!   record kinds). Chunks stay 10 s for players and storage, five pieces each.
+//! - **Priority:** live (within 30 s ahead of a playhead), then ahead (the rest
+//!   of a playing title), then backfill (everything else, oldest title first).
+//!   Remote workers never take live pieces.
+//! - **Leases** last about twice a worker's measured piece time; an expired
+//!   one returns its piece to the queue. A seek doesn't cancel anything: the
+//!   pieces behind the new playhead just fall to backfill.
+//! - **Profiles:** one set of models per title. The first worker granted a
+//!   piece fixes it; workers running other models skip that title, so
+//!   neighbouring chunks never come from numerically different networks.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::source::{MediaInfo, SourceRef};
+use crate::track::{Kind, ParsedTrack};
+
+pub const PIECE_SECONDS: f64 = 2.0;
+pub const CHUNK_SECONDS: f64 = 10.0;
+pub const PIECES_PER_CHUNK: usize = 5;
+/// Pieces this close ahead of a playhead are live.
+pub const LIVE_SECONDS: f64 = 30.0;
+/// A playhead not reported again for this long is gone.
+pub const PLAYHEAD_TTL: Duration = Duration::from_secs(20);
+const DEFAULT_LEASE: Duration = Duration::from_secs(120);
+const MIN_LEASE: Duration = Duration::from_secs(20);
+const MAX_LEASE: Duration = Duration::from_secs(900);
+
+/// A set of record kinds made together, e.g. Smooth Motion for 3D titles
+/// (flow pairs on the left eye and right→left disparity).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Workload {
+    pub name: String,
+    pub kinds: Vec<Kind>,
+    /// Only stereo titles (both eyes are read).
+    pub needs_stereo: bool,
+}
+
+impl Workload {
+    pub const SMOOTH_MOTION_3D: &'static str = "smooth-motion-3d";
+
+    pub fn defaults() -> Vec<Workload> {
+        vec![Workload {
+            name: Self::SMOOTH_MOTION_3D.into(),
+            kinds: vec![Kind::FlowPair, Kind::Disparity],
+            needs_stereo: true,
+        }]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PieceState {
+    Pending,
+    Leased,
+    Done,
+}
+
+/// The models a title's records come from, per kind name.
+pub type Profile = BTreeMap<String, String>;
+
+#[derive(Clone, Debug)]
+pub struct Title {
+    pub key: String,
+    pub source: SourceRef,
+    pub workload: Workload,
+    pub info: MediaInfo,
+    pub profile: Option<Profile>,
+    /// One eye's size as the workers decoded it, fixed by the first result.
+    pub source_size: Option<(u32, u32)>,
+    /// Added order, for backfill.
+    pub ordinal: u64,
+    pub pieces: Vec<PieceState>,
+}
+
+/// What a title's results are stored and served as.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TitleMeta {
+    pub key: String,
+    pub source: SourceRef,
+    pub workload: Workload,
+    pub info: MediaInfo,
+    pub profile: Option<Profile>,
+    pub source_size: Option<(u32, u32)>,
+    pub ordinal: u64,
+}
+
+impl Title {
+    pub fn key_for(source: &SourceRef, workload: &str) -> String {
+        format!("{}/{}/{}", source.server.name(), source.id, workload)
+    }
+
+    pub fn meta(&self) -> TitleMeta {
+        TitleMeta {
+            key: self.key.clone(),
+            source: self.source.clone(),
+            workload: self.workload.clone(),
+            info: self.info.clone(),
+            profile: self.profile.clone(),
+            source_size: self.source_size,
+            ordinal: self.ordinal,
+        }
+    }
+
+    pub fn piece_count(info: &MediaInfo) -> usize {
+        (info.duration_seconds / PIECE_SECONDS).ceil().max(0.0) as usize
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.pieces.len().div_ceil(PIECES_PER_CHUNK)
+    }
+
+    /// Frames in the whole title.
+    pub fn frame_count(&self) -> i64 {
+        (self.info.duration_seconds * self.info.frame_rate.fps()).round() as i64
+    }
+
+    /// The frame indices piece `i` holds: frames whose time is in [2i, 2i+2).
+    pub fn piece_frames(&self, i: usize) -> std::ops::Range<i64> {
+        let (num, den) = (self.info.frame_rate.num as i64, self.info.frame_rate.den as i64);
+        let first = |seconds: i64| (seconds * num + den - 1) / den;
+        let start = first(i as i64 * PIECE_SECONDS as i64);
+        let end = first((i as i64 + 1) * PIECE_SECONDS as i64).min(self.frame_count());
+        start..end.max(start)
+    }
+
+    pub fn done(&self) -> usize {
+        self.pieces.iter().filter(|p| **p == PieceState::Done).count()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TitleStatus {
+    /// ready (every piece done), running (some done or leased), queued.
+    pub state: &'static str,
+    pub progress: f64,
+    pub pieces_done: usize,
+    pub pieces_leased: usize,
+    pub pieces: usize,
+    pub piece_seconds: f64,
+    pub chunk_seconds: f64,
+    pub chunks: usize,
+    pub frame_rate: f64,
+}
+
+/// A worker asking for a piece.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Claim {
+    /// The worker's own stable name.
+    pub worker: String,
+    /// Behind a slow link: never given live pieces.
+    #[serde(default)]
+    pub remote: bool,
+    /// The models it runs, per kind name (what its tracks' headers will say).
+    pub models: Profile,
+    /// Workloads it takes; all it can do when absent.
+    #[serde(default)]
+    pub workloads: Option<Vec<String>>,
+}
+
+/// A piece handed to a worker.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Lease {
+    pub lease: u64,
+    pub title: String,
+    pub source: SourceRef,
+    pub workload: String,
+    pub kinds: Vec<Kind>,
+    pub piece: usize,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    /// Frame indices [first, end) whose records the piece holds. A flow pair
+    /// from the last of them reaches the next frame, so decode one past `end`
+    /// when there is one (`frameCount` says).
+    pub first_frame: i64,
+    pub end_frame: i64,
+    pub frame_count: i64,
+    pub info: MediaInfo,
+    pub lease_seconds: f64,
+    /// Live work: a player is waiting for it.
+    pub live: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LeaseState {
+    title: String,
+    piece: usize,
+    worker: String,
+    granted: Instant,
+    until: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct Playhead {
+    title: String,
+    seconds: f64,
+    rate: f64,
+    at: Instant,
+}
+
+impl Playhead {
+    fn now(&self, now: Instant) -> f64 {
+        self.seconds + self.rate * now.saturating_duration_since(self.at).as_secs_f64()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct WorkerStats {
+    piece_seconds: Option<f64>,
+    pieces: u64,
+    last_seen: Option<Instant>,
+    remote: bool,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum UploadError {
+    #[error("no such lease (it expired or was released)")]
+    NoLease,
+    #[error("the lease belongs to another worker")]
+    NotYours,
+    #[error("the track's models don't match the title's profile")]
+    Profile,
+    #[error("the track's picture size doesn't match the title's")]
+    SourceSize,
+    #[error("a record of kind {0} isn't part of this workload")]
+    Kind(&'static str),
+    #[error("a record at {0:.3} s is outside the piece or off the title's frame grid")]
+    Time(f64),
+    #[error("{kind} has {got} records where {expected} were expected")]
+    Count { kind: &'static str, got: usize, expected: i64 },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum AddOutcome {
+    Added,
+    Unchanged,
+    /// The file behind the title changed: its results were dropped.
+    Reset,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum AddError {
+    #[error("the title isn't stereo, and this workload needs both eyes")]
+    NotStereo,
+    #[error("the title's length or frame rate is unknown")]
+    NoTiming,
+    #[error("Blu-ray discs aren't read by workers yet")]
+    Disc,
+}
+
+#[derive(Default)]
+pub struct Queue {
+    titles: BTreeMap<String, Title>,
+    leases: HashMap<u64, LeaseState>,
+    playheads: HashMap<String, Playhead>,
+    workers: HashMap<String, WorkerStats>,
+    next_lease: u64,
+    next_ordinal: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+struct Rank {
+    class: u8,
+    distance: f64,
+    ordinal: u64,
+    piece: usize,
+}
+
+impl Queue {
+    pub fn new() -> Queue {
+        Queue { next_lease: 1, ..Default::default() }
+    }
+
+    /// A title read back from storage, with the pieces whose results are kept.
+    pub fn restore(&mut self, meta: TitleMeta, done: &[usize]) {
+        let mut pieces = vec![PieceState::Pending; Title::piece_count(&meta.info)];
+        for &i in done {
+            if let Some(p) = pieces.get_mut(i) {
+                *p = PieceState::Done;
+            }
+        }
+        self.next_ordinal = self.next_ordinal.max(meta.ordinal + 1);
+        self.titles.insert(
+            meta.key.clone(),
+            Title {
+                key: meta.key,
+                source: meta.source,
+                workload: meta.workload,
+                info: meta.info,
+                profile: meta.profile,
+                source_size: meta.source_size,
+                ordinal: meta.ordinal,
+                pieces,
+            },
+        );
+    }
+
+    pub fn title(&self, key: &str) -> Option<&Title> {
+        self.titles.get(key)
+    }
+
+    pub fn titles(&self) -> impl Iterator<Item = &Title> {
+        self.titles.values()
+    }
+
+    /// Adds a title, or refreshes what is known about it.
+    pub fn add(&mut self, source: SourceRef, workload: &Workload, info: MediaInfo) -> Result<AddOutcome, AddError> {
+        if workload.needs_stereo && !info.stereo.is_stereo() {
+            return Err(AddError::NotStereo);
+        }
+        if info.stereo == crate::source::StereoLayout::Mvc {
+            return Err(AddError::Disc);
+        }
+        if info.duration_seconds <= 0.0 || info.frame_rate.num == 0 {
+            return Err(AddError::NoTiming);
+        }
+        let key = Title::key_for(&source, &workload.name);
+        if let Some(title) = self.titles.get_mut(&key) {
+            if title.info.identity == info.identity {
+                return Ok(AddOutcome::Unchanged);
+            }
+            title.pieces = vec![PieceState::Pending; Title::piece_count(&info)];
+            title.info = info;
+            title.profile = None;
+            title.source_size = None;
+            self.leases.retain(|_, l| l.title != key);
+            return Ok(AddOutcome::Reset);
+        }
+        let pieces = vec![PieceState::Pending; Title::piece_count(&info)];
+        let ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        self.titles.insert(
+            key.clone(),
+            Title { key, source, workload: workload.clone(), info, profile: None, source_size: None, ordinal, pieces },
+        );
+        Ok(AddOutcome::Added)
+    }
+
+    pub fn remove(&mut self, key: &str) -> bool {
+        self.leases.retain(|_, l| l.title != key);
+        self.playheads.retain(|_, p| p.title != key);
+        self.titles.remove(key).is_some()
+    }
+
+    /// A player says where it is playing.
+    pub fn report_playhead(&mut self, player: &str, title: &str, seconds: f64, rate: f64, now: Instant) {
+        self.playheads.insert(
+            player.to_string(),
+            Playhead { title: title.to_string(), seconds: seconds.max(0.0), rate: rate.clamp(0.0, 4.0), at: now },
+        );
+    }
+
+    /// A player stopped.
+    pub fn stop_playhead(&mut self, player: &str) {
+        self.playheads.remove(player);
+    }
+
+    /// Returns expired leases' pieces to the queue and forgets old playheads.
+    pub fn expire(&mut self, now: Instant) {
+        let expired: Vec<u64> = self.leases.iter().filter(|(_, l)| l.until <= now).map(|(id, _)| *id).collect();
+        for id in expired {
+            if let Some(lease) = self.leases.remove(&id)
+                && let Some(title) = self.titles.get_mut(&lease.title)
+                && title.pieces[lease.piece] == PieceState::Leased
+            {
+                title.pieces[lease.piece] = PieceState::Pending;
+            }
+        }
+        self.playheads.retain(|_, p| now.saturating_duration_since(p.at) < PLAYHEAD_TTL);
+    }
+
+    fn lease_length(&self, worker: &str) -> Duration {
+        self.workers
+            .get(worker)
+            .and_then(|w| w.piece_seconds)
+            .map(|s| Duration::from_secs_f64(s * 2.0 + 5.0).clamp(MIN_LEASE, MAX_LEASE))
+            .unwrap_or(DEFAULT_LEASE)
+    }
+
+    /// The best piece for this worker, leased to it.
+    pub fn claim(&mut self, claim: &Claim, now: Instant) -> Option<Lease> {
+        self.expire(now);
+        let stats = self.workers.entry(claim.worker.clone()).or_default();
+        stats.last_seen = Some(now);
+        stats.remote = claim.remote;
+
+        let mut best: Option<(Rank, String)> = None;
+        for title in self.titles.values() {
+            if let Some(names) = &claim.workloads
+                && !names.contains(&title.workload.name)
+            {
+                continue;
+            }
+            if !title.workload.kinds.iter().all(|k| claim.models.contains_key(k.name())) {
+                continue;
+            }
+            if let Some(profile) = &title.profile
+                && profile.iter().any(|(k, m)| claim.models.get(k) != Some(m))
+            {
+                continue;
+            }
+            let heads: Vec<f64> = self.playheads.values().filter(|p| p.title == title.key).map(|p| p.now(now)).collect();
+            if let Some(rank) = Self::best_piece(title, &heads, claim.remote)
+                && best.as_ref().is_none_or(|(b, _)| rank < *b)
+            {
+                best = Some((rank, title.key.clone()));
+            }
+        }
+        let (rank, key) = best?;
+        let length = self.lease_length(&claim.worker);
+        let id = self.next_lease;
+        self.next_lease += 1;
+        let title = self.titles.get_mut(&key).expect("the title was just found");
+        title.pieces[rank.piece] = PieceState::Leased;
+        if title.profile.is_none() {
+            title.profile = Some(
+                title.workload.kinds.iter().map(|k| (k.name().to_string(), claim.models[k.name()].clone())).collect(),
+            );
+        }
+        self.leases.insert(
+            id,
+            LeaseState { title: key.clone(), piece: rank.piece, worker: claim.worker.clone(), granted: now, until: now + length },
+        );
+        let title = &self.titles[&key];
+        let frames = title.piece_frames(rank.piece);
+        Some(Lease {
+            lease: id,
+            title: key,
+            source: title.source.clone(),
+            workload: title.workload.name.clone(),
+            kinds: title.workload.kinds.clone(),
+            piece: rank.piece,
+            start_seconds: rank.piece as f64 * PIECE_SECONDS,
+            end_seconds: ((rank.piece + 1) as f64 * PIECE_SECONDS).min(title.info.duration_seconds),
+            first_frame: frames.start,
+            end_frame: frames.end,
+            frame_count: title.frame_count(),
+            info: title.info.clone(),
+            lease_seconds: length.as_secs_f64(),
+            live: rank.class == 0,
+        })
+    }
+
+    /// The pending piece of `title` this worker should take, if any.
+    fn best_piece(title: &Title, heads: &[f64], remote: bool) -> Option<Rank> {
+        let first_pending = |from: usize| (from..title.pieces.len()).find(|&i| title.pieces[i] == PieceState::Pending);
+        let mut best: Option<Rank> = None;
+        let mut consider = |rank: Rank| {
+            if best.is_none_or(|b| rank < b) {
+                best = Some(rank);
+            }
+        };
+        for &head in heads {
+            // Remote workers start past the live window.
+            let from = if remote {
+                ((head + LIVE_SECONDS) / PIECE_SECONDS).ceil().max(0.0) as usize
+            } else {
+                (head / PIECE_SECONDS).floor().max(0.0) as usize
+            };
+            if let Some(i) = first_pending(from) {
+                let distance = i as f64 * PIECE_SECONDS - head;
+                let class = if distance < LIVE_SECONDS { 0 } else { 1 };
+                if remote && class == 0 {
+                    continue;
+                }
+                consider(Rank { class, distance, ordinal: title.ordinal, piece: i });
+            }
+        }
+        if let Some(i) = first_pending(0) {
+            consider(Rank { class: 2, distance: 0.0, ordinal: title.ordinal, piece: i });
+        }
+        best
+    }
+
+    /// Keeps a lease alive; returns its new length in seconds.
+    pub fn heartbeat(&mut self, lease: u64, worker: &str, now: Instant) -> Result<f64, UploadError> {
+        let length = self.lease_length(worker);
+        let state = self.leases.get_mut(&lease).ok_or(UploadError::NoLease)?;
+        if state.worker != worker {
+            return Err(UploadError::NotYours);
+        }
+        state.until = now + length;
+        Ok(length.as_secs_f64())
+    }
+
+    /// The worker gives the piece back (it has to yield, or failed).
+    pub fn release(&mut self, lease: u64, worker: &str) -> Result<(), UploadError> {
+        let state = self.leases.get(&lease).ok_or(UploadError::NoLease)?;
+        if state.worker != worker {
+            return Err(UploadError::NotYours);
+        }
+        let state = self.leases.remove(&lease).expect("just found");
+        if let Some(title) = self.titles.get_mut(&state.title)
+            && title.pieces[state.piece] == PieceState::Leased
+        {
+            title.pieces[state.piece] = PieceState::Pending;
+        }
+        Ok(())
+    }
+
+    /// Checks a worker's result for its lease without accepting it yet:
+    /// the right models, kinds and picture size, every record inside the
+    /// piece on the title's frame grid, and about as many as there are frames.
+    /// Returns the title key and piece.
+    pub fn check(&self, lease: u64, worker: &str, track: &ParsedTrack) -> Result<(String, usize), UploadError> {
+        let state = self.leases.get(&lease).ok_or(UploadError::NoLease)?;
+        if state.worker != worker {
+            return Err(UploadError::NotYours);
+        }
+        let title = &self.titles[&state.title];
+        if let Some(profile) = &title.profile
+            && profile.iter().any(|(k, m)| track.header.models.get(k) != Some(m))
+        {
+            return Err(UploadError::Profile);
+        }
+        if let Some(size) = title.source_size
+            && size != (track.header.source_width, track.header.source_height)
+        {
+            return Err(UploadError::SourceSize);
+        }
+        let frames = title.piece_frames(state.piece);
+        let fps = title.info.frame_rate.fps();
+        let mut counts: BTreeMap<Kind, usize> = BTreeMap::new();
+        for record in &track.records {
+            if !title.workload.kinds.contains(&record.kind) {
+                return Err(UploadError::Kind(record.kind.name()));
+            }
+            let seconds = record.time.seconds();
+            let position = seconds * fps;
+            let index = position.round();
+            if (position - index).abs() > 0.05 || !frames.contains(&(index as i64)) {
+                return Err(UploadError::Time(seconds));
+            }
+            *counts.entry(record.kind).or_default() += 1;
+        }
+        let frames_here = frames.end - frames.start;
+        for kind in &title.workload.kinds {
+            // A flow pair needs the next frame: the title's last frame has none.
+            let expected = if kind.is_pair() && frames.end >= title.frame_count() { frames_here - 1 } else { frames_here };
+            let got = counts.get(kind).copied().unwrap_or(0);
+            // Decoders can drop a frame or two at a cut or a seek point.
+            if (got as i64) < (expected as f64 * 0.9).floor() as i64 - 1 || got as i64 > expected + 1 {
+                return Err(UploadError::Count { kind: kind.name(), got, expected: expected.max(0) });
+            }
+        }
+        Ok((state.title.clone(), state.piece))
+    }
+
+    /// Accepts a checked result: the piece is done (whoever else holds it).
+    pub fn complete(&mut self, lease: u64, source_size: (u32, u32), now: Instant) -> Option<(String, usize)> {
+        let state = self.leases.remove(&lease)?;
+        self.leases.retain(|_, l| !(l.title == state.title && l.piece == state.piece));
+        let title = self.titles.get_mut(&state.title)?;
+        title.pieces[state.piece] = PieceState::Done;
+        title.source_size.get_or_insert(source_size);
+        let stats = self.workers.entry(state.worker).or_default();
+        let took = now.saturating_duration_since(state.granted).as_secs_f64();
+        stats.piece_seconds = Some(stats.piece_seconds.map_or(took, |s| s * 0.7 + took * 0.3));
+        stats.pieces += 1;
+        stats.last_seen = Some(now);
+        Some((state.title, state.piece))
+    }
+
+    pub fn status(&self, key: &str) -> Option<TitleStatus> {
+        let title = self.titles.get(key)?;
+        let done = title.done();
+        let leased = title.pieces.iter().filter(|p| **p == PieceState::Leased).count();
+        let total = title.pieces.len();
+        Some(TitleStatus {
+            state: if done == total {
+                "ready"
+            } else if done + leased > 0 {
+                "running"
+            } else {
+                "queued"
+            },
+            progress: if total == 0 { 1.0 } else { done as f64 / total as f64 },
+            pieces_done: done,
+            pieces_leased: leased,
+            pieces: total,
+            piece_seconds: PIECE_SECONDS,
+            chunk_seconds: CHUNK_SECONDS,
+            chunks: title.chunk_count(),
+            frame_rate: title.info.frame_rate.fps(),
+        })
+    }
+
+    /// Chunk `n`'s done pieces, and whether it is whole.
+    pub fn chunk_pieces(&self, key: &str, n: usize) -> Option<(Vec<usize>, bool)> {
+        let title = self.titles.get(key)?;
+        let range = n * PIECES_PER_CHUNK..((n + 1) * PIECES_PER_CHUNK).min(title.pieces.len());
+        if range.is_empty() {
+            return None;
+        }
+        let done: Vec<usize> = range.clone().filter(|&i| title.pieces[i] == PieceState::Done).collect();
+        let whole = done.len() == range.len();
+        Some((done, whole))
+    }
+
+    /// For the admin view.
+    pub fn snapshot(&self, now: Instant) -> serde_json::Value {
+        serde_json::json!({
+            "titles": self.titles.values().map(|t| serde_json::json!({
+                "key": t.key, "status": self.status(&t.key), "profile": t.profile,
+                "stereo": t.info.stereo, "durationSeconds": t.info.duration_seconds,
+            })).collect::<Vec<_>>(),
+            "leases": self.leases.iter().map(|(id, l)| serde_json::json!({
+                "lease": id, "title": l.title, "piece": l.piece, "worker": l.worker,
+                "secondsLeft": l.until.saturating_duration_since(now).as_secs_f64(),
+            })).collect::<Vec<_>>(),
+            "workers": self.workers.iter().map(|(name, w)| serde_json::json!({
+                "worker": name, "pieces": w.pieces, "pieceSeconds": w.piece_seconds, "remote": w.remote,
+                "idleSeconds": w.last_seen.map(|t| now.saturating_duration_since(t).as_secs_f64()),
+            })).collect::<Vec<_>>(),
+            "playheads": self.playheads.iter().map(|(player, p)| serde_json::json!({
+                "player": player, "title": p.title, "seconds": p.now(now), "rate": p.rate,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::{Rate, StereoLayout};
+    use crate::track::{self, Header, tests::record};
+
+    fn info(seconds: f64) -> MediaInfo {
+        MediaInfo {
+            duration_seconds: seconds,
+            frame_rate: Rate { num: 24, den: 1 },
+            width: 1920,
+            height: 1080,
+            codec: "h264".into(),
+            stereo: StereoLayout::HalfSideBySide,
+            identity: "a".into(),
+            media_source_id: None,
+        }
+    }
+
+    fn models(flow: &str) -> Profile {
+        [("flowPair".to_string(), flow.to_string()), ("disparity".to_string(), "NeuFlow 512x288".to_string())].into()
+    }
+
+    fn claim(worker: &str, remote: bool) -> Claim {
+        Claim { worker: worker.into(), remote, models: models("RIFE 480x288"), workloads: None }
+    }
+
+    fn queue_with(seconds: f64) -> (Queue, String) {
+        let mut q = Queue::new();
+        let source = SourceRef::jellyfin("abc");
+        q.add(source.clone(), &Workload::defaults()[0], info(seconds)).unwrap();
+        (q, Title::key_for(&source, Workload::SMOOTH_MOTION_3D))
+    }
+
+    /// A worker's result for a lease, as `vergence worker` would make it.
+    fn result(lease: &Lease, flow: &str) -> ParsedTrack {
+        let mut data = track::write_header(&Header {
+            media_id: "x".into(),
+            producer: "test".into(),
+            models: models(flow),
+            source_width: 960,
+            source_height: 1080,
+        });
+        for k in lease.first_frame..lease.end_frame {
+            if k + 1 < lease.frame_count {
+                data.extend(record(Kind::FlowPair, 1, k, k + 1, 24, 2, 2));
+            }
+            data.extend(record(Kind::Disparity, 2, k, k, 24, 2, 2));
+        }
+        track::parse(&data).unwrap()
+    }
+
+    #[test]
+    fn rejects_mono_titles_for_3d_work() {
+        let mut q = Queue::new();
+        let mut mono = info(10.0);
+        mono.stereo = StereoLayout::Mono;
+        assert_eq!(q.add(SourceRef::stash("1"), &Workload::defaults()[0], mono), Err(AddError::NotStereo));
+    }
+
+    #[test]
+    fn backfill_goes_in_order() {
+        let (mut q, _) = queue_with(10.0);
+        let now = Instant::now();
+        let pieces: Vec<usize> = (0..5).map(|_| q.claim(&claim("w", false), now).unwrap().piece).collect();
+        assert_eq!(pieces, vec![0, 1, 2, 3, 4]);
+        assert!(q.claim(&claim("w", false), now).is_none());
+    }
+
+    #[test]
+    fn playheads_come_first_and_remote_workers_stay_out_of_the_live_window() {
+        let (mut q, key) = queue_with(600.0);
+        let now = Instant::now();
+        q.report_playhead("vp", &key, 101.0, 1.0, now);
+        let live = q.claim(&claim("mac", false), now).unwrap();
+        assert_eq!((live.piece, live.live), (50, true));
+        let remote = q.claim(&claim("far", true), now).unwrap();
+        assert!(!remote.live);
+        assert!(remote.start_seconds >= 101.0 + LIVE_SECONDS - PIECE_SECONDS, "{}", remote.start_seconds);
+        // After a seek the old playhead's pieces stay leased, the new one's come first.
+        q.report_playhead("vp", &key, 300.0, 1.0, now);
+        assert_eq!(q.claim(&claim("mac", false), now).unwrap().piece, 150);
+    }
+
+    #[test]
+    fn the_playhead_moves_with_time() {
+        let (mut q, key) = queue_with(600.0);
+        let now = Instant::now();
+        q.report_playhead("vp", &key, 0.0, 1.0, now);
+        assert_eq!(q.claim(&claim("mac", false), now + Duration::from_secs(10)).unwrap().piece, 5);
+    }
+
+    #[test]
+    fn a_title_keeps_one_profile() {
+        let (mut q, _) = queue_with(10.0);
+        let now = Instant::now();
+        q.claim(&claim("a", false), now).unwrap();
+        let other = Claim { models: models("RIFE 960x576"), ..claim("b", false) };
+        assert!(q.claim(&other, now).is_none(), "a worker with other models skips the title");
+    }
+
+    #[test]
+    fn expired_leases_go_back() {
+        let (mut q, _) = queue_with(2.0);
+        let now = Instant::now();
+        let lease = q.claim(&claim("a", false), now).unwrap();
+        assert!(q.claim(&claim("b", false), now).is_none());
+        let later = now + Duration::from_secs_f64(lease.lease_seconds + 1.0);
+        assert_eq!(q.claim(&claim("b", false), later).unwrap().piece, 0);
+    }
+
+    #[test]
+    fn checks_uploads() {
+        let (mut q, key) = queue_with(5.0);
+        let now = Instant::now();
+        let lease = q.claim(&claim("a", false), now).unwrap();
+        assert_eq!((lease.first_frame, lease.end_frame), (0, 48));
+        assert_eq!(q.check(lease.lease, "b", &result(&lease, "RIFE 480x288")), Err(UploadError::NotYours));
+        assert_eq!(q.check(lease.lease, "a", &result(&lease, "RIFE 960x576")), Err(UploadError::Profile));
+        let good = result(&lease, "RIFE 480x288");
+        assert_eq!(q.check(lease.lease, "a", &good), Ok((key.clone(), 0)));
+        q.complete(lease.lease, (960, 1080), now);
+        assert_eq!(q.status(&key).unwrap().pieces_done, 1);
+        assert_eq!(q.chunk_pieces(&key, 0), Some((vec![0], false)));
+
+        // A transcode whose timestamps restarted at zero is caught by the frame grid.
+        let second = q.claim(&claim("a", false), now).unwrap();
+        assert_eq!(second.piece, 1);
+        let mut shifted = second.clone();
+        shifted.first_frame = 0;
+        shifted.end_frame = 48;
+        assert!(matches!(q.check(second.lease, "a", &result(&shifted, "RIFE 480x288")), Err(UploadError::Time(_))));
+        // The last piece has one flow pair fewer than frames.
+        let last = q.claim(&claim("a", false), now).unwrap();
+        assert_eq!((last.piece, last.end_frame, last.frame_count), (2, 120, 120));
+        assert!(q.check(last.lease, "a", &result(&last, "RIFE 480x288")).is_ok());
+    }
+
+    #[test]
+    fn a_replaced_file_resets_the_title() {
+        let (mut q, key) = queue_with(4.0);
+        let now = Instant::now();
+        let lease = q.claim(&claim("a", false), now).unwrap();
+        q.complete(lease.lease, (960, 1080), now);
+        let mut replaced = info(4.0);
+        replaced.identity = "b".into();
+        assert_eq!(q.add(SourceRef::jellyfin("abc"), &Workload::defaults()[0], replaced), Ok(AddOutcome::Reset));
+        assert_eq!(q.status(&key).unwrap().pieces_done, 0);
+        assert!(q.title(&key).unwrap().profile.is_none());
+    }
+}
