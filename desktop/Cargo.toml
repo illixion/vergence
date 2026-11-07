@@ -34,6 +34,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(windows)'.dependencies]
 # Windows has no system OpenSSL: build it in (statically) for the paired channel's TLS-PSK.
 vergence-companion = { path = "../companion", features = ["vendored-openssl"] }
+# DnsServiceRegister: announcing pairing through Windows' own mDNS responder.
+windows-sys = { version = "0.61", features = ["Win32_NetworkManagement_Dns"] }
 
 [target.'cfg(unix)'.dependencies]
 # openpty, so `vergence convert` sees a terminal and prints its progress; renamex_np for updates.

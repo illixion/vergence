@@ -65,6 +65,10 @@ Both are looked for in Settings (the file, or the folder holding it), `VERGENCE_
 the app, then `PATH`. Build them on Windows (they need ONNX Runtime's Windows binaries) and pack
 them with `--tools`.
 
+While pairing is open the app announces `_vergence-pair._tcp` through Windows' own mDNS responder
+(`DnsServiceRegister`, Windows 10 1809 and later; nothing to install), as it does through
+`dns-sd` on a Mac, so a Quest finds it without typing an address.
+
 Windows Defender Firewall asks on first start whether Vergence may use the network: private
 networks are enough for headsets to pair (4869) and reach the paired channel (8421).
 
@@ -117,7 +121,8 @@ signed names, so an old release can't be relabelled as new.
 
 ## Not done yet
 
-- **Bonjour**: devices pair from the address link the Headsets tab shows.
+- **Bonjour** is only the pairing announcement (macOS, Linux, Windows); the coordinator's own ports
+  aren't announced, so a paired device remembers the address it paired over.
 - **Windows:** no installer that writes Start menu entries or registers "Open with" (the zip is
   unpacked anywhere, as Apparition's is), no code signing (SmartScreen warns once), and the
   firewall asks on first start; the tray and a conversion haven't been tried there yet.
