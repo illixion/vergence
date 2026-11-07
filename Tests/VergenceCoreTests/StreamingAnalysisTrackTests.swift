@@ -103,6 +103,51 @@ struct StreamingAnalysisTrackTests {
     /// A real server's chunks (`VERGENCE_TEST_CHUNKS`: a folder of 0.vgat,
     /// 1.vgat, … as `GET SmoothMotion/{id}/Chunks/{n}` served them, plus
     /// track.vgat from `/Track`) give every pair the whole track gives.
+    /// A coordinator serves a chunk with only some pieces done: its records
+    /// are used at once, it isn't taken for whole, and it is fetched again
+    /// until it is.
+    @Test func aPartialChunkIsUsedAndFetchedAgainUntilWhole() async throws {
+        let whole = try Self.chunks(frames: 48, seconds: 1)
+        // The first half second of chunk 0's records, as a partial chunk.
+        let header = try AnalysisTrack.header(AnalysisTrackHeader(mediaID: "t", producer: "test", models: [:],
+                                                                  sourceWidth: 1920, sourceHeight: 1080))
+        let index0 = try AnalysisTrackIndex(whole[0])
+        var firstHalf = header
+        for entry in index0.entries where entry.time.seconds < 0.5 {
+            firstHalf.append(AnalysisTrack.record(try index0.record(entry)))
+        }
+        final class Flags: @unchecked Sendable {
+            private let lock = NSLock()
+            private var _done = false, _count = 0
+            func finish() { lock.lock(); _done = true; lock.unlock() }
+            var done: Bool { lock.lock(); defer { lock.unlock() }; return _done }
+            func count() { lock.lock(); _count += 1; lock.unlock() }
+            var counted: Int { lock.lock(); defer { lock.unlock() }; return _count }
+        }
+        let pieces = Flags(), demand = Flags()
+        let partialData = firstHalf
+        let track = StreamingAnalysisTrack(chunkSeconds: 1, chunkCount: whole.count, lookAhead: 0, retrySeconds: 0.05,
+                                           partialRefetchSeconds: 0.05, onDemand: { _ in demand.count() }) { n in
+            n == 0 && !pieces.done ? StreamingAnalysisChunk(data: partialData, isComplete: false)
+                : StreamingAnalysisChunk(data: whole[n])
+        }
+        let provider = Self.provider(track)
+        track.prefetch(at: 0)
+        for _ in 0 ..< 200 where track.heldChunks.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
+        #expect(track.partialChunks == [0])
+        #expect(!track.holdsRecords(at: 0.1))
+        #expect(provider.fields(from: 0, to: 1 / Self.rate) != nil, "a partial chunk's records are used")
+        #expect(provider.fields(from: 20 / Self.rate, to: 21 / Self.rate) == nil, "its missing piece isn't there yet")
+        pieces.finish()
+        for _ in 0 ..< 200 where !track.partialChunks.isEmpty {
+            track.noteDemand(at: 0.1)
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(track.partialChunks.isEmpty && track.holdsRecords(at: 0.1))
+        #expect(provider.fields(from: 20 / Self.rate, to: 21 / Self.rate) != nil)
+        #expect(demand.counted > 0, "the caller hears where the player is")
+    }
+
     @Test(.enabled(if: ProcessInfo.processInfo.environment["VERGENCE_TEST_CHUNKS"] != nil))
     func aServersChunksGiveTheWholeTracksFields() async throws {
         let folder = URL(fileURLWithPath: try #require(ProcessInfo.processInfo.environment["VERGENCE_TEST_CHUNKS"]))
