@@ -1,6 +1,6 @@
 # vergence-desktop
 
-The Vergence desktop app (Tauri 2, binary `vergence-app`), Mac first, then Windows. One tray
+The Vergence desktop app (Tauri 2, binary `vergence-app`) for Mac and Windows. One tray
 (menu-bar) app that:
 
 - **runs the analysis coordinator** in-process: the same `vergence-coordinator` axum server
@@ -36,6 +36,37 @@ The `vergence` executable is looked for in Settings, `VERGENCE_CLI`, beside the 
 
 `VERGENCE_APP_DATA=DIR` moves the app's data (for a second copy, or a test run). In a debug build
 `VERGENCE_APP_CONVERT=a.mp4:b.mkv` queues files to convert at launch.
+
+## Windows
+
+The same app, cross-compiled from a Mac and packed the way Apparition packs its Windows
+installer: one zip, `Vergence-<version>-windows-x86_64.zip` (the name the updater looks for).
+
+```sh
+brew install mingw-w64 && rustup target add x86_64-pc-windows-gnu    # once
+desktop/scripts/package-windows.sh                                    # -> target/package/
+desktop/scripts/package-windows.sh --tools DIR    # also packs every .exe and .dll in DIR
+```
+
+It holds `Vergence.exe`, `WebView2Loader.dll` (keep it beside the app) and a README. OpenSSL is
+built into the executable (`vendored-openssl` on Windows), since Windows has none to link. Unpack
+it anywhere and open `Vergence.exe`; the window is Microsoft Edge WebView2, which Windows 10 and
+11 have.
+
+On Windows the app runs the Rust tools instead of the Swift command line, with the same config
+file and flags (`src/sidecar.rs`, `find_tool`):
+
+- the worker is `vergence-worker.exe --config FILE` (ONNX Runtime, `worker/`);
+- conversion is `vergence-convert.exe <file> --layout … ` (`convert/`), given
+  `VERGENCE_PROGRESS=1` because its stderr is a pipe, not a terminal, there.
+
+Both are looked for in Settings (the file, or the folder holding it), `VERGENCE_WORKER` /
+`VERGENCE_CONVERT`, beside `Vergence.exe`, then this checkout's `target/release/`; ffmpeg beside
+the app, then `PATH`. Build them on Windows (they need ONNX Runtime's Windows binaries) and pack
+them with `--tools`.
+
+Windows Defender Firewall asks on first start whether Vergence may use the network: private
+networks are enough for headsets to pair (4869) and reach the paired channel (8421).
 
 ## Tests
 
@@ -87,8 +118,9 @@ signed names, so an old release can't be relabelled as new.
 ## Not done yet
 
 - **Bonjour**: devices pair from the address link the Headsets tab shows.
-- **Windows:** the worker and conversion arrive with the ONNX Runtime engine; the app shows so.
-  The `cfg`s are in place, but no Windows build has been made.
+- **Windows:** no installer that writes Start menu entries or registers "Open with" (the zip is
+  unpacked anywhere, as Apparition's is), no code signing (SmartScreen warns once), and the
+  firewall asks on first start; the tray and a conversion haven't been tried there yet.
 - **Updates:** there is no release site yet (`updater::SITE` is `None`), so checking is off by
   default, and the Windows install step isn't ported. The signing keys are pinned (below).
 - **Titles by name** in the queue (it shows server and id), a preview frame before converting,

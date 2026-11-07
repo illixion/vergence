@@ -1,6 +1,7 @@
-//! The worker sidecar (Mac): `vergence worker --config FILE`, run as a child process against
-//! this app's own coordinator, with a `work` token the app mints for it. Its config holds paths
-//! only (the token's file, the servers' key files), never a secret.
+//! The worker sidecar: `vergence worker --config FILE` on a Mac (Core ML), `vergence-worker.exe
+//! --config FILE` on Windows (ONNX Runtime; the same config format), run as a child process
+//! against this app's own coordinator, with a `work` token the app mints for it. Its config holds
+//! paths only (the token's file, the servers' key files), never a secret.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,10 @@ use vergence_coordinator::auth::Grant;
 
 use crate::coordinator::CoordinatorHost;
 use crate::settings::{Paths, Server, Settings, has_secret, write_atomic};
-use crate::sidecar;
+use crate::sidecar::{self, ToolKind};
+
+/// Whether this platform has a worker to run (Core ML on a Mac, ONNX Runtime on Windows).
+pub const AVAILABLE: bool = cfg!(any(target_os = "macos", windows));
 
 /// Lines of the worker's output kept for the window.
 const LOG_LINES: usize = 400;
@@ -110,13 +114,13 @@ impl WorkerHost {
     }
 
     pub fn start(self: &Arc<Self>, settings: &Settings) -> Result<(), String> {
-        if !cfg!(target_os = "macos") {
-            return Err("This computer's worker arrives with the ONNX Runtime engine; the Core ML one runs on a Mac.".into());
+        if !AVAILABLE {
+            return Err("This computer's worker runs on a Mac or Windows for now.".into());
         }
         if self.is_running() {
             return Ok(());
         }
-        let cli = sidecar::find_cli(settings).ok_or("No vergence command line found: build it (swift build -c release) or set its path in Settings.")?;
+        let tool = sidecar::find_tool(settings, ToolKind::Worker).ok_or(sidecar::missing_tool(ToolKind::Worker))?;
         if self.coordinator.state().is_none() {
             return Err("The coordinator isn't running.".into());
         }
@@ -124,7 +128,8 @@ impl WorkerHost {
         let token = self.coordinator.add_token(TOKEN_NAME, vec![Grant::Work]).map_err(|e| format!("Couldn't make the worker's token: {e}"))?;
         write_atomic(&token_path(&self.paths), token.as_bytes(), true).map_err(|e| e.to_string())?;
         let config_path = config.write(&self.paths).map_err(|e| e.to_string())?;
-        let mut child = sidecar::spawn(&cli, &["worker".into(), "--config".into(), config_path.into()], false)
+        let cli = tool.program.clone();
+        let mut child = sidecar::spawn(&cli, &tool.arguments(["--config".into(), config_path.into()]), false)
             .map_err(|e| format!("Couldn't start {}: {e}", cli.display()))?;
         self.push_log(format!("started {} (pid {})", cli.display(), child.pid.unwrap_or(0)));
         *self.last_exit.lock().unwrap() = None;
@@ -178,10 +183,10 @@ impl WorkerHost {
     pub fn status(&self, settings: &Settings) -> Value {
         let running = self.running.lock().unwrap();
         json!({
-            "available": cfg!(target_os = "macos"),
+            "available": AVAILABLE,
             "running": running.is_some(),
             "pid": running.as_ref().and_then(|r| r.pid),
-            "cli": sidecar::find_cli(settings).map(|p| p.to_string_lossy().into_owned()),
+            "cli": sidecar::find_tool(settings, ToolKind::Worker).map(|t| t.program.to_string_lossy().into_owned()),
             "modelsFolder": settings.models_folder,
             "lastExit": *self.last_exit.lock().unwrap(),
             "log": self.log.lock().unwrap().iter().collect::<Vec<_>>(),

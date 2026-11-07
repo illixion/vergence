@@ -3,7 +3,8 @@
 //! `convert-queue.json`, so it carries on after a quit; `vergence convert` itself picks up from
 //! the depth it had finished (its hidden work folder beside the output).
 //!
-//! Mac only for now: on Windows the same stages arrive with the ONNX Runtime engine.
+//! On a Mac it runs `vergence convert` (Core ML, Metal); on Windows `vergence-convert.exe` (ONNX
+//! Runtime, wgpu, ffmpeg), which takes the same flags and prints the same progress lines.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -16,10 +17,10 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 
 use crate::settings::{Settings, write_atomic};
-use crate::sidecar;
+use crate::sidecar::{self, ToolKind};
 
-pub const AVAILABLE: bool = cfg!(target_os = "macos");
-pub const UNAVAILABLE_REASON: &str = "Converting arrives on Windows with the ONNX Runtime engine; for now it needs a Mac.";
+pub const AVAILABLE: bool = cfg!(any(target_os = "macos", windows));
+pub const UNAVAILABLE_REASON: &str = "Converting needs a Mac or Windows for now.";
 /// What `--sample` renders, for a quick look before the whole file.
 pub const SAMPLE_SECONDS: u32 = 10;
 
@@ -116,9 +117,9 @@ pub struct ConvertJob {
 }
 
 impl ConvertJob {
-    /// `vergence convert`'s arguments for this job.
+    /// The converter's arguments for this job (after `convert`, on a Mac).
     pub fn arguments(&self, model: Option<&str>) -> Vec<OsString> {
-        let mut args: Vec<OsString> = vec!["convert".into(), self.input.clone().into(), "--layout".into(), self.options.layout.option().into()];
+        let mut args: Vec<OsString> = vec![self.input.clone().into(), "--layout".into(), self.options.layout.option().into()];
         if let Some(s) = self.options.strength {
             args.extend(["--strength".into(), format!("{s}").into()]);
         }
@@ -487,7 +488,7 @@ impl ConvertQueue {
         json!({
             "available": AVAILABLE,
             "unavailableReason": (!AVAILABLE).then_some(UNAVAILABLE_REASON),
-            "cli": sidecar::find_cli(&settings).map(|p| p.to_string_lossy().into_owned()),
+            "cli": sidecar::find_tool(&settings, ToolKind::Convert).map(|t| t.program.to_string_lossy().into_owned()),
             "defaults": file.defaults,
             "outputDir": file.output_dir,
             "sampleSeconds": SAMPLE_SECONDS,
@@ -562,11 +563,12 @@ impl ConvertQueue {
             self.save();
             self.changed();
         };
-        let Some(cli) = sidecar::find_cli(&settings) else {
-            finish(JobState::Failed, "No vergence command line found: build it (swift build -c release) or set its path in Settings.".into());
+        let Some(tool) = sidecar::find_tool(&settings, ToolKind::Convert) else {
+            finish(JobState::Failed, sidecar::missing_tool(ToolKind::Convert).into());
             return;
         };
-        let args = job.arguments(settings.depth_model.as_deref());
+        let cli = tool.program.clone();
+        let args = tool.arguments(job.arguments(settings.depth_model.as_deref()));
         tracing::info!(id = job.id, "converting");
         let mut child = match sidecar::spawn(&cli, &args, true) {
             Ok(child) => child,
@@ -664,14 +666,14 @@ mod tests {
     fn builds_the_command_line() {
         assert_eq!(
             strings(job(ConvertOptions::default()).arguments(None)),
-            ["convert", "/films/Film.mkv", "--layout", "fsbs", "--download-model"]
+            ["/films/Film.mkv", "--layout", "fsbs", "--download-model"]
         );
         let mut j = job(ConvertOptions { layout: Layout::Spatial, strength: Some(0.012), convergence: Some(0.5), sample: true, force: true });
         j.output_dir = Some(PathBuf::from("/out/3D"));
         assert_eq!(
             strings(j.arguments(Some("/models/depth.mlpackage"))),
             [
-                "convert", "/films/Film.mkv", "--layout", "spatial", "--strength", "0.012", "--convergence", "0.5", "--sample", "10",
+                "/films/Film.mkv", "--layout", "spatial", "--strength", "0.012", "--convergence", "0.5", "--sample", "10",
                 "--output", "/out/3D/", "--model", "/models/depth.mlpackage", "--force",
             ]
         );

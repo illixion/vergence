@@ -146,10 +146,10 @@ async function refreshWorker() {
   $("worker-start").disabled = w.running || !w.available;
   $("worker-stop").disabled = !w.running;
   const parts = [];
-  if (!w.available) parts.push("The worker on this platform arrives with the ONNX Runtime engine.");
+  if (!w.available) parts.push("This computer's worker runs on a Mac or Windows for now.");
   else {
     parts.push(w.running ? `Running (pid ${w.pid}).` : "Stopped.");
-    parts.push(w.cli ? `vergence: ${w.cli}` : "No vergence command line found.");
+    parts.push(w.cli ? `Runs ${w.cli}` : "The worker program wasn't found: give its path in Settings.");
     parts.push(w.modelsFolder ? `Models: ${w.modelsFolder}` : "Choose the models folder in Settings.");
     if (w.lastExit && !w.running) parts.push(w.lastExit);
   }
@@ -226,7 +226,7 @@ async function refreshConvert() {
   }
   $("sample-seconds").textContent = c.sampleSeconds;
   $("out-dir").textContent = c.outputDir || "Beside the original";
-  $("cli-line").textContent = c.available ? (c.cli ? `Runs ${c.cli}` : "No vergence command line found: build it with swift build -c release, or set its path in Settings.") : "";
+  $("cli-line").textContent = c.available ? (c.cli ? `Runs ${c.cli}` : "The converter wasn't found: give its path in Settings.") : "";
   const jobs = [...c.jobs].reverse();
   $("jobs").innerHTML = jobs.map((j) => {
     const o = j.options;

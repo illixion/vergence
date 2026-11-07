@@ -1,12 +1,21 @@
 //! Running the `vergence` command line as a child process: finding it (and ffmpeg), reading its
 //! output line by line, and stopping it, only ever by that child's own PID.
 //!
+//! Which program does what ([`find_tool`]):
+//! - **Mac:** `vergence worker` (Core ML) and `vergence convert`, both the Swift command line.
+//! - **Windows:** `vergence-worker.exe` (ONNX Runtime, `worker/`) and `vergence-convert.exe`
+//!   (ONNX Runtime depth, a wgpu warp, ffmpeg; `convert/`), which take the same config file and
+//!   the same flags as the Mac's, with no subcommand word. They are looked for in Settings (the
+//!   file, or the folder holding it), `VERGENCE_WORKER` / `VERGENCE_CONVERT`, beside the app, then
+//!   this checkout's `target/release/`.
+//!
 //! `vergence convert` prints its progress (`\r  depth  42%`) only when stderr is a terminal, so
 //! a conversion's stderr is a pseudo-terminal on Unix, read here like any other output.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+#[cfg(unix)]
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -47,12 +56,87 @@ pub fn find_cli(settings: &Settings) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file()).map(|p| p.canonicalize().unwrap_or(p))
 }
 
+/// What the app runs a tool as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolKind {
+    Worker,
+    Convert,
+}
+
+/// A tool to run: the program, and the words before its own arguments (`worker`, `convert` on
+/// a Mac; none for the Windows executables).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tool {
+    pub program: PathBuf,
+    pub prefix: Vec<OsString>,
+}
+
+impl Tool {
+    /// The full argument list for `args`.
+    pub fn arguments(&self, args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+        self.prefix.iter().cloned().chain(args).collect()
+    }
+}
+
+/// The program that runs `kind` on this platform (see the module docs), or None when it isn't
+/// there.
+pub fn find_tool(settings: &Settings, kind: ToolKind) -> Option<Tool> {
+    if cfg!(windows) {
+        let (name, var) = match kind {
+            ToolKind::Worker => ("vergence-worker.exe", "VERGENCE_WORKER"),
+            ToolKind::Convert => ("vergence-convert.exe", "VERGENCE_CONVERT"),
+        };
+        find_executable(settings, name, var).map(|program| Tool { program, prefix: Vec::new() })
+    } else {
+        let word = match kind {
+            ToolKind::Worker => "worker",
+            ToolKind::Convert => "convert",
+        };
+        find_cli(settings).map(|program| Tool { program, prefix: vec![word.into()] })
+    }
+}
+
+/// What to tell the person when a tool isn't found.
+pub fn missing_tool(kind: ToolKind) -> &'static str {
+    match (cfg!(windows), kind) {
+        (true, ToolKind::Worker) => "vergence-worker.exe wasn't found: put it beside the app, or give its folder in Settings.",
+        (true, ToolKind::Convert) => "vergence-convert.exe wasn't found: put it beside the app, or give its folder in Settings.",
+        (false, _) => "No vergence command line found: build it (swift build -c release) or set its path in Settings.",
+    }
+}
+
+/// A Windows tool by name: the Settings path (a file, or the folder holding it), its
+/// environment variable, beside the app, then this checkout's Rust release build.
+fn find_executable(settings: &Settings, name: &str, var: &str) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = &settings.vergence_cli {
+        let path = expand_tilde(path);
+        if path.is_dir() {
+            candidates.push(path.join(name));
+        } else if path.file_name().is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+            candidates.push(path.clone());
+        } else if let Some(dir) = path.parent() {
+            candidates.push(dir.join(name));
+        }
+    }
+    if let Some(path) = std::env::var_os(var) {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
+        candidates.push(dir.join(name));
+    }
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/release").join(name));
+    candidates.into_iter().find(|p| p.is_file())
+}
+
 pub fn find_ffmpeg() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("VERGENCE_FFMPEG").map(PathBuf::from).filter(|p| p.is_file()) {
         return Some(path);
     }
     let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    search_path().into_iter().map(|dir| dir.join(name)).find(|p| p.is_file())
+    // One shipped beside the app (Windows has no Homebrew), then PATH.
+    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join(name)));
+    beside.into_iter().chain(search_path().into_iter().map(|dir| dir.join(name))).find(|p| p.is_file())
 }
 
 fn search_path() -> Vec<PathBuf> {
@@ -160,7 +244,11 @@ pub fn spawn(program: &Path, args: &[OsString], tty: bool) -> std::io::Result<Si
     };
     #[cfg(not(unix))]
     {
-        let _ = tty;
+        // No terminal to give it here: a tool that prints progress only to a terminal is asked
+        // for it anyway.
+        if tty {
+            command.env("VERGENCE_PROGRESS", "1");
+        }
         command.stderr(Stdio::piped());
     }
     let mut child = command.spawn()?;
@@ -264,6 +352,27 @@ fn open_pty() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tools_run_as_the_platform_has_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) { "vergence-worker.exe" } else { "vergence" };
+        std::fs::write(dir.path().join(name), b"").unwrap();
+        let settings = Settings { vergence_cli: Some(dir.path().join(name).to_string_lossy().into_owned()), ..Settings::default() };
+        let tool = find_tool(&settings, ToolKind::Worker).unwrap();
+        let args = tool.arguments(["--config".into(), "w.json".into()]);
+        if cfg!(windows) {
+            assert!(tool.program.ends_with("vergence-worker.exe"));
+            assert_eq!(args, ["--config", "w.json"]);
+            // The folder works too.
+            let folder = Settings { vergence_cli: Some(dir.path().to_string_lossy().into_owned()), ..Settings::default() };
+            assert!(find_tool(&folder, ToolKind::Worker).is_some());
+        } else {
+            assert_eq!(args, ["worker", "--config", "w.json"]);
+            let convert = find_tool(&settings, ToolKind::Convert).unwrap();
+            assert_eq!(convert.prefix, ["convert"]);
+        }
+    }
 
     #[test]
     fn splits_at_returns_and_newlines() {

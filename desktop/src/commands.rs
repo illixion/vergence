@@ -70,7 +70,7 @@ impl App {
             "settings": settings,
             "jellyfinKey": key_hint(&self.paths, Server::Jellyfin),
             "stashKey": key_hint(&self.paths, Server::Stash),
-            "cli": sidecar::find_cli(&settings).map(|p| p.to_string_lossy().into_owned()),
+            "cli": sidecar::find_tool(&settings, sidecar::ToolKind::Convert).map(|t| t.program.to_string_lossy().into_owned()),
             "ffmpeg": sidecar::find_ffmpeg().map(|p| p.to_string_lossy().into_owned()),
             "launchAtLogin": app.autolaunch().is_enabled().unwrap_or(false),
             "dataDir": self.paths.root,
