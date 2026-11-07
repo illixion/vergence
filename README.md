@@ -325,6 +325,36 @@ ONNX Runtime. `--upscale-model PATH` (or `VERGENCE_UPSCALE_MODEL`) takes another
   without it. The bitrate is worked out for the bigger picture; `--quality high` keeps more of the
   new detail.
 
+**Old SD sources: `--antialias` and `--ai-hdr`.**
+
+```sh
+vergence convert "Film sbs.mkv" --upscale 2x --antialias --ai-hdr --gain-model ~/Models/GainMapGMNet.mlpackage
+```
+
+- `--antialias` (both converters) smooths stair-stepped edges before anything else sees the picture.
+  A 2003 SD CG film after NTSC deinterlacing has diagonals in steps a line tall, which an upscaler
+  sharpens into crisp ragged edges. ffmpeg re-makes each field's missing lines by edge-slope
+  tracing (`estdif`: in every ffmpeg build, LGPL, no weights), averages both fields' versions (old
+  AviSynth scripts' "daa") and uses that only along edges (a blurred Sobel mask), so texture away
+  from edges keeps its detail. On that film's bed edge, after upscaling, a measured edge raggedness
+  (fine-scale gradient direction against the edge's own, on strong coherent edges) went from 0.0655
+  to 0.0564, with 7 % less fine detail elsewhere; NNEDI3 in the same arrangement (GPL weights) gave
+  0.0612, and in both directions 0.0592, losing more detail. The Mac writes the antialiased part to
+  a ProRes intermediate in the work folder (about 75 frames a second for 720×400 pairs); the PC
+  decodes through the same filter graph.
+- `--ai-hdr` (Mac for now) makes an SDR source HDR the way the `ai-hdr` workload and the players
+  do: the worker's own producer makes GMNet's gain grids (keyframes every half second and at cuts,
+  eased within shots, the 16×9×8 grid), from the left eye of a 3D source, and `GainGridPass`, the
+  players' shader, applies them, holding the frame's average gain to 2.5×. The output is 10-bit
+  HEVC in BT.2020 PQ with SDR white at 203 nits, HDR10 mastering display (P3 D65, 1,000 nits) and
+  light levels (MaxCLL 1,015, MaxFALL 507), both eyes with one grid and one scale, named
+  `VIDEO.hdr.3D.FSBS.mp4`. GMNet is Convolution's Core ML conversion, a worker's `gainModel`:
+  `--gain-model PATH` or `VERGENCE_GAIN_MODEL`. The grids take a pass of their own (about 35 frames
+  a second); applying them costs the picture pass nothing measurable. A 10-minute piece of the 3D
+  film with `--upscale 2x --antialias --ai-hdr` took 40.6 minutes on the M2 Max: the antialiased
+  intermediate 4.3 min (73 fps), the grids 9.2 min (34 fps), the upscaled HDR picture 26 min (9.6 fps,
+  as fast as without HDR).
+
 **Repeated frames.** Every `convert` now checks whether a video repeats one frame in five: film made
 30 fps by doubling a frame in four and then retimed, often to an odd rate after a remux (a 3D film
 read as 31.24 fps: NTSC's 29.97 sped up 25/23.976 to fit PAL audio). Those repeats judder in a headset
