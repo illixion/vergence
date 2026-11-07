@@ -107,8 +107,8 @@ pub struct DepthModel {
 impl DepthModel {
     pub fn load(path: &Path, provider: Provider) -> Result<DepthModel, String> {
         let env = ort::init().with_name("vergence-convert").build().map_err(|e| e.to_string())?;
+        // What TensorRT and Core ML compile, kept between runs (only they make it).
         let cache = std::env::temp_dir().join("vergence-convert-model-cache");
-        let _ = std::fs::create_dir_all(&cache);
         let mut errors = Vec::new();
         for candidate in provider.candidates() {
             let built = (|| -> Result<Session, String> {
@@ -119,6 +119,9 @@ impl DepthModel {
                     .map_err(fail)?;
                 if candidate == Provider::DirectMl {
                     builder = builder.with_memory_pattern(false).map_err(fail)?.with_parallel_execution(false).map_err(fail)?;
+                }
+                if matches!(candidate, Provider::TensorRt | Provider::CoreMl) {
+                    let _ = std::fs::create_dir_all(&cache);
                 }
                 if let Some(ep) = dispatch(candidate, &cache)? {
                     builder = builder.with_execution_providers([ep]).map_err(fail)?;
