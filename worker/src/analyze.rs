@@ -91,9 +91,9 @@ pub fn run(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Vec<
         let _ = stderr.read_to_string(&mut text);
         text
     });
-    let mut output = child.stdout.take().expect("piped");
-    let result = frames(piece, engine, stop, &mut output, (w, h, side_by_side), (eye_w, eye_h));
-    drop(output);
+    let output = child.stdout.take().expect("piped");
+    let result = frames(piece, engine, stop, output, (w, h, side_by_side), (eye_w, eye_h));
+    // Also ends the reading thread, if it is still waiting for a frame.
     let _ = child.kill();
     let status = child.wait().ok();
     let message = errors.join().unwrap_or_default();
@@ -106,51 +106,98 @@ pub fn run(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Vec<
     Ok(track)
 }
 
-fn frames(piece: &Piece, engine: &mut Engine, stop: &AtomicBool, output: &mut impl Read,
+/// One frame's model inputs: the left eye at RIFE's size, and both eyes at
+/// NeuFlow's for frames inside the piece.
+struct Inputs {
+    index: i64,
+    left_flow: Vec<f32>,
+    disparity: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+/// A model's output on its way to the track.
+enum Output {
+    Flow { flow: Vec<f32>, mask: Vec<f32>, from: Time, to: Time },
+    Disparity { field: Vec<f32>, at: Time },
+}
+
+/// Decoding and resizing (one thread), the models (this one) and packing the
+/// records (another) overlap: on a fast GPU the first and last took longer
+/// than the models.
+fn frames(piece: &Piece, engine: &mut Engine, stop: &AtomicBool, mut output: impl Read + Send + 'static,
           (w, h, side_by_side): (usize, usize, bool), (eye_w, eye_h): (usize, usize)) -> Result<(Vec<u8>, i64), Failure> {
     let lease = piece.lease;
     let rate = lease.info.frame_rate;
-    let mut track = track_header(&lease.title, piece.producer, piece.models, eye_w as u32, eye_h as u32);
     let (fw, fh) = FLOW_SIZE;
     let (dw, dh) = DISPARITY_SIZE;
-    let frame_bytes = w * h * 3 / 2;
-    let mut frame = vec![0u8; frame_bytes];
-    let mut previous: Option<(Vec<f32>, Time)> = None;
-    let mut index = lease.first_frame;
-    let end = lease.first_frame + frames_wanted(lease);
-    while index < end {
-        if stop.load(Ordering::Relaxed) {
-            return Err(Failure::Yielded("asked to stop".into()));
-        }
-        if output.read_exact(&mut frame).is_err() {
-            break;
-        }
-        let time = Time { value: index * rate.den, timescale: rate.num as i32 };
-        let in_piece = index < lease.end_frame;
-        let (left, right) = eyes(&frame, w, h, side_by_side);
-        let left_flow = rgb_planar(left[0], left[1], left[2], fw, fh, 1.0);
-        let Engine { flow, disparity, .. } = engine;
-        // The two models run at once, as the Swift worker runs them.
-        let (flow_out, disparity_out) = std::thread::scope(|scope| {
-            let flow_job = previous.as_ref().map(|(prev, _)| scope.spawn(|| flow.run(prev, &left_flow)));
-            let disparity_out = in_piece.then(|| {
-                let l = rgb_planar(left[0], left[1], left[2], dw, dh, 1.0);
-                let r = rgb_planar(right[0], right[1], right[2], dw, dh, 1.0);
-                disparity.run(&l, &r)
+    let (first, end, piece_end) = (lease.first_frame, lease.first_frame + frames_wanted(lease), lease.end_frame);
+
+    // Not scoped: on a stop it may be blocked reading; killing ffmpeg ends it.
+    let (inputs_tx, inputs) = std::sync::mpsc::sync_channel::<Inputs>(3);
+    std::thread::spawn(move || {
+        let mut frame = vec![0u8; w * h * 3 / 2];
+        for index in first..end {
+            if output.read_exact(&mut frame).is_err() {
+                break;
+            }
+            let (left, right) = eyes(&frame, w, h, side_by_side);
+            let left_flow = rgb_planar(left[0], left[1], left[2], fw, fh, 1.0);
+            let disparity = (index < piece_end).then(|| {
+                (rgb_planar(left[0], left[1], left[2], dw, dh, 1.0), rgb_planar(right[0], right[1], right[2], dw, dh, 1.0))
             });
-            (flow_job.map(|j| j.join().expect("the flow model panicked")), disparity_out)
-        });
-        if let (Some((_, prev_time)), Some(result)) = (&previous, flow_out) {
-            let (f, m) = result?;
-            track.extend(flow_pair_record(&f, &m, fw, fh, *prev_time, time).deflated().framed());
+            if inputs_tx.send(Inputs { index, left_flow, disparity }).is_err() {
+                break;
+            }
         }
-        if let Some(result) = disparity_out {
-            track.extend(disparity_record(&result?, dw, dh, time).deflated().framed());
+    });
+
+    let header = track_header(&lease.title, piece.producer, piece.models, eye_w as u32, eye_h as u32);
+    let (outputs_tx, outputs) = std::sync::mpsc::sync_channel::<Output>(6);
+    let packer = std::thread::spawn(move || {
+        let mut track = header;
+        for output in outputs {
+            match output {
+                Output::Flow { flow, mask, from, to } => {
+                    track.extend(flow_pair_record(&flow, &mask, fw, fh, from, to).deflated().framed())
+                }
+                Output::Disparity { field, at } => track.extend(disparity_record(&field, dw, dh, at).deflated().framed()),
+            }
         }
-        previous = Some((left_flow, time));
-        index += 1;
-    }
-    Ok((track, index - lease.first_frame))
+        track
+    });
+
+    let mut previous: Option<(Vec<f32>, Time)> = None;
+    let mut decoded = 0i64;
+    let result = (|| -> Result<(), Failure> {
+        for Inputs { index, left_flow, disparity: pair } in inputs.iter() {
+            if stop.load(Ordering::Relaxed) {
+                return Err(Failure::Yielded("asked to stop".into()));
+            }
+            let time = Time { value: index * rate.den, timescale: rate.num as i32 };
+            let Engine { flow, disparity, .. } = &mut *engine;
+            // The two models run at once, as the Swift worker runs them.
+            let (flow_out, disparity_out) = std::thread::scope(|scope| {
+                let flow_job = previous.as_ref().map(|(prev, _)| scope.spawn(|| flow.run(prev, &left_flow)));
+                let disparity_out = pair.as_ref().map(|(l, r)| disparity.run(l, r));
+                (flow_job.map(|j| j.join().expect("the flow model panicked")), disparity_out)
+            });
+            let send = |o: Output| outputs_tx.send(o).map_err(|_| Failure::Error("the record packer stopped".into()));
+            if let (Some((_, from)), Some(result)) = (&previous, flow_out) {
+                let (flow, mask) = result?;
+                send(Output::Flow { flow, mask, from: *from, to: time })?;
+            }
+            if let Some(result) = disparity_out {
+                send(Output::Disparity { field: result?, at: time })?;
+            }
+            previous = Some((left_flow, time));
+            decoded = index + 1 - first;
+        }
+        Ok(())
+    })();
+    drop(inputs);
+    drop(outputs_tx);
+    let track = packer.join().map_err(|_| Failure::Error("the record packer panicked".into()))?;
+    result?;
+    Ok((track, decoded))
 }
 
 #[cfg(test)]

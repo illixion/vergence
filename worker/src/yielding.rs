@@ -5,13 +5,11 @@
 //!
 //! - **Everywhere:** a `pause` file next to the config (`touch` it to pause,
 //!   delete it to resume). On an NVIDIA GPU, from `nvidia-smi`:
-//!   - another program computing on it (another model, a CUDA renderer): a
-//!     process of type `C`. Windows lists nearly every desktop program as
-//!     `C+G` (the shell, the browser), so those don't count;
-//!   - a video encoder session (NVENC): a game stream, a recording or a
-//!     broadcast. `nvidia-smi` can't say whose sessions they are, so while a
-//!     Vergence converter runs this is left to the per-process engine
-//!     counters below (Windows);
+//!   - elsewhere than Windows, another program computing on it (another
+//!     model, a CUDA renderer): a process of type `C`, but a streaming host
+//!     (Sunshine converts colours for its encoder with CUDA). On Windows,
+//!     where the desktop is `C+G` and an idle Sunshine shows up as `C`, the
+//!     per-process engine counters below say how busy each one is instead;
 //!   - less than 1 GiB of the GPU's memory free (a game loading), until
 //!     2.5 GiB are free again.
 //!
@@ -24,24 +22,27 @@
 //!     over its pipe (`LibraryList`), so its custom titles and kind overrides
 //!     count; without it, from Steam's own `libraryfolders.vdf` (any
 //!     `steamapps\common` folder is a game);
-//!   - the Companion's native screen stream with a device connected
-//!     (`NativeStreamStatus.connectedDevice`), and SteamVR (`vrserver.exe`),
-//!     which runs only while a PCVR session (Longwave's foveated streaming
-//!     included) is up;
+//!   - SteamVR (`vrserver.exe`), which runs only while a PCVR session
+//!     (Longwave's foveated streaming included) is up;
 //!   - the shell saying a full-screen Direct3D program or presentation mode is
 //!     up (`SHQueryUserNotificationState`), which catches games outside any
 //!     library. Only for a worker in the user's session: a service in
 //!     session 0 sees its own desktop;
 //!   - another process keeping the GPU's 3D or compute engines at least 30%
-//!     busy, or encoding video at all (a Sunshine, Moonlight, Steam Link or
-//!     Longwave stream, a recording), in two samples in a row: the `GPU
-//!     Engine` performance counters, per process, which catch any GPU vendor
-//!     and a game in a window;
+//!     busy in two samples in a row (the `GPU Engine` performance counters,
+//!     per process, which catch any GPU vendor and a game in a window); 15%
+//!     while something encodes video, i.e. a stream or a recording is on;
+//!   - a program launched through a Sunshine stream (an app of its list, not
+//!     the desktop);
 //!   - any executable named in the config's `yieldProcesses`.
 //!
+//! A stream of the desktop alone (Sunshine, Moonlight, Steam Link,
+//! Longwave's screen stream) doesn't make it stand aside: it keeps the GPU a
+//! few percent busy, and the worker's below-normal priority leaves it be. A
+//! game in that stream does, by any of the rules above.
+//!
 //! While it stands aside, the worker also unloads its models, so the GPU's
-//! memory goes back too (`main.rs`). On Windows 10 with an RTX 3080, a
-//! Sunshine stream starting made it stand aside and unload its models.
+//! memory goes back too (`main.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -116,6 +117,37 @@ pub fn is_vergence(pid: u32, table: &[Process], own_pid: u32) -> bool {
     false
 }
 
+/// The first process under one named `parent` (at any depth), other than
+/// `ignored` names and the parent's own kind: what a streaming host launched.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn launched_through(table: &[Process], parent: &str, ignored: &[&str]) -> Option<String> {
+    let hosts: Vec<u32> = table.iter().filter(|p| p.name.eq_ignore_ascii_case(parent)).map(|p| p.pid).collect();
+    if hosts.is_empty() {
+        return None;
+    }
+    let stem = parent.trim_end_matches(".exe").to_lowercase();
+    table
+        .iter()
+        .filter(|p| {
+            let name = p.name.to_lowercase();
+            !name.starts_with(&stem) && !ignored.iter().any(|i| name == i.to_lowercase())
+        })
+        .find(|p| {
+            let mut current = p.parent;
+            for _ in 0..16 {
+                if hosts.contains(&current) {
+                    return true;
+                }
+                match table.iter().find(|q| q.pid == current) {
+                    Some(q) if q.parent != 0 && q.parent != current => current = q.parent,
+                    _ => return false,
+                }
+            }
+            false
+        })
+        .map(|p| p.name.clone())
+}
+
 /// `(pid, type, name)` of each process in `nvidia-smi -q -d PIDS`.
 pub fn gpu_processes(query: &str) -> Vec<(u32, String, String)> {
     let mut out = Vec::new();
@@ -145,8 +177,8 @@ pub fn gpu_processes(query: &str) -> Vec<(u32, String, String)> {
     out
 }
 
-/// Free memory in MiB and encoder sessions, from
-/// `--query-gpu=memory.used,memory.total,encoder.stats.sessionCount`.
+/// Free memory in MiB and encoder sessions (when asked for too), from
+/// `--query-gpu=memory.used,memory.total[,encoder.stats.sessionCount]`.
 pub fn gpu_state(csv: &str) -> Option<(u64, u64)> {
     let mut parts = csv.lines().next()?.split(',').map(|p| p.trim().parse::<u64>().ok());
     let (used, total, sessions) = (parts.next()??, parts.next()??, parts.next().flatten().unwrap_or(0));
@@ -172,26 +204,24 @@ impl NvidiaPeers {
     }
 
     fn check(&self) -> Option<String> {
-        let query = nvidia_smi(&["-q", "-d", "PIDS"])?;
-        let own = std::process::id();
-        let table = process_table();
-        let computing: Vec<String> = gpu_processes(&query)
-            .into_iter()
-            .filter(|(pid, kind, _)| kind == "C" && !is_vergence(*pid, &table, own))
-            .map(|(_, _, name)| name)
-            .collect();
-        if !computing.is_empty() {
-            return Some(format!("the GPU is computing for {}", computing.join(", ")));
+        if !cfg!(windows) {
+            let query = nvidia_smi(&["-q", "-d", "PIDS"])?;
+            let own = std::process::id();
+            let table = process_table();
+            let computing: Vec<String> = gpu_processes(&query)
+                .into_iter()
+                .filter(|(pid, kind, name)| {
+                    kind == "C" && !name.to_lowercase().contains("sunshine") && !is_vergence(*pid, &table, own)
+                })
+                .map(|(_, _, name)| name)
+                .collect();
+            if !computing.is_empty() {
+                return Some(format!("the GPU is computing for {}", computing.join(", ")));
+            }
         }
-        // (`nvidia-smi encodersessions` would name the processes, but it
-        // keeps printing until stopped.)
-        let (free, sessions) =
-            nvidia_smi(&["--query-gpu=memory.used,memory.total,encoder.stats.sessionCount", "--format=csv,noheader,nounits"])
+        let (free, _) =
+            nvidia_smi(&["--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"])
                 .and_then(|csv| gpu_state(&csv))?;
-        let converting = table.iter().any(|p| p.name.to_lowercase().starts_with("vergence-convert"));
-        if sessions > 0 && !converting {
-            return Some(format!("the GPU is encoding video ({sessions} session(s): a stream or a recording)"));
-        }
         let mut short = self.short_of_memory.lock().unwrap();
         *short = free < if *short { RESUME_MEMORY_MIB } else { LOW_MEMORY_MIB };
         short.then(|| format!("only {free} MiB of the GPU's memory is free"))
@@ -239,27 +269,26 @@ pub fn engine_instance(name: &str) -> Option<(u32, String)> {
     Some((pid, kind))
 }
 
-/// How busy a 3D or compute engine must be, in percent, to count; any video
-/// encoding counts (a stream at 1080p keeps NVENC only a few percent busy).
+/// How busy another process's 3D or compute engine must be, in percent, for
+/// the worker to stand aside; less while a stream or recording is on.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const BUSY_PERCENT: f64 = 30.0;
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const ENCODING_PERCENT: f64 = 0.1;
+pub const BUSY_WHILE_STREAMING_PERCENT: f64 = 15.0;
 
-/// What a process is doing on the GPU that the worker yields to.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What a process does on the GPU, in percent.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[cfg_attr(not(windows), allow(dead_code))]
-pub enum GpuUse {
-    /// Its busiest 3D or compute engine (CUDA, DirectML), in percent.
-    Busy(f64),
-    /// Its video encoders, in percent.
-    Encoding(f64),
+pub struct GpuUse {
+    /// Its busiest 3D or compute engine (CUDA, DirectML).
+    pub busy: f64,
+    /// Its video encoders.
+    pub encoding: f64,
 }
 
-/// Per process, what it does on the GPU that counts, from `(instance,
-/// percent)` samples of `GPU Engine(*)\Utilization Percentage` (several
-/// engines of one type add up). Copy and video decode (a video playing) never
-/// count.
+/// Per process, what it does on the GPU, from `(instance, percent)` samples of
+/// `GPU Engine(*)\Utilization Percentage` (several engines of one type add
+/// up). Copy and video decode (a video playing) don't count.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn gpu_users(samples: &[(String, f64)]) -> std::collections::BTreeMap<u32, GpuUse> {
     let mut per_engine: std::collections::BTreeMap<(u32, String), f64> = std::collections::BTreeMap::new();
@@ -268,25 +297,25 @@ pub fn gpu_users(samples: &[(String, f64)]) -> std::collections::BTreeMap<u32, G
             *per_engine.entry((pid, kind)).or_default() += value;
         }
     }
-    let mut out = std::collections::BTreeMap::new();
+    let mut out: std::collections::BTreeMap<u32, GpuUse> = std::collections::BTreeMap::new();
     for ((pid, kind), value) in per_engine {
-        let usage = if kind == "videoencode" && value >= ENCODING_PERCENT {
-            GpuUse::Encoding(value)
-        } else if (kind == "3d" || kind == "cuda" || kind.starts_with("compute")) && value >= BUSY_PERCENT {
-            GpuUse::Busy(value)
-        } else {
-            continue;
-        };
-        // Encoding says more than busy: a stream's game is busy too.
-        match out.get(&pid) {
-            Some(GpuUse::Encoding(_)) => {}
-            Some(GpuUse::Busy(v)) if matches!(usage, GpuUse::Busy(u) if u <= *v) => {}
-            _ => {
-                out.insert(pid, usage);
-            }
+        let usage = out.entry(pid).or_default();
+        if kind == "videoencode" {
+            usage.encoding += value;
+        } else if kind == "3d" || kind == "cuda" || kind.starts_with("compute") {
+            usage.busy = usage.busy.max(value);
         }
     }
     out
+}
+
+/// The processes busy enough to stand aside for: `(pid, busiest engine)`,
+/// with the lower bar while any of them encodes video.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn heavy_users(users: &std::collections::BTreeMap<u32, GpuUse>) -> Vec<(u32, f64)> {
+    let streaming = users.values().any(|u| u.encoding >= 0.5);
+    let bar = if streaming { BUSY_WHILE_STREAMING_PERCENT } else { BUSY_PERCENT };
+    users.iter().filter(|(_, u)| u.busy >= bar).map(|(&pid, u)| (pid, u.busy)).collect()
 }
 
 /// The first reason any of them gives.
@@ -299,7 +328,7 @@ impl Yield for AnyOf {
 }
 
 /// What this machine yields to: the pause file in `config_dir`, others on an
-/// NVIDIA GPU, and on Windows games, streams and anything keeping the GPU
+/// NVIDIA GPU, and on Windows games, games launched through a stream and anything keeping the GPU
 /// busy (with `extra_processes` by name).
 pub fn for_this_machine(config_dir: &Path, extra_processes: Vec<String>) -> AnyOf {
     #[allow(unused_mut)]
@@ -408,7 +437,10 @@ mod windows {
         PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
     };
 
-    use super::{GpuUse, Title, Yield, gpu_users, is_vergence, library_folders, match_title, process_table, titles_from_response};
+    use super::{
+        Process, Title, Yield, gpu_users, heavy_users, is_vergence, library_folders, match_title, process_table,
+        titles_from_response,
+    };
 
     const COMPANION_PIPE: &str = r"\\.\pipe\longwave-hotspot";
     /// Running only during a PCVR session.
@@ -516,12 +548,11 @@ mod windows {
         receive.recv_timeout(timeout).ok().flatten()
     }
 
-    fn native_stream_connected() -> Option<String> {
-        let line = companion("NativeStreamStatus", Duration::from_secs(2))?;
-        let value: serde_json::Value = serde_json::from_str(&line).ok()?;
-        // Only this field is read: the status also carries a token.
-        let device = value.get("result")?.get("connectedDevice")?.as_str()?;
-        Some(format!("Longwave is streaming the screen to {device}"))
+    /// A program Sunshine started for its client (an app of its list): any
+    /// process under `sunshine.exe` but its own console and prep commands.
+    fn launched_through_sunshine(table: &[Process]) -> Option<String> {
+        super::launched_through(table, "sunshine.exe", &["conhost.exe", "cmd.exe"])
+            .map(|name| format!("{name} was launched through a Sunshine stream"))
     }
 
     pub struct GamesAndStreams {
@@ -568,7 +599,7 @@ mod windows {
                     return Some(format!("{} is running ({name})", title.name));
                 }
             }
-            native_stream_connected()
+            launched_through_sunshine(&process_table())
         }
     }
 
@@ -669,15 +700,13 @@ mod windows {
             let samples = query.as_ref()?.sample();
             let own = std::process::id();
             let table = process_table();
-            let busy: Vec<(u32, GpuUse)> =
-                gpu_users(&samples).into_iter().filter(|&(pid, _)| pid != 0 && !is_vergence(pid, &table, own)).collect();
+            let mut users = gpu_users(&samples);
+            users.retain(|&pid, _| pid != 0 && !is_vergence(pid, &table, own));
+            let busy = heavy_users(&users);
             // In this sample and the one before: not a moment's spike.
-            let reason = busy.iter().find(|(pid, _)| busy_before.contains(pid)).map(|&(pid, usage)| {
+            let reason = busy.iter().find(|(pid, _)| busy_before.contains(pid)).map(|&(pid, value)| {
                 let name = table.iter().find(|p| p.pid == pid).map(|p| p.name.clone()).unwrap_or_else(|| format!("process {pid}"));
-                match usage {
-                    GpuUse::Encoding(_) => format!("{name} is encoding video on the GPU (a stream or a recording)"),
-                    GpuUse::Busy(value) => format!("{name} keeps the GPU {value:.0}% busy"),
-                }
+                format!("{name} keeps the GPU {value:.0}% busy")
             });
             *busy_before = busy.into_iter().map(|(pid, _)| pid).collect();
             *last = Some((Instant::now(), reason.clone()));
@@ -769,6 +798,12 @@ mod tests {
         assert!(is_vergence(30, &table, 30));
         assert!(!is_vergence(21, &table, 99));
         assert!(!is_vergence(404, &table, 99));
+        assert_eq!(launched_through(&table, "sunshine.exe", &["conhost.exe"]), Some("ffmpeg.exe".to_string()));
+        let desktop_only = vec![
+            Process { pid: 20, parent: 1, name: "sunshine.exe".into() },
+            Process { pid: 22, parent: 20, name: "conhost.exe".into() },
+        ];
+        assert_eq!(launched_through(&desktop_only, "sunshine.exe", &["conhost.exe"]), None);
     }
 
     #[test]
@@ -784,11 +819,24 @@ mod tests {
             ("pid_7_luid_0x00000000_0x0000D69A_phys_0_eng_8_engtype_VideoEncode".to_string(), 4.0),
         ];
         let users = gpu_users(&samples);
-        assert_eq!(users.get(&17684), Some(&GpuUse::Busy(75.2)));
-        assert_eq!(users.get(&20532), Some(&GpuUse::Busy(35.0)));
-        assert_eq!(users.get(&5), None);
-        assert_eq!(users.get(&6), None);
-        assert_eq!(users.get(&7), Some(&GpuUse::Encoding(4.0)));
+        assert_eq!(users[&17684], GpuUse { busy: 75.2, encoding: 0.0 });
+        assert_eq!(users[&20532].busy, 35.0);
+        assert_eq!(users[&5], GpuUse::default());
+        assert_eq!(users[&7], GpuUse { busy: 60.0, encoding: 4.0 });
+        // A stream (pid 7 encodes) lowers the bar: pid 6 at 12% stays below it, pid 20532 at 35% not.
+        let mut heavy: Vec<u32> = heavy_users(&users).into_iter().map(|(pid, _)| pid).collect();
+        heavy.sort();
+        assert_eq!(heavy, vec![7, 17684, 20532]);
+        // A desktop stream alone: the encoder busy, its 3D engine nearly idle.
+        let desktop = vec![
+            ("pid_9_luid_0x0_0x1_phys_0_eng_7_engtype_VideoEncode".to_string(), 28.0),
+            ("pid_9_luid_0x0_0x1_phys_0_eng_0_engtype_3D".to_string(), 1.0),
+            ("pid_10_luid_0x0_0x1_phys_0_eng_0_engtype_3D".to_string(), 16.0),
+        ];
+        let users = gpu_users(&desktop);
+        assert_eq!(heavy_users(&users), vec![(10, 16.0)]);
+        let quiet = gpu_users(&desktop[..2]);
+        assert!(heavy_users(&quiet).is_empty());
         assert_eq!(engine_instance("pid_x_engtype_3D"), None);
     }
 }
