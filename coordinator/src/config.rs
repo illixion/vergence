@@ -6,11 +6,15 @@
 //!   "store": "/var/lib/vergenced",
 //!   "jellyfin": { "url": "http://127.0.0.1:8096", "apiKeyFile": "/var/lib/vergenced/jellyfin.key" },
 //!   "stash": { "url": "http://127.0.0.1:9999", "apiKeyFile": "/var/lib/vergenced/stash.key" },
-//!   "scanEveryMinutes": 360
+//!   "scanEveryMinutes": 360,
+//!   "pairedListen": "0.0.0.0:8421"
 //! }
 //! ```
 //! Keys can be given inline as `apiKey` too; a file keeps them out of the config.
 //! Tokens for players and workers live in `<store>/tokens.json` (`vergenced token add`).
+//! Paired devices live in `<store>/devices.json` (`vergenced pair`, or `devicesFile`) and reach
+//! the same API over TLS-PSK on `pairedListen` (default every interface, port 8421; `null` turns
+//! it off). See [`crate::paired`].
 
 use std::path::PathBuf;
 
@@ -36,10 +40,20 @@ pub struct Config {
     /// Queue every stereo title the servers list, at start and then this often.
     #[serde(default)]
     pub scan_every_minutes: Option<u64>,
+    /// Where paired devices reach the API over TLS-PSK; `null` for nowhere.
+    #[serde(default = "default_paired_listen")]
+    pub paired_listen: Option<String>,
+    /// The paired devices (vergence-companion's `JsonFileStore`); `<store>/devices.json` by default.
+    #[serde(default)]
+    pub devices_file: Option<PathBuf>,
 }
 
 fn default_listen() -> String {
     "127.0.0.1:8420".into()
+}
+
+fn default_paired_listen() -> Option<String> {
+    Some(format!("0.0.0.0:{}", crate::paired::DEFAULT_PAIRED_PORT))
 }
 
 impl Config {
@@ -50,6 +64,10 @@ impl Config {
 
     pub fn tokens_path(&self) -> PathBuf {
         self.tokens_file.clone().unwrap_or_else(|| self.store.join("tokens.json"))
+    }
+
+    pub fn devices_path(&self) -> PathBuf {
+        self.devices_file.clone().unwrap_or_else(|| self.store.join("devices.json"))
     }
 
     pub fn sources(&self) -> std::io::Result<Sources> {

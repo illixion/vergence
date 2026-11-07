@@ -5,6 +5,10 @@
 //!
 //! The app's own UI is its admin: it reads the queue and manages tokens through the shared
 //! state directly, so it needs no admin token of its own.
+//!
+//! Paired headsets reach the same API over TLS-PSK on the paired port (8421 by default, every
+//! interface, `vergence_coordinator::paired`), keyed from the pairings in `devices.json`; plain
+//! HTTP with tokens stays on the coordinator's port.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,6 +19,7 @@ use tokio::task::JoinHandle;
 use vergence_coordinator::api::{self, AppState};
 use vergence_coordinator::auth::{Grant, TokenEntry, Tokens};
 use vergence_coordinator::config::Config;
+use vergence_coordinator::paired::{self, PairedDevices};
 use vergence_coordinator::queue::Workload;
 use vergence_coordinator::store::Store;
 
@@ -26,6 +31,9 @@ struct Running {
     /// None when the port couldn't be opened (the state is still there for tokens and the queue).
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<()>>,
+    /// The paired listener; None when its port couldn't be opened.
+    paired: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
+    paired_error: Option<String>,
     chores: Vec<JoinHandle<()>>,
 }
 
@@ -35,6 +43,7 @@ pub struct CoordinatorHost {
     /// The state, for synchronous readers (commands, the tray).
     state: Mutex<Option<(Arc<AppState>, String)>>,
     error: Mutex<Option<String>>,
+    paired: Mutex<(Option<String>, Option<String>)>,
     last_scan: Mutex<Option<Value>>,
 }
 
@@ -45,6 +54,7 @@ impl CoordinatorHost {
             running: Default::default(),
             state: Default::default(),
             error: Default::default(),
+            paired: Default::default(),
             last_scan: Default::default(),
         }
     }
@@ -58,6 +68,8 @@ impl CoordinatorHost {
             stash: server_config(&self.paths, settings, Server::Stash),
             workloads: Workload::defaults(),
             scan_every_minutes: settings.scan.then(|| u64::from(settings.scan_every_hours.max(1)) * 60),
+            paired_listen: Some(settings.paired_listen()),
+            devices_file: Some(self.paths.devices()),
         }
     }
 
@@ -73,6 +85,10 @@ impl CoordinatorHost {
         match result {
             Ok(now) => {
                 *self.state.lock().unwrap() = Some((now.state.clone(), now.listen.clone()));
+                *self.paired.lock().unwrap() = (
+                    now.paired.as_ref().and(config.paired_listen.clone()),
+                    now.paired_error.clone(),
+                );
                 *self.error.lock().unwrap() = if now.server.is_some() {
                     None
                 } else {
@@ -94,6 +110,8 @@ impl CoordinatorHost {
         let tokens = Tokens::load(&config.tokens_path()).map_err(|e| format!("The coordinator's tokens: {e}"))?;
         let sources = config.sources().map_err(|e| format!("A media server's key couldn't be read: {e}"))?;
         let state = AppState::new(store, sources, config.workloads.clone(), tokens).map_err(|e| format!("The coordinator's store: {e}"))?;
+        let devices = PairedDevices::open(config.devices_path());
+        state.set_paired(devices.clone());
         let mut chores = Vec::new();
         {
             let state = state.clone();
@@ -139,7 +157,31 @@ impl CoordinatorHost {
                 (None, None)
             }
         };
-        Ok(Running { state, listen: config.listen.clone(), shutdown, server, chores })
+        let (paired, paired_error) = match &config.paired_listen {
+            None => (None, None),
+            Some(listen) => match tokio::net::TcpListener::bind(listen).await {
+                Ok(listener) => {
+                    let (tx, rx) = oneshot::channel::<()>();
+                    let router = api::router(state.clone());
+                    let listen = listen.clone();
+                    let task = tokio::spawn(async move {
+                        tracing::info!(%listen, "paired channel serving");
+                        let stopped = async {
+                            let _ = rx.await;
+                        };
+                        if let Err(e) = paired::serve(listener, router, devices, stopped).await {
+                            tracing::error!(error = %e, "the paired channel stopped");
+                        }
+                    });
+                    (Some((tx, task)), None)
+                }
+                Err(e) => {
+                    tracing::warn!(%listen, error = %e, "the paired channel couldn't listen");
+                    (None, Some(format!("Paired headsets can't connect: port {} is taken ({e}).", listen.rsplit(':').next().unwrap_or(listen))))
+                }
+            },
+        };
+        Ok(Running { state, listen: config.listen.clone(), shutdown, server, paired, paired_error, chores })
     }
 
     pub async fn shutdown(&self) {
@@ -147,6 +189,7 @@ impl CoordinatorHost {
             stop(old).await;
         }
         *self.state.lock().unwrap() = None;
+        *self.paired.lock().unwrap() = (None, None);
     }
 
     pub fn state(&self) -> Option<Arc<AppState>> {
@@ -165,6 +208,8 @@ impl CoordinatorHost {
             "listen": state.as_ref().map(|(_, listen)| listen.clone()),
             "error": *self.error.lock().unwrap(),
             "titles": state.as_ref().map(|(s, _)| s.queue.lock().unwrap().titles().count()),
+            "pairedListen": self.paired.lock().unwrap().0.clone(),
+            "pairedError": self.paired.lock().unwrap().1.clone(),
             "lastScan": *self.last_scan.lock().unwrap(),
         })
     }
@@ -248,6 +293,12 @@ async fn stop(running: Running) {
     for chore in &running.chores {
         chore.abort();
     }
+    if let Some((tx, mut task)) = running.paired {
+        let _ = tx.send(());
+        if tokio::time::timeout(Duration::from_secs(3), &mut task).await.is_err() {
+            task.abort();
+        }
+    }
     if let Some(tx) = running.shutdown {
         let _ = tx.send(());
     }
@@ -271,8 +322,9 @@ mod tests {
     async fn serves_health_and_keeps_tokens_across_restarts() {
         let dir = tempfile::tempdir().unwrap();
         let host = Arc::new(CoordinatorHost::new(Paths::new(dir.path())));
-        let settings = Settings { port: free_port(), ..Settings::default() };
+        let settings = Settings { port: free_port(), paired_port: free_port(), ..Settings::default() };
         host.start(&settings).await.unwrap();
+        assert_eq!(host.status()["pairedListen"], settings.paired_listen());
         let health: Value = reqwest::get(format!("{}/v1/health", settings.local_url())).await.unwrap().json().await.unwrap();
         assert_eq!(health["service"], "vergenced");
 
@@ -291,7 +343,7 @@ mod tests {
         assert!(host.snapshot().unwrap()["titles"].as_array().unwrap().is_empty());
 
         // A restart on another port reads the same tokens back.
-        let moved = Settings { port: free_port(), ..settings.clone() };
+        let moved = Settings { port: free_port(), paired_port: free_port(), ..settings.clone() };
         host.start(&moved).await.unwrap();
         assert!(reqwest::get(format!("{}/v1/health", settings.local_url())).await.is_err());
         assert_eq!(names(&host), ["phone", "headset"]);
@@ -306,7 +358,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let host = Arc::new(CoordinatorHost::new(Paths::new(dir.path())));
-        let settings = Settings { port: taken.local_addr().unwrap().port(), ..Settings::default() };
+        let settings = Settings { port: taken.local_addr().unwrap().port(), paired_port: free_port(), ..Settings::default() };
         let error = host.start(&settings).await.unwrap_err();
         assert!(error.contains("taken"), "{error}");
         assert_eq!(host.status()["running"], false);

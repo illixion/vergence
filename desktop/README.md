@@ -11,7 +11,8 @@ The Vergence desktop app (Tauri 2, binary `vergence-app`), Mac first, then Windo
 - **shows the queue** (titles with progress, leases, workers, playheads) and manages `play` and
   `work` tokens, each shown once;
 - **pairs headsets** with RAVECompanion's six-digit comparison (`vergence-companion`, port 4869,
-  open only while pairing). A paired device gets a coordinator `play` token: see below;
+  open only while pairing). A paired headset then reaches the coordinator over TLS-PSK on port
+  8421 (every interface, `pairedPort` in `settings.json`), keyed from its pairing: see below;
 - **runs this Mac's worker** (`vergence worker --config …`) as a child process, with a `work`
   token it mints for it, and shows its output;
 - **converts files to AI 3D**: drop videos or folders on the window, pick them, or "Open With"
@@ -45,19 +46,25 @@ stop, and the updater's signature checks. `cargo test -p vergence-desktop -- --i
 converts_a_clip` runs a real conversion of a generated clip (needs the release CLI, ffmpeg and a
 depth model).
 
-## A paired headset's token (interim)
+## How a paired headset reaches the coordinator
 
-Until the chunk API runs over the paired TLS-PSK channel, a paired device reaches the coordinator
-with a bearer token over HTTP on the LAN. It is derived from its pairing token, never the pairing
-token itself (which keys the PSK channel and mustn't cross the network):
+Over the paired channel: TLS 1.2 with an external PSK on port 8421, keyed from the pairing token
+the headset got, the PSK identity naming the device (`VergenceAPI/v1/<device id>`), then plain
+HTTP/1.1 to the same routes. The coordinator reads `devices.json` itself, so a new pairing works
+at once and Forget locks the device out at once, open connections included. The exact wire is in
+`coordinator/src/paired.rs` and Convolution's `docs/plans/analysis-workers.md` ("The paired
+channel"). It needs no *Listen on the network*: that switch is for the plain HTTP port.
+
+A paired device may instead use the plain HTTP port with a bearer token derived from its pairing
+token, never the pairing token itself (which keys the PSK channel and mustn't cross the network):
 
 ```text
 token = hex(HKDF-SHA256(ikm: pairing token (UTF-8), salt: "Vergence-HTTP-Token-v1",
                         info: device id (UTF-8), length 32))
 ```
 
-The coordinator keeps its SHA-256 as `device-<device id>` with the `play` grant; forgetting the
-device removes it.
+The coordinator recognises it from `devices.json`, and also keeps its SHA-256 as `device-<device
+id>` with the `play` grant; forgetting the device removes both.
 
 ## Signing a release
 
@@ -79,7 +86,6 @@ signed names, so an old release can't be relabelled as new.
 
 ## Not done yet
 
-- **The TLS-PSK channel** for the chunk and worker API (pairing and the derived HTTP token work).
 - **Bonjour**: devices pair from the address link the Headsets tab shows.
 - **Windows:** the worker and conversion arrive with the ONNX Runtime engine; the app shows so.
   The `cfg`s are in place, but no Windows build has been made.

@@ -7,6 +7,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod paired;
 pub mod queue;
 pub mod source;
 pub mod store;

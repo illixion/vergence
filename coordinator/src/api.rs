@@ -21,14 +21,18 @@
 //! ```
 //! Admin: `GET /v1/queue`, `POST /v1/scan` (queue every stereo title the servers list),
 //! `DELETE /v1/titles/{server}/{id}/{workload}`.
+//!
+//! Who is calling: a bearer token over plain HTTP (`vergenced token add`, or a paired device's
+//! derived token), or a paired device on the TLS-PSK channel ([`crate::paired`]), whose grants are
+//! the ones it was paired with. Both reach the same routes.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
+use axum::http::{HeaderValue, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -36,6 +40,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::auth::{Grant, Tokens, token_from_headers};
+use crate::paired::{PairedDevices, PairedPeer, device_name};
 use crate::queue::{AddError, AddOutcome, Claim, Queue, Title, Workload};
 use crate::source::{Server, SourceRef, Sources};
 use crate::store::Store;
@@ -50,6 +55,8 @@ pub struct AppState {
     pub sources: Sources,
     pub workloads: Vec<Workload>,
     pub tokens: RwLock<Tokens>,
+    /// Paired devices, when this coordinator has any (set once, by [`AppState::set_paired`]).
+    paired: OnceLock<PairedDevices>,
     described: Mutex<HashMap<String, Instant>>,
 }
 
@@ -66,8 +73,19 @@ impl AppState {
             sources,
             workloads,
             tokens: RwLock::new(tokens),
+            paired: OnceLock::new(),
             described: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Lets paired devices in: on the TLS-PSK channel, and with their derived token over HTTP.
+    /// Set once; a second call is ignored.
+    pub fn set_paired(&self, devices: PairedDevices) {
+        let _ = self.paired.set(devices);
+    }
+
+    pub fn paired(&self) -> Option<&PairedDevices> {
+        self.paired.get()
     }
 }
 
@@ -88,15 +106,49 @@ fn err(status: StatusCode, reason: impl Into<String>) -> ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-fn authorize(state: &AppState, headers: &HeaderMap, grant: Grant) -> ApiResult<String> {
-    let token = token_from_headers(headers).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "a token is needed"))?;
-    state
-        .tokens
-        .read()
-        .expect("tokens lock")
-        .check(&token, grant)
-        .map(str::to_string)
-        .ok_or_else(|| err(StatusCode::FORBIDDEN, "the token doesn't allow this"))
+/// Who a request comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Caller {
+    /// Plain HTTP, with the token it sent (if any).
+    Token(Option<String>),
+    /// A paired device on the TLS-PSK channel.
+    Device(String),
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for Caller {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(match parts.extensions.get::<PairedPeer>() {
+            Some(peer) => Caller::Device(peer.device_id.clone()),
+            None => Caller::Token(token_from_headers(&parts.headers)),
+        })
+    }
+}
+
+fn holds(grants: &[Grant], grant: Grant) -> bool {
+    grants.contains(&grant) || grants.contains(&Grant::Admin)
+}
+
+/// The caller's name if it holds `grant` (admin holds every grant).
+fn authorize(state: &AppState, caller: &Caller, grant: Grant) -> ApiResult<String> {
+    let refused = || err(StatusCode::FORBIDDEN, "the token doesn't allow this");
+    match caller {
+        Caller::Device(id) => {
+            let grants = state.paired().and_then(|d| d.grants(id)).ok_or_else(|| err(StatusCode::FORBIDDEN, "this device isn't paired"))?;
+            holds(&grants, grant).then(|| device_name(id)).ok_or_else(refused)
+        }
+        Caller::Token(None) => Err(err(StatusCode::UNAUTHORIZED, "a token is needed")),
+        Caller::Token(Some(token)) => {
+            if let Some(name) = state.tokens.read().expect("tokens lock").check(token, grant) {
+                return Ok(name.to_string());
+            }
+            match state.paired().and_then(|d| d.by_http_token(token)) {
+                Some((id, grants)) if holds(&grants, grant) => Ok(device_name(&id)),
+                _ => Err(refused()),
+            }
+        }
+    }
 }
 
 fn source_ref(server: &str, id: &str) -> ApiResult<SourceRef> {
@@ -228,8 +280,8 @@ fn one() -> f64 {
     1.0
 }
 
-async fn playing(State(state): State<Shared>, headers: HeaderMap, Json(body): Json<Playing>) -> ApiResult<Response> {
-    let name = authorize(&state, &headers, Grant::Play)?;
+async fn playing(State(state): State<Shared>, caller: Caller, Json(body): Json<Playing>) -> ApiResult<Response> {
+    let name = authorize(&state, &caller, Grant::Play)?;
     let player = format!("{name}/{}", body.player.as_deref().unwrap_or("default"));
     if body.stopped {
         state.queue.lock().expect("queue lock").stop_playhead(&player);
@@ -244,10 +296,10 @@ async fn playing(State(state): State<Shared>, headers: HeaderMap, Json(body): Js
 
 async fn title_status(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    caller: Caller,
     Path((server, id, workload)): Path<(String, String, String)>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers, Grant::Play)?;
+    authorize(&state, &caller, Grant::Play)?;
     let key = Title::key_for(&source_ref(&server, &id)?, &workload);
     Ok(match state.status_json(&key) {
         Some(status) => Json(status).into_response(),
@@ -257,10 +309,10 @@ async fn title_status(
 
 async fn enqueue(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    caller: Caller,
     Path((server, id, workload)): Path<(String, String, String)>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers, Grant::Play)?;
+    authorize(&state, &caller, Grant::Play)?;
     let workload = state.workload(&workload)?;
     let key = state.ensure_title(&source_ref(&server, &id)?, &workload).await?;
     Ok((StatusCode::ACCEPTED, Json(state.status_json(&key))).into_response())
@@ -268,10 +320,10 @@ async fn enqueue(
 
 async fn remove(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    caller: Caller,
     Path((server, id, workload)): Path<(String, String, String)>,
 ) -> ApiResult<StatusCode> {
-    authorize(&state, &headers, Grant::Admin)?;
+    authorize(&state, &caller, Grant::Admin)?;
     let key = Title::key_for(&source_ref(&server, &id)?, &workload);
     let removed = state.queue.lock().expect("queue lock").remove(&key);
     state.store.remove_title(&key).map_err(internal)?;
@@ -293,10 +345,10 @@ fn chunk_response(ChunkBytes { bytes, whole, done, total }: ChunkBytes) -> Respo
 
 async fn chunk(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    caller: Caller,
     Path((server, id, workload, n)): Path<(String, String, String, usize)>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers, Grant::Play)?;
+    authorize(&state, &caller, Grant::Play)?;
     let key = Title::key_for(&source_ref(&server, &id)?, &workload);
     match state.chunk(&key, n)? {
         Some(chunk) => Ok(chunk_response(chunk)),
@@ -304,8 +356,8 @@ async fn chunk(
     }
 }
 
-async fn queue_view(State(state): State<Shared>, headers: HeaderMap) -> ApiResult<Response> {
-    authorize(&state, &headers, Grant::Admin)?;
+async fn queue_view(State(state): State<Shared>, caller: Caller) -> ApiResult<Response> {
+    authorize(&state, &caller, Grant::Admin)?;
     let snapshot = state.queue.lock().expect("queue lock").snapshot(Instant::now());
     Ok(Json(snapshot).into_response())
 }
@@ -329,8 +381,8 @@ pub async fn scan_now(state: &AppState) -> serde_json::Value {
     json!({ "titles": added, "problems": problems })
 }
 
-async fn scan(State(state): State<Shared>, headers: HeaderMap) -> ApiResult<Response> {
-    authorize(&state, &headers, Grant::Admin)?;
+async fn scan(State(state): State<Shared>, caller: Caller) -> ApiResult<Response> {
+    authorize(&state, &caller, Grant::Admin)?;
     Ok(Json(scan_now(&state).await).into_response())
 }
 
@@ -344,8 +396,8 @@ fn worker_name(token: &str, worker: Option<&str>) -> String {
     format!("{token}/{}", worker.unwrap_or("default"))
 }
 
-async fn claim(State(state): State<Shared>, headers: HeaderMap, Json(mut body): Json<Claim>) -> ApiResult<Response> {
-    let token = authorize(&state, &headers, Grant::Work)?;
+async fn claim(State(state): State<Shared>, caller: Caller, Json(mut body): Json<Claim>) -> ApiResult<Response> {
+    let token = authorize(&state, &caller, Grant::Work)?;
     body.worker = worker_name(&token, Some(&body.worker));
     let lease = state.queue.lock().expect("queue lock").claim(&body, Instant::now());
     let Some(lease) = lease else { return Ok(StatusCode::NO_CONTENT.into_response()) };
@@ -366,11 +418,11 @@ fn lease_error(e: crate::queue::UploadError) -> ApiError {
 
 async fn heartbeat(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    caller: Caller,
     Path(lease): Path<u64>,
     Query(q): Query<WorkerQuery>,
 ) -> ApiResult<Response> {
-    let token = authorize(&state, &headers, Grant::Work)?;
+    let token = authorize(&state, &caller, Grant::Work)?;
     let worker = worker_name(&token, q.worker.as_deref());
     let seconds = state.queue.lock().expect("queue lock").heartbeat(lease, &worker, Instant::now()).map_err(lease_error)?;
     Ok(Json(json!({ "leaseSeconds": seconds })).into_response())
@@ -378,11 +430,11 @@ async fn heartbeat(
 
 async fn release(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    caller: Caller,
     Path(lease): Path<u64>,
     Query(q): Query<WorkerQuery>,
 ) -> ApiResult<StatusCode> {
-    let token = authorize(&state, &headers, Grant::Work)?;
+    let token = authorize(&state, &caller, Grant::Work)?;
     let worker = worker_name(&token, q.worker.as_deref());
     state.queue.lock().expect("queue lock").release(lease, &worker).map_err(lease_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -390,12 +442,12 @@ async fn release(
 
 async fn result(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    caller: Caller,
     Path(lease): Path<u64>,
     Query(q): Query<WorkerQuery>,
     body: Bytes,
 ) -> ApiResult<Response> {
-    let token = authorize(&state, &headers, Grant::Work)?;
+    let token = authorize(&state, &caller, Grant::Work)?;
     let worker = worker_name(&token, q.worker.as_deref());
     let parsed = track::parse(&body).map_err(|e| err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let (key, piece) = state.queue.lock().expect("queue lock").check(lease, &worker, &parsed).map_err(|e| {
@@ -412,8 +464,8 @@ async fn result(
 
 // MARK: The Jellyfin plugin's routes
 
-async fn compat_status(State(state): State<Shared>, headers: HeaderMap, Path(item): Path<String>) -> ApiResult<Response> {
-    authorize(&state, &headers, Grant::Play)?;
+async fn compat_status(State(state): State<Shared>, caller: Caller, Path(item): Path<String>) -> ApiResult<Response> {
+    authorize(&state, &caller, Grant::Play)?;
     let key = Title::key_for(&SourceRef::jellyfin(&item), Workload::SMOOTH_MOTION_3D);
     let Some(status) = state.queue.lock().expect("queue lock").status(&key) else {
         return Ok(Json(json!({ "state": "none" })).into_response());
@@ -430,8 +482,8 @@ async fn compat_status(State(state): State<Shared>, headers: HeaderMap, Path(ite
     Ok(Json(body).into_response())
 }
 
-async fn compat_analyze(State(state): State<Shared>, headers: HeaderMap, Path(item): Path<String>) -> ApiResult<Response> {
-    authorize(&state, &headers, Grant::Play)?;
+async fn compat_analyze(State(state): State<Shared>, caller: Caller, Path(item): Path<String>) -> ApiResult<Response> {
+    authorize(&state, &caller, Grant::Play)?;
     let workload = state.workload(Workload::SMOOTH_MOTION_3D)?;
     let key = state
         .ensure_title(&SourceRef::jellyfin(&item), &workload)
@@ -443,10 +495,10 @@ async fn compat_analyze(State(state): State<Shared>, headers: HeaderMap, Path(it
 
 async fn compat_chunk(
     State(state): State<Shared>,
-    headers: HeaderMap,
+    caller: Caller,
     Path((item, n)): Path<(String, usize)>,
 ) -> ApiResult<Response> {
-    authorize(&state, &headers, Grant::Play)?;
+    authorize(&state, &caller, Grant::Play)?;
     let key = Title::key_for(&SourceRef::jellyfin(&item), Workload::SMOOTH_MOTION_3D);
     match state.chunk(&key, n)? {
         Some(chunk) if chunk.whole => Ok(chunk_response(chunk)),

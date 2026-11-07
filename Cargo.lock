@@ -4780,6 +4780,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-openssl"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59df6849caa43bb7567f9a36f863c447d95a11d5903c9cc334ba32576a27eadd"
+dependencies = [
+ "openssl",
+ "openssl-sys",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-rustls"
 version = "0.26.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5210,7 +5221,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
+ "hkdf",
  "http-body-util",
+ "hyper",
+ "hyper-util",
+ "openssl",
  "rand 0.9.5",
  "reqwest 0.12.28",
  "serde",
@@ -5219,9 +5234,11 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-openssl",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "vergence-companion",
 ]
 
 [[package]]
@@ -5231,7 +5248,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "ed25519-dalek",
- "hkdf",
  "libc",
  "reqwest 0.12.28",
  "serde",

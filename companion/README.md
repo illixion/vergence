@@ -105,8 +105,9 @@ Each direction passes when both sides showed the same code and both ended OK.
   browsing for knocks and the per-device `_<stem>-pair._tcp` listener are not. Until then devices
   pair through the fixed pairing port, from an address link (`PairLink`) the desktop app shows or
   sends. `mdns-sd` is the likely crate.
-- **Async.** The drivers are blocking; the coordinator can run them in `spawn_blocking`, or drive
-  `HostPairing` from tokio directly. A `tokio-openssl` acceptor would be the async channel.
+- **Async pairing.** The pairing drivers are blocking; the coordinator runs them on a thread. The
+  TLS channel is async there already: `PskServer::ssl` and `PskServer::matched` let it run the
+  handshake through `tokio-openssl` (`coordinator/src/paired.rs`).
 - **DTLS** (Longwave's UDP channels) isn't ported; the coordinator only needs TCP.
 - **Knock-gated ports** (`RAVECompanionPresence`, `RAVECompanionPortListener`'s rebind retry):
   host-app behaviour, left to the coordinator.

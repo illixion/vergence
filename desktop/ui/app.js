@@ -86,6 +86,8 @@ async function refreshStatus() {
   $("coordinator-line").innerHTML = c.running
     ? `Serving at <span class="mono">${esc(s.localUrl)}</span>${esc(addresses)}`
     : `<span class="bad-text">${esc(c.error || "Not running.")}</span>`;
+  if (c.pairedListen) $("paired-port").textContent = c.pairedListen.split(":").pop();
+  $("paired-error").textContent = c.pairedError || "";
   const scan = c.lastScan;
   $("scan-line").textContent = scan ? `Last scan: ${scan.titles} titles${scan.problems?.length ? `, ${scan.problems.length} problems (${scan.problems[0]})` : ""}.` : "";
 }

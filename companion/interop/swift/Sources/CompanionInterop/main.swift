@@ -3,6 +3,9 @@
 //   CompanionInterop device <pair-port> <tls-port>   pair with a Rust host, then
 //                                                    open its TLS-PSK channel and identify
 //   CompanionInterop host <pair-port> <tls-port>     the Swift host a Rust device pairs with
+//   CompanionInterop api <pair-port> <api-port>      pair with `vergenced pair` (Vergence's own
+//                                                    namespace), then use the coordinator's API on
+//                                                    its paired TLS-PSK port with RAVECompanionHTTPClient
 //
 // Prints `CODE <six digits>` when the code is known, `OK <detail>` on success,
 // and exits non-zero on failure. Uses a namespace of its own so nothing real
@@ -186,10 +189,65 @@ final class HostSide {
     }
 }
 
+/// Pairs with vergenced as a headset would, then talks to its API over the paired channel.
+@MainActor
+func runAPI() {
+    let vergence = RAVECompanionNamespace(serviceStem: "vergence", labelPrefix: "Vergence", urlScheme: "vergence",
+                                          defaultPairPort: pairPort, hostAppName: "Vergence")
+    let locator = RAVECompanionLocator(namespace: vergence, deviceID: "swift-headset", deviceName: { "Swift harness" })
+    let link = RAVECompanionPairLink(vergence, macID: "", name: "vergenced", addresses: ["127.0.0.1"])
+    let client = RAVEPairingClient<Grant>(locator: locator, link: link, deviceName: "Swift harness", requested: [.play])
+    client.start()
+    var printedCode = false
+    Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { timer in
+        MainActor.assumeIsolated {
+            switch client.state {
+            case .confirming(let code) where !printedCode:
+                printedCode = true
+                say("CODE \(code)")
+            case .paired(let grant):
+                timer.invalidate()
+                say("GRANT host=\(grant.macName) grants=\((grant.grants ?? []).joined(separator: ","))")
+                let http = RAVECompanionHTTPClient(
+                    channel: RAVECompanionChannel(identityBase: "VergenceAPI/v1", salt: "Vergence-API-PSK-v1"),
+                    credential: RAVECompanionCredential(token: grant.token, deviceID: "swift-headset"),
+                    hosts: ["127.0.0.1"], port: tlsPort, timeout: .seconds(10))
+                Task {
+                    do {
+                        let health = try await http.send("GET", "/v1/health")
+                        guard health.status == 200, String(decoding: health.body, as: UTF8.self).contains("vergenced") else {
+                            fail("health: \(health.status)")
+                        }
+                        let status = try await http.send("GET", "/v1/titles/jellyfin/none/smooth-motion-3d")
+                        guard status.status == 404, String(decoding: status.body, as: UTF8.self).contains("\"none\"") else {
+                            fail("title status: \(status.status)")
+                        }
+                        let queue = try await http.send("GET", "/v1/queue")
+                        guard queue.status == 403 else { fail("queue answered \(queue.status) to a play device") }
+                        let stopped = try await http.send(
+                            "POST", "/v1/playing", headers: ["Content-Type": "application/json"],
+                            body: Data(#"{"server":"jellyfin","id":"","seconds":0,"player":"harness","stopped":true}"#.utf8))
+                        guard stopped.status == 204 else { fail("playing: \(stopped.status)") }
+                        say("OK health 200, title 404 none, queue 403, playing 204 over TLS-PSK")
+                        exit(0)
+                    } catch {
+                        fail("API: \(error)")
+                    }
+                }
+            case .failed(let reason):
+                fail(reason)
+            default:
+                break
+            }
+        }
+    }
+}
+
 var host: HostSide?
 MainActor.assumeIsolated {
     switch args[1] {
     case "device": runDevice()
+    case "api": runAPI()
     case "host":
         host = HostSide()
         host?.start()

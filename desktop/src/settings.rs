@@ -74,8 +74,10 @@ impl Server {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// The coordinator's port.
+    /// The coordinator's port (plain HTTP, tokens).
     pub port: u16,
+    /// The port paired headsets reach the coordinator on (TLS-PSK, every interface).
+    pub paired_port: u16,
     /// Listen on every interface (headsets and other workers on the LAN), not just this computer.
     pub lan: bool,
     pub jellyfin_url: Option<String>,
@@ -98,11 +100,13 @@ pub struct Settings {
 }
 
 pub const DEFAULT_PORT: u16 = 8420;
+pub const DEFAULT_PAIRED_PORT: u16 = vergence_coordinator::paired::DEFAULT_PAIRED_PORT;
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             port: DEFAULT_PORT,
+            paired_port: DEFAULT_PAIRED_PORT,
             lan: false,
             jellyfin_url: None,
             stash_url: None,
@@ -130,6 +134,11 @@ impl Settings {
     /// Where the coordinator listens.
     pub fn listen(&self) -> String {
         format!("{}:{}", if self.lan { "0.0.0.0" } else { "127.0.0.1" }, self.port)
+    }
+
+    /// Where paired headsets reach the coordinator (TLS-PSK only, so on every interface).
+    pub fn paired_listen(&self) -> String {
+        format!("0.0.0.0:{}", self.paired_port)
     }
 
     /// How this computer reaches its own coordinator.
@@ -169,8 +178,11 @@ impl Settings {
                 }
             }
         }
-        if self.port < 1024 {
+        if self.port < 1024 || self.paired_port < 1024 {
             return Err("Pick a port from 1024 up.".into());
+        }
+        if self.port == self.paired_port {
+            return Err("The paired port must differ from the coordinator's port.".into());
         }
         self.scan_every_hours = self.scan_every_hours.clamp(1, 24 * 7);
         Ok(self)

@@ -21,8 +21,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 bytes = "1"
 rand = "0.9"
+# The paired channel: the same API over TLS 1.2 PSK, keyed from each device's pairing token.
+vergence-companion = { path = "../companion" }
+openssl = "0.10"
+tokio-openssl = "0.6"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
+hkdf = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

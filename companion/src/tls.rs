@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 
 use openssl::error::ErrorStack;
 use openssl::ex_data::Index;
-use openssl::ssl::{HandshakeError, Ssl, SslContext, SslMethod, SslStream, SslVersion};
+use openssl::ssl::{HandshakeError, Ssl, SslContext, SslMethod, SslRef, SslStream, SslVersion};
 
 use crate::credential::{Channel, Credential, Identify, PSK_CIPHER_NAME};
 use crate::keyring::{Keyring, KeyringEntry};
@@ -106,6 +106,18 @@ impl PskServer {
     /// Keys from a keyring, which the pairing side keeps current.
     pub fn with_keyring(channel: Channel, keyring: Keyring) -> Result<Self, ErrorStack> {
         Self::new(channel, move |device| keyring.token_for(device))
+    }
+
+    /// A fresh `SSL` for one connection, for a caller running the handshake itself (an async
+    /// stream, `tokio-openssl`). Read which device it matched with [`PskServer::matched`].
+    pub fn ssl(&self) -> Result<Ssl, ErrorStack> {
+        Ssl::new(&self.context)
+    }
+
+    /// After a handshake on an `SSL` from [`PskServer::ssl`]: the device whose PSK it used
+    /// (`Some(None)`: the shared token), or `None` when no identity matched.
+    pub fn matched(ssl: &SslRef) -> Option<Option<String>> {
+        ssl.ex_data(matched_index()).map(|m| m.0.clone())
     }
 
     /// Runs the server handshake on an accepted stream.

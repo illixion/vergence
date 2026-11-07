@@ -347,9 +347,18 @@ cargo build --release -p vergence-coordinator
 target/release/vergenced token add vision-pro --grants play --config vergenced.json   # prints a token once
 target/release/vergenced token add mac --grants work --config vergenced.json
 target/release/vergenced serve --config vergenced.json       # config format: coordinator/src/config.rs
+target/release/vergenced pair --config vergenced.json        # pair a headset: compare six digits, answer y
 .build/release/vergence worker --config worker.json          # a Mac (Core ML); format: Sources/VergenceCLI/Worker.swift
 target/release/vergence-worker --config worker.json          # a PC (ONNX Runtime), same format
 ```
+
+Two ways in, to the same API. **Paired devices** (a headset paired with `vergenced pair` or the
+desktop app's Headsets tab) use TLS 1.2 with an external PSK on port 8421, keyed from their
+pairing, with nothing secret on the wire and no token to copy; the spec is in
+`coordinator/src/paired.rs` (identity `VergenceAPI/v1/<device id>`, PSK
+HKDF-SHA256(pairing token, `Vergence-API-PSK-v1`, `psk`), then plain HTTP/1.1). **Tokens** over
+plain HTTP on port 8420 are for scripts, workers set up by hand and the Jellyfin plugin
+(`vergenced token add`); a paired device may use a token derived from its pairing there too.
 
 A Mac worker gives the same records as `vergence analyze` over the whole file (disparity
 identical, flow within Core ML's run-to-run noise; `scripts/check-worker.sh`), at about 37 fps

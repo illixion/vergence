@@ -2,25 +2,26 @@
 //! the pairing port, open only while the person has asked to pair. The window shows the code
 //! and the device's name, with Pair and Decline.
 //!
-//! A paired device keeps its record (its token and grants) in `devices.json`, and the
-//! coordinator gets a `play` token for it. Until the chunk API runs over the paired TLS-PSK
-//! channel, that token is the interim the plan allows: a bearer token over HTTP on the LAN. It
-//! is *derived* from the device's pairing token, never the pairing token itself (which keys
-//! the PSK channel and mustn't cross the network):
+//! A paired device keeps its record (its token and grants) in `devices.json`. From then on it
+//! reaches the coordinator over the paired TLS-PSK channel, keyed from that token
+//! (`vergence_coordinator::paired`, port 8421), which reads `devices.json` itself. It may also
+//! use the plain HTTP port with a bearer token *derived* from its pairing token, never the
+//! pairing token itself (which keys the PSK channel and mustn't cross the network):
 //!
 //! ```text
 //! http token = hex(HKDF-SHA256(ikm: pairing token (UTF-8), salt: "Vergence-HTTP-Token-v1",
 //!                              info: device id (UTF-8), 32 bytes))
 //! ```
-//! so a device computes it itself from its grant, and nothing else has to reach it.
+//! so a device computes it itself from its grant, and nothing else has to reach it. The
+//! coordinator also keeps that token's hash as `device-<id>`, for copies of the coordinator that
+//! predate reading `devices.json`.
 
-use std::net::{TcpListener, UdpSocket};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -36,15 +37,12 @@ const OPEN_FOR: Duration = Duration::from_secs(300);
 
 /// Vergence's own namespace, so a Longwave companion and Vergence never answer each other.
 pub fn namespace() -> Namespace {
-    Namespace::new("vergence", "Vergence", "vergence", 4869, "Vergence")
+    vergence_coordinator::paired::namespace()
 }
 
 /// The bearer token a paired device uses with the coordinator over HTTP (see the module docs).
 pub fn http_token(record: &DeviceRecord) -> String {
-    let hk = Hkdf::<Sha256>::new(Some(b"Vergence-HTTP-Token-v1"), record.token.as_bytes());
-    let mut out = [0u8; 32];
-    hk.expand(record.device_id.as_bytes(), &mut out).expect("32 bytes is a valid length");
-    out.iter().map(|b| format!("{b:02x}")).collect()
+    vergence_coordinator::paired::http_token(&record.token, &record.device_id)
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -346,11 +344,7 @@ pub fn computer_name() -> String {
 
 /// The LAN address the default route leaves from (no packet is sent).
 pub fn lan_addresses() -> Vec<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("192.0.2.1:9").map(|()| s));
-    match socket.and_then(|s| s.local_addr()) {
-        Ok(addr) if !addr.ip().is_unspecified() && !addr.ip().is_loopback() => vec![addr.ip().to_string()],
-        _ => Vec::new(),
-    }
+    vergence_coordinator::paired::lan_addresses()
 }
 
 #[cfg(test)]
@@ -386,7 +380,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
         let coordinator = Arc::new(CoordinatorHost::new(paths.clone()));
-        let settings = crate::settings::Settings { port: free_port(), ..Default::default() };
+        let settings = crate::settings::Settings { port: free_port(), paired_port: free_port(), ..Default::default() };
         coordinator.start(&settings).await.unwrap();
         let pairing = Arc::new(Pairing::new(paths.clone(), coordinator.clone()));
         let port = free_port();
@@ -438,6 +432,32 @@ mod tests {
         assert_eq!(state.tokens.read().unwrap().check(&http_token(&record), Grant::Play), Some("device-HS-1"));
         assert_eq!(state.tokens.read().unwrap().check(&http_token(&record), Grant::Work), None);
         assert_eq!(state.tokens.read().unwrap().check(&grant.token, Grant::Play), None);
+        // And it reaches the coordinator over the paired TLS-PSK channel, with its play grant.
+        let paired_port = settings.paired_port;
+        let token = grant.token.clone();
+        let (health, queue) = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let credential = vergence_companion::Credential::new(token, Some("HS-1".into()));
+            let client = vergence_companion::tls::PskClient::new(&vergence_coordinator::paired::channel(), &credential).unwrap();
+            let get = |path: &str| {
+                let tcp = std::net::TcpStream::connect(("127.0.0.1", paired_port)).unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut tls = client.connect(tcp).unwrap();
+                write!(tls, "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+                let mut out = Vec::new();
+                let _ = tls.read_to_end(&mut out);
+                String::from_utf8_lossy(&out).to_string()
+            };
+            let health = get("/v1/titles/jellyfin/x/smooth-motion-3d");
+            let queue = get("/v1/queue");
+            (health, queue)
+        })
+        .await
+        .unwrap();
+        assert!(health.starts_with("HTTP/1.1 404"), "{health}");
+        assert!(health.contains("\"state\":\"none\""), "{health}");
+        assert!(queue.starts_with("HTTP/1.1 403"), "{queue}");
+
         let devices = pairing.devices();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0]["token"], "device-HS-1");
