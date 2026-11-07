@@ -25,6 +25,10 @@ It contains no AACS or BD+ code.
 | `VergenceApple` | The Apple-framework half: spatial video making and inspection (`SpatialVideoMaker`, `SpatialVideoInspector`), realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox, Smooth Motion (frame interpolation, and `StereoFlowAnalyzer`: the flow and disparity models with Core ML). Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
 | `vergence` | The command line tool. | macOS, Linux (disc commands only, without PNG or audio output) |
 | `VergenceCommandLine` | The tool's option parsing and output names, apart from the executable so its tests can import them (not a product). Foundation only. | Apple platforms, Linux (tested) |
+| `coordinator/` (Rust) | `vergenced`, the analysis coordinator: queues work for Jellyfin and Stash titles in 2 s pieces, nearest a player's playhead first, checks and keeps workers' results, serves them in 10 s chunks. | macOS, Linux, Windows |
+| `companion/` (Rust) | RAVECompanion pairing (six-digit code, per-device keys, TLS-PSK), byte-compatible with the Swift and C# implementations. | macOS, Linux, Windows |
+| `worker/` (Rust) | `vergence-worker`, the analysis worker on ONNX Runtime (CUDA, TensorRT, DirectML, Core ML, CPU) for PCs. | Windows, Linux, macOS |
+| `desktop/` (Rust, Tauri) | The Vergence desktop app: the coordinator, pairing, a worker and file conversion in one tray app. | macOS (Windows planned) |
 
 No consumer platform ships an MVC decoder: Apple's VideoToolbox, Android's MediaCodec and FFmpeg
 all decode only the base view of a 3D Blu-ray and silently drop the second eye. Vergence reads both
@@ -328,6 +332,31 @@ for checking it against the PyTorch reference; about 2 ms a 1080p pair on an M2 
 ffmpeg -i clip.mkv -f rawvideo -pix_fmt bgra - \
   | .build/release/vergence interpolate --raw 1920x1080 - --fields clip.vgat -o clip-mid.bgra
 ```
+
+### Analysis workers
+
+Other machines can make a title's analysis while it plays, so a headset only presents (the design
+is Convolution's `docs/plans/analysis-workers.md`). `vergenced` (`coordinator/`) knows each
+title from Jellyfin or Stash and hands it out in 2 s pieces: first the 30 s ahead of whoever is
+watching, then the rest of that title, then the library. Workers read the media from the server
+themselves, with their own credentials, and upload only the records. Players read 10 s chunks
+while they fill; the Jellyfin plugin's `SmoothMotion/` routes are served too.
+
+```sh
+cargo build --release -p vergence-coordinator
+target/release/vergenced token add vision-pro --grants play --config vergenced.json   # prints a token once
+target/release/vergenced token add mac --grants work --config vergenced.json
+target/release/vergenced serve --config vergenced.json       # config format: coordinator/src/config.rs
+.build/release/vergence worker --config worker.json          # a Mac (Core ML); format: Sources/VergenceCLI/Worker.swift
+target/release/vergence-worker --config worker.json          # a PC (ONNX Runtime), same format
+```
+
+A Mac worker gives the same records as `vergence analyze` over the whole file (disparity
+identical, flow within Core ML's run-to-run noise; `scripts/check-worker.sh`), at about 37 fps
+for 1080p 3D on an M2 Max. The ONNX worker agrees on disparity; its RIFE flow differs from Core
+ML's float16 run, so its titles use their own profile (`scripts/check-onnx-worker.sh`). The
+desktop app (`desktop/`, `cargo run -p vergence-desktop`) runs the coordinator, pairs headsets,
+runs a worker and converts files to AI 3D side by side, from one tray icon.
 
 ## Library
 
