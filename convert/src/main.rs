@@ -57,11 +57,11 @@
 //! VERGENCE_UPSCALE_MODEL names one): a 2D source is upscaled and then made
 //! 3D from depth (depth still at the source's size), or with `--layout 2d`
 //! only upscaled (`VIDEO.2x.mp4`); a side-by-side or top-and-bottom source
-//! (declared by the file or named so; `--input-layout` says it otherwise) has
-//! each eye upscaled with their fine detail brought into agreement, no depth,
-//! packed as `--layout` says (`VIDEO.2x.3D.FSBS.mp4`). Unlike the Mac this
-//! doesn't look at the picture to find a 3D source, and runs an eye in one
-//! piece (no tiles).
+//! (declared by the file, or seen in its picture and name as the Mac sees
+//! them, `layout.rs`; `--input-layout` says it otherwise) has each eye
+//! upscaled with their fine detail brought into agreement, no depth, packed
+//! as `--layout` says (`VIDEO.2x.3D.FSBS.mp4`). Unlike the Mac it runs an
+//! eye in one piece (no tiles).
 //!
 //! A video that repeats one frame in five (`repeats.rs`) has the repeats
 //! dropped by ffmpeg's decimate in every pass, at four fifths of the rate,
@@ -78,7 +78,7 @@
 mod mp4;
 mod options;
 
-use vergence_convert::{decode, depth, gpu, maths, model, repeats, upscale};
+use vergence_convert::{decode, depth, gpu, layout, maths, model, repeats, upscale};
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -454,9 +454,24 @@ fn convert_one(input: &Path, output: &Path, o: &Options, cx: &Context) -> Result
         "auto" => match declared {
             Some(kind) => Some((Packing { side_by_side: kind == "side by side", half: false }.corrected(width, height),
                                 "declared by the file".to_string())),
-            None if upscaling => named_packing(&file).map(|(packing, explicit)| {
-                (if explicit { packing } else { packing.corrected(width, height) }, "the file name says so".to_string())
-            }),
+            // The picture, as the Mac reads it, then the name; the picture wins when they disagree.
+            None if upscaling => {
+                let named = named_packing(&file);
+                let picture = layout::detect(cx.tools, input, &probe);
+                match (picture, named) {
+                    (Some(sbs), Some((packing, explicit))) if packing.side_by_side == sbs => Some((
+                        if explicit { packing } else { packing.corrected(width, height) },
+                        "the file name says so, and the picture agrees".to_string(),
+                    )),
+                    (Some(sbs), _) => Some((Packing { side_by_side: sbs, half: false }.corrected(width, height),
+                                            format!("the picture's halves match {}", if sbs { "side by side" } else { "over-under" }))),
+                    (None, Some((packing, explicit))) => Some((
+                        if explicit { packing } else { packing.corrected(width, height) },
+                        "the file name says so".to_string(),
+                    )),
+                    (None, None) => None,
+                }
+            }
             None => None,
         },
         "2d" => None,

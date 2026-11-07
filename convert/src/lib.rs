@@ -5,6 +5,7 @@
 
 pub mod checkpoint;
 pub mod decode;
+pub mod layout;
 pub mod depth;
 pub mod gpu;
 pub mod licence;

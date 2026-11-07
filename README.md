@@ -312,8 +312,8 @@ ONNX Runtime. `--upscale-model PATH` (or `VERGENCE_UPSCALE_MODEL`) takes another
 
 - **A 2D source** is upscaled in the picture pass and then warped from depth as before (depth is
   still made at the source's size), or with `--layout 2d` only upscaled.
-- **A side-by-side or top-and-bottom source** (declared by the file, named so, or on the Mac seen in
-  its picture; `--input-layout sbs|hsbs|tab|htab|2d` to say) has each eye upscaled, with no depth,
+- **A side-by-side or top-and-bottom source** (declared by the file, named so, or seen in its picture;
+  `--input-layout sbs|hsbs|tab|htab|2d` to say) has each eye upscaled, with no depth,
   and packed as `--layout` asks (full or half side by side, top and bottom, or spatial video on the
   Mac). A half-width eye is stretched back to its real shape first. Then the eyes' fine detail is
   brought into agreement: an upscaler run on each eye alone invents texture in each on its own, so
