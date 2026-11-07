@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vergence</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="logo" aria-hidden="true"></span>Vergence</div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="library" class="active">Library &amp; Queue</button>
+      <button role="tab" data-tab="convert">Convert</button>
+      <button role="tab" data-tab="headsets">Headsets</button>
+      <button role="tab" data-tab="settings">Settings</button>
+    </nav>
+    <div id="status-pill" class="pill">…</div>
+  </header>
+
+  <main>
+    <!-- Library & Queue -->
+    <section id="tab-library" class="tab active">
+      <div class="row">
+        <div class="card grow">
+          <div class="card-head">
+            <h2>Analysis queue</h2>
+            <div class="actions">
+              <button id="scan-now">Scan libraries now</button>
+            </div>
+          </div>
+          <p id="coordinator-line" class="muted"></p>
+          <p id="scan-line" class="muted small"></p>
+          <table class="list" id="titles">
+            <thead><tr><th>Title</th><th>State</th><th class="w-progress">Progress</th><th>Pieces</th><th>Size</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <p id="titles-empty" class="empty">Nothing queued. A headset playing a 3D title queues it, or scan your libraries.</p>
+        </div>
+      </div>
+      <div class="row">
+        <div class="card grow">
+          <h3>Workers</h3>
+          <ul id="workers" class="plain"></ul>
+          <h3>Leases</h3>
+          <ul id="leases" class="plain"></ul>
+          <h3>Playing now</h3>
+          <ul id="playheads" class="plain"></ul>
+        </div>
+        <div class="card grow">
+          <div class="card-head">
+            <h2>This computer's worker</h2>
+            <div class="actions">
+              <button id="worker-start" class="primary">Start</button>
+              <button id="worker-stop">Stop</button>
+            </div>
+          </div>
+          <p id="worker-line" class="muted small"></p>
+          <pre id="worker-log" class="log"></pre>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Tokens</h2></div>
+        <p class="muted small">For players and workers that don't pair: a <b>play</b> token fetches analysis and reports the playhead, a <b>work</b> token claims pieces. A token is shown once.</p>
+        <form id="token-form" class="inline">
+          <input id="token-name" placeholder="Name, e.g. living-room-pc" maxlength="64" required>
+          <select id="token-grant"><option value="play">play</option><option value="work">work</option></select>
+          <button type="submit">Create token</button>
+        </form>
+        <div id="token-new" class="reveal hidden">
+          <div>Token for <b id="token-new-name"></b>, shown only now:</div>
+          <div class="copyrow"><input id="token-new-value" readonly><button id="token-copy">Copy</button><button id="token-hide">Done</button></div>
+        </div>
+        <table class="list" id="tokens"><thead><tr><th>Name</th><th>Grants</th><th></th></tr></thead><tbody></tbody></table>
+      </div>
+    </section>
+
+    <!-- Convert -->
+    <section id="tab-convert" class="tab">
+      <div id="convert-unavailable" class="notice hidden"></div>
+      <div class="row">
+        <div class="card drop grow" id="drop">
+          <div class="drop-icon" aria-hidden="true"></div>
+          <div class="drop-title">Drop videos or folders here</div>
+          <div class="muted small">Each becomes an AI 3D copy that 3D players read (a Quest's player, Skybox, Jellyfin, a 3D TV).</div>
+          <div class="actions center">
+            <button id="add-files" class="primary">Add Files…</button>
+            <button id="add-folder">Add Folder…</button>
+          </div>
+        </div>
+        <div class="card options">
+          <h3>Options</h3>
+          <label>Layout
+            <select id="opt-layout">
+              <option value="fsbs">Full side by side</option>
+              <option value="hsbs">Half side by side</option>
+              <option value="tab">Top and bottom</option>
+              <option value="htab">Half top and bottom</option>
+              <option value="spatial">Spatial video (MV-HEVC)</option>
+            </select>
+          </label>
+          <label>Strength <span class="muted small">share of the width, 0–0.05</span>
+            <input id="opt-strength" type="number" min="0" max="0.05" step="0.001" placeholder="Default (Subtle)">
+          </label>
+          <label>Convergence <span class="muted small">0–1, 1 puts the nearest on the screen</span>
+            <input id="opt-convergence" type="number" min="0" max="1" step="0.05" placeholder="Default">
+          </label>
+          <label class="check"><input id="opt-sample" type="checkbox"> <span>Only a <span id="sample-seconds">10</span> s sample</span></label>
+          <label class="check"><input id="opt-force" type="checkbox"> <span>Redo files already converted</span></label>
+          <div class="outrow">
+            <div><div class="small muted">Copies go</div><div id="out-dir">Beside the original</div></div>
+            <div class="actions"><button id="out-pick">Choose…</button><button id="out-beside">Beside</button></div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <h2>Conversions</h2>
+          <div class="actions"><button id="clear-finished">Clear Finished</button></div>
+        </div>
+        <ul id="jobs" class="jobs"></ul>
+        <p id="jobs-empty" class="empty">Nothing to convert yet.</p>
+        <p id="cli-line" class="muted small"></p>
+      </div>
+    </section>
+
+    <!-- Headsets -->
+    <section id="tab-headsets" class="tab">
+      <div class="card">
+        <div class="card-head">
+          <h2>Pair a headset</h2>
+          <div class="actions">
+            <button id="pair-start" class="primary">Pair a Headset</button>
+            <button id="pair-stop">Stop</button>
+          </div>
+        </div>
+        <p class="muted small">Pair once: the headset shows a six-digit code, and this window shows the same one. Paired headsets get a <b>play</b> token for this coordinator. For now they reach it over HTTP on your network, so turn on <i>Listen on the network</i> in Settings.</p>
+        <div id="pair-open" class="hidden">
+          <p>Waiting for a headset on port <b id="pair-port"></b><span id="pair-addresses"></span>.</p>
+          <div class="copyrow"><input id="pair-link" readonly><button id="pair-link-copy">Copy Link</button></div>
+        </div>
+        <div id="pair-waiting" class="code-card hidden">
+          <div class="small muted"><span id="pair-device"></span> wants to pair. Does it show this code?</div>
+          <div id="pair-code" class="code"></div>
+          <div class="actions center">
+            <button id="pair-yes" class="primary">Pair</button>
+            <button id="pair-no">Decline</button>
+          </div>
+        </div>
+        <p id="pair-last" class="muted"></p>
+      </div>
+      <div class="card">
+        <h2>Paired headsets</h2>
+        <table class="list" id="devices"><thead><tr><th>Name</th><th>Grants</th><th>Paired</th><th></th></tr></thead><tbody></tbody></table>
+        <p id="devices-empty" class="empty">None yet.</p>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section id="tab-settings" class="tab">
+      <form id="settings-form">
+        <div class="row">
+          <div class="card grow">
+            <h2>Media servers</h2>
+            <p class="muted small">Keys stay in this app (in files only you can read) and are never shown again.</p>
+            <fieldset>
+              <legend>Jellyfin</legend>
+              <label>Address <input id="jf-url" placeholder="http://192.168.1.10:8096"></label>
+              <label>API key <input id="jf-key" type="password" autocomplete="off"></label>
+              <div class="actions"><button type="button" id="jf-test">Test</button><button type="button" id="jf-forget">Remove Key</button><span id="jf-result" class="small"></span></div>
+            </fieldset>
+            <fieldset>
+              <legend>Stash</legend>
+              <label>Address <input id="st-url" placeholder="http://192.168.1.10:9999"></label>
+              <label>API key <input id="st-key" type="password" autocomplete="off"></label>
+              <div class="actions"><button type="button" id="st-test">Test</button><button type="button" id="st-forget">Remove Key</button><span id="st-result" class="small"></span></div>
+            </fieldset>
+            <label class="check"><input id="scan" type="checkbox"> <span>Queue every 3D title the servers list, every <input id="scan-hours" type="number" min="1" max="168" class="tiny"> hours</span></label>
+          </div>
+          <div class="card grow">
+            <h2>Coordinator</h2>
+            <label>Port <input id="port" type="number" min="1024" max="65535" class="short"></label>
+            <label class="check"><input id="lan" type="checkbox"> <span>Listen on the network (headsets and other workers), not just this computer</span></label>
+            <h2>Worker</h2>
+            <div class="outrow">
+              <div><div class="small muted">Interpolation models</div><div id="models-folder">Not chosen</div></div>
+              <div class="actions"><button type="button" id="models-pick">Choose…</button></div>
+            </div>
+            <label>Worker name <input id="worker-name" placeholder="This computer's name"></label>
+            <label class="check"><input id="worker-at-start" type="checkbox"> <span>Start the worker with the app</span></label>
+            <label>vergence command line <input id="cli-path" placeholder="Found by itself"></label>
+            <label>Depth model for conversions <input id="depth-model" placeholder="The installed one (downloaded once if none)"></label>
+            <h2>App</h2>
+            <label class="check"><input id="login" type="checkbox"> <span>Open at login, in the menu bar</span></label>
+            <label class="check"><input id="updates" type="checkbox"> <span>Check for updates</span></label>
+            <div class="actions"><button type="button" id="update-check">Check Now</button><span id="update-line" class="small muted"></span></div>
+            <p id="data-dir" class="muted small"></p>
+            <div class="actions"><button type="button" id="quit">Quit Vergence</button><span class="small muted">Closing the window keeps it running in the menu bar.</span></div>
+          </div>
+        </div>
+        <div class="savebar">
+          <span id="settings-result" class="small"></span>
+          <button type="submit" class="primary">Save</button>
+        </div>
+      </form>
+    </section>
+  </main>
+  <div id="toast" class="toast hidden"></div>
+</body>
+</html>

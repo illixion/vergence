@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window: core events only. Files are picked, dropped and opened through Rust (dialogs and drops are handled there), so the page gets no dialog, opener or filesystem permission of its own.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}

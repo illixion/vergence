@@ -1,0 +1,12 @@
+# Vergence release signers, in ssh-keygen allowed_signers format.
+#
+# PLACEHOLDER: Vergence has no releases yet, so no key is pinned and the updater (off by
+# default) can verify nothing. When releases start:
+#   - sign each release's SHA256SUMS with `ssh-keygen -Y sign -n vergence-release`;
+#   - pin the signing key and an offline backup here, both from the first release that ships
+#     this file (a backup added later is worthless: nothing installed would trust it);
+#   - set `updater::SITE` to the site serving release.json.
+#
+# The structure is Apparition's (MIT, same author): its desktop updater and release manifest
+# verification, adapted. Lines look like:
+# releases@example.invalid ssh-ed25519 AAAA...
