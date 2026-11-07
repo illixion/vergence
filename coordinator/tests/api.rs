@@ -122,6 +122,7 @@ fn piece(lease: &Value, width: u32) -> Vec<u8> {
         models: [("flowPair".into(), "RIFE 480x288".into()), ("disparity".into(), "NeuFlow 512x288".into())].into(),
         source_width: width,
         source_height: 1080,
+        video_end_frame: None,
     });
     let (first, end, count) =
         (lease["firstFrame"].as_i64().unwrap(), lease["endFrame"].as_i64().unwrap(), lease["frameCount"].as_i64().unwrap());

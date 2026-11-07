@@ -124,6 +124,7 @@ impl Store {
             models: title.profile.clone().unwrap_or_default(),
             source_width: w,
             source_height: h,
+            video_end_frame: None,
         }
     }
 

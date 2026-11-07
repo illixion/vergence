@@ -327,13 +327,19 @@ public struct AnalysisTrackHeader: Codable, Sendable, Equatable {
     /// from the record's size to its own.
     public var sourceWidth: Int
     public var sourceHeight: Int
+    /// A worker's piece only: the video stream ended at this frame
+    /// (exclusive), before the piece did (a container whose audio runs past
+    /// its picture), so the coordinator can end the title there.
+    public var videoEndFrame: Int64?
 
-    public init(mediaID: String, producer: String, models: [String: String] = [:], sourceWidth: Int, sourceHeight: Int) {
+    public init(mediaID: String, producer: String, models: [String: String] = [:], sourceWidth: Int, sourceHeight: Int,
+                videoEndFrame: Int64? = nil) {
         self.mediaID = mediaID
         self.producer = producer
         self.models = models
         self.sourceWidth = sourceWidth
         self.sourceHeight = sourceHeight
+        self.videoEndFrame = videoEndFrame
     }
 }
 

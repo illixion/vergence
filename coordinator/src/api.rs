@@ -456,7 +456,18 @@ async fn result(
     })?;
     let bytes = state.store.save_piece(&key, piece, &body, &parsed).map_err(internal)?;
     let size = (parsed.header.source_width, parsed.header.source_height);
-    state.queue.lock().expect("queue lock").complete(lease, size, Instant::now());
+    let completed = state.queue.lock().expect("queue lock").complete(lease, size, parsed.header.video_end_frame, Instant::now());
+    // Pieces past where the video ends hold nothing; they are stored empty so their chunks serve.
+    if let Some((_, _, emptied)) = completed {
+        let empty = track::write_header(&parsed.header);
+        let none = track::parse(&empty).map_err(internal)?;
+        for i in emptied {
+            state.store.save_piece(&key, i, &empty, &none).map_err(internal)?;
+        }
+        if let Some(end) = parsed.header.video_end_frame {
+            tracing::info!(title = %key, end, "the video stream ends before the container: the title ends there");
+        }
+    }
     state.save_meta(&key)?;
     tracing::debug!(title = %key, piece, bytes, "piece done");
     Ok(Json(state.status_json(&key)).into_response())

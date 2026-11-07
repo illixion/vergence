@@ -161,9 +161,10 @@ struct PieceDecoder {
         try process.run()
         defer { if process.isRunning { process.terminate() } }
 
-        let header = AnalysisTrackHeader(mediaID: mediaID, producer: producerName, models: producer.models,
+        var header = AnalysisTrackHeader(mediaID: mediaID, producer: producerName, models: producer.models,
                                          sourceWidth: eyeW, sourceHeight: eyeH)
-        var track = try AnalysisTrack.header(header)
+        // The records; the header goes in front once it is known whether the video ended early.
+        var track = Data()
         func append(_ records: [AnalysisRecord]) throws {
             for record in records { track.append(AnalysisTrack.record(try record.deflated())) }
         }
@@ -193,11 +194,15 @@ struct PieceDecoder {
         errors.fileHandleForReading.readabilityHandler = nil
         let decodedPiece = min(index, piece.upperBound) - piece.lowerBound
         let reference = frameCount == Int64.max
-        guard reference ? decodedPiece > 0 : decodedPiece >= piece.count else {
+        // ffmpeg finished cleanly short of the piece: the video stream ends here (the coordinator
+        // takes that only near the title's end, where a container's audio often outlasts its picture).
+        let endedEarly = !reference && decodedPiece < piece.count && process.terminationStatus == 0 && index > piece.lowerBound
+        guard reference ? decodedPiece > 0 : decodedPiece >= piece.count || endedEarly else {
             throw WorkerFailure("ffmpeg gave \(index - first) of \(wanted) frames (\(process.terminationStatus)): \(messages.text.prefix(300))")
         }
+        if endedEarly { header.videoEndFrame = index }
         try append(producer.finish(piece: piece.lowerBound ..< min(piece.upperBound, index)))
-        return track
+        return try AnalysisTrack.header(header) + track
     }
 
     static func whole(base: UnsafePointer<UInt8>, width w: Int, height h: Int) -> [AnalysisPlane] {
@@ -400,6 +405,27 @@ final class DepthProducer: PieceFileProducer {
         return nil
     }
 
+    /// ffmpeg's arguments for a piece's intermediate: `wanted` frames from
+    /// frame `first`, at most 1036 px, ProRes, frame k at exactly k / rate.
+    static func intermediateArguments(input: PieceInput, first: Int64, wanted: Int64, into intermediate: URL) -> [String] {
+        let rate = Double(input.rate.num) / Double(input.rate.den)
+        let seek = (Double(first) - 0.5) / rate
+        var args = ["-nostdin", "-v", "error"]
+        if input.codec.lowercased() == "h264" { args += ["-bsf:v", "filter_units=remove_types=6"] }
+        if seek > 0 { args += ["-ss", String(format: "%.6f", seek)] }
+        args += ["-i", input.url, "-map", "0:v:0", "-fps_mode", "passthrough"]
+        if wanted < Int64(Int32.max) { args += ["-frames:v", String(wanted)] }
+        // Frame k of the intermediate is shown at k / rate, exactly: a Matroska source's millisecond
+        // timestamps, passed through, came out uneven (two frames 0.08 ms apart), and the depth pass,
+        // which reads the file by time, then lost a quarter of a piece's frames.
+        let timing = "setpts=N*\(input.rate.den)/\(input.rate.num)/TB"
+        args += ["-vf", "\(timing),scale='min(iw,1036)':'min(ih,1036)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                 "-video_track_timescale", "\(input.rate.num)",
+                 "-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le", "-an", "-sn", "-dn",
+                 "-y", intermediate.path]
+        return args
+    }
+
     func track(of input: PieceInput, frames piece: Range<Int64>, frameCount: Int64, ffmpeg: String?,
                mediaID: String, producerName: String) async throws -> Data {
         guard input.stereo == "mono" else { throw WorkerFailure("the title is stereo; AI 3D depth is for 2D") }
@@ -414,15 +440,7 @@ final class DepthProducer: PieceFileProducer {
         defer { try? FileManager.default.removeItem(at: work) }
         let intermediate = work.appendingPathComponent("piece.mov")
 
-        let seek = (Double(first) - 0.5) / rate
-        var args = ["-nostdin", "-v", "error"]
-        if input.codec.lowercased() == "h264" { args += ["-bsf:v", "filter_units=remove_types=6"] }
-        if seek > 0 { args += ["-ss", String(format: "%.6f", seek)] }
-        args += ["-i", input.url, "-map", "0:v:0", "-fps_mode", "passthrough"]
-        if wanted < Int64(Int32.max) { args += ["-frames:v", String(wanted)] }
-        args += ["-vf", "scale='min(iw,1036)':'min(ih,1036)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-                 "-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le", "-an", "-sn", "-dn",
-                 "-y", intermediate.path]
+        let args = Self.intermediateArguments(input: input, first: first, wanted: wanted, into: intermediate)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ffmpeg ?? "/usr/bin/env")
         process.arguments = ffmpeg == nil ? ["ffmpeg"] + args : args
@@ -442,18 +460,30 @@ final class DepthProducer: PieceFileProducer {
         let entry = try await OfflineDepthConversion.convert(video: intermediate, into: work.appendingPathComponent("depth"),
                                                              model: model)
         let records = try await OfflineDepthConversion.records(entry)
+        // The intermediate's frame at k / rate is the title's frame first + k.
+        var byIndex: [Int64: AnalysisRecord] = [:]
+        for record in records {
+            let k = Int64((record.time.seconds * rate).rounded())
+            byIndex[first + k] = byIndex[first + k] ?? record
+        }
+        let inPiece = byIndex.keys.filter { piece.contains($0) }.count
         let reference = frameCount == Int64.max
-        guard reference || Int64(records.count) >= min(piece.upperBound, last) - first else {
-            throw WorkerFailure("the depth pass gave \(records.count) of \(wanted) frames")
+        let expected = min(piece.upperBound, last) - piece.lowerBound
+        // The intermediate (written by an ffmpeg that finished cleanly) ran out inside the piece:
+        // the video stream ends there.
+        let decodedEnd = (byIndex.keys.max() ?? first - 1) + 1
+        let endedEarly = !reference && Int64(inPiece) < expected && decodedEnd > piece.lowerBound
+            && Int64(byIndex.count) == decodedEnd - first
+        guard reference || Int64(inPiece) >= expected || endedEarly else {
+            throw WorkerFailure("the depth pass gave \(inPiece) of the piece's \(expected) frames (\(records.count) of \(wanted) decoded)")
         }
         let header = AnalysisTrackHeader(mediaID: mediaID, producer: producerName, models: models,
-                                         sourceWidth: input.width, sourceHeight: input.height)
+                                         sourceWidth: input.width, sourceHeight: input.height,
+                                         videoEndFrame: endedEarly ? decodedEnd : nil)
         var track = try AnalysisTrack.header(header)
-        // The intermediate's k-th frame is the title's frame first + k.
-        for (k, record) in records.enumerated() {
-            let index = first + Int64(k)
-            guard piece.contains(index) else { continue }
-            var record = record
+        for index in byIndex.keys.sorted() {
+            guard piece.contains(index), let found = byIndex[index] else { continue }
+            var record = found
             record.time = AnalysisTime(value: index * Int64(input.rate.den), timescale: Int32(input.rate.num))
             record.endTime = record.time
             track.append(AnalysisTrack.record(try record.deflated()))

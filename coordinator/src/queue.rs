@@ -104,6 +104,9 @@ pub struct Title {
     /// Added order, for backfill.
     pub ordinal: u64,
     pub pieces: Vec<PieceState>,
+    /// Where the video stream really ends, when a worker found it shorter
+    /// than the container (whose duration the servers report).
+    pub video_frames: Option<i64>,
 }
 
 /// What a title's results are stored and served as.
@@ -117,6 +120,8 @@ pub struct TitleMeta {
     pub profile: Option<Profile>,
     pub source_size: Option<(u32, u32)>,
     pub ordinal: u64,
+    #[serde(default)]
+    pub video_frames: Option<i64>,
 }
 
 impl Title {
@@ -133,6 +138,7 @@ impl Title {
             profile: self.profile.clone(),
             source_size: self.source_size,
             ordinal: self.ordinal,
+            video_frames: self.video_frames,
         }
     }
 
@@ -144,9 +150,19 @@ impl Title {
         self.pieces.len().div_ceil(PIECES_PER_CHUNK)
     }
 
-    /// Frames in the whole title.
+    /// Frames in the whole title: the container's duration at the frame
+    /// rate, or where the video stream turned out to end.
     pub fn frame_count(&self) -> i64 {
-        (self.info.duration_seconds * self.info.frame_rate.fps()).round() as i64
+        let nominal = (self.info.duration_seconds * self.info.frame_rate.fps()).round() as i64;
+        self.video_frames.map_or(nominal, |end| end.min(nominal))
+    }
+
+    /// How far before the container's end a worker may say the video ended:
+    /// a picture shorter than its audio by a few seconds is common, a claim
+    /// further back is a decode that failed and is refused.
+    pub fn video_end_window(&self) -> i64 {
+        let nominal = (self.info.duration_seconds * self.info.frame_rate.fps()).round() as i64;
+        ((10.0 * self.info.frame_rate.fps()).round() as i64).max(nominal / 50)
     }
 
     /// The frame indices piece `i` holds: frames whose time is in [2i, 2i+2).
@@ -280,6 +296,8 @@ pub enum UploadError {
     Eye(&'static str),
     #[error("{0} records differ in size or channels within the piece")]
     Shape(&'static str),
+    #[error("the video can't end at frame {0}: outside the piece, or too far before the title's end")]
+    VideoEnd(i64),
 }
 
 #[derive(Debug, PartialEq)]
@@ -345,6 +363,7 @@ impl Queue {
                 source_size: meta.source_size,
                 ordinal: meta.ordinal,
                 pieces,
+                video_frames: meta.video_frames,
             },
         );
     }
@@ -380,6 +399,7 @@ impl Queue {
             title.info = info;
             title.profile = None;
             title.source_size = None;
+            title.video_frames = None;
             self.leases.retain(|_, l| l.title != key);
             return Ok(AddOutcome::Reset);
         }
@@ -388,7 +408,17 @@ impl Queue {
         self.next_ordinal += 1;
         self.titles.insert(
             key.clone(),
-            Title { key, source, workload: workload.clone(), info, profile: None, source_size: None, ordinal, pieces },
+            Title {
+                key,
+                source,
+                workload: workload.clone(),
+                info,
+                profile: None,
+                source_size: None,
+                ordinal,
+                pieces,
+                video_frames: None,
+            },
         );
         Ok(AddOutcome::Added)
     }
@@ -576,7 +606,17 @@ impl Queue {
         {
             return Err(UploadError::SourceSize);
         }
-        let frames = title.piece_frames(state.piece);
+        let mut frames = title.piece_frames(state.piece);
+        // A worker whose decode ended inside the piece says where the video stream ends; near the
+        // container's end that is a picture shorter than its audio, and the piece holds what there is.
+        let mut title_end = title.frame_count();
+        if let Some(end) = track.header.video_end_frame {
+            if end < frames.start || end >= frames.end || end < title_end - title.video_end_window() {
+                return Err(UploadError::VideoEnd(end));
+            }
+            frames.end = end;
+            title_end = end;
+        }
         let fps = title.info.frame_rate.fps();
         let mut counts: BTreeMap<Kind, usize> = BTreeMap::new();
         let mut shapes: BTreeMap<Kind, (u8, u16, u16)> = BTreeMap::new();
@@ -602,7 +642,7 @@ impl Queue {
         let frames_here = frames.end - frames.start;
         for kind in &title.workload.kinds {
             // A flow pair needs the next frame: the title's last frame has none.
-            let expected = if kind.is_pair() && frames.end >= title.frame_count() { frames_here - 1 } else { frames_here };
+            let expected = if kind.is_pair() && frames.end >= title_end { frames_here - 1 } else { frames_here };
             let got = counts.get(kind).copied().unwrap_or(0);
             // Decoders can drop a frame or two at a cut or a seek point.
             if (got as i64) < (expected as f64 * 0.9).floor() as i64 - 1 || got as i64 > expected + 1 {
@@ -613,18 +653,33 @@ impl Queue {
     }
 
     /// Accepts a checked result: the piece is done (whoever else holds it).
-    pub fn complete(&mut self, lease: u64, source_size: (u32, u32), now: Instant) -> Option<(String, usize)> {
+    /// With `video_end`, the title ends there: later pieces hold no frames,
+    /// are done empty and are returned, for the caller to store as such.
+    pub fn complete(&mut self, lease: u64, source_size: (u32, u32), video_end: Option<i64>, now: Instant)
+                    -> Option<(String, usize, Vec<usize>)> {
         let state = self.leases.remove(&lease)?;
         self.leases.retain(|_, l| !(l.title == state.title && l.piece == state.piece));
         let title = self.titles.get_mut(&state.title)?;
         title.pieces[state.piece] = PieceState::Done;
         title.source_size.get_or_insert(source_size);
+        let mut emptied = Vec::new();
+        if let Some(end) = video_end {
+            title.video_frames = Some(title.video_frames.map_or(end, |known| known.min(end)));
+            for i in state.piece + 1..title.pieces.len() {
+                if title.piece_frames(i).is_empty() && title.pieces[i] != PieceState::Done {
+                    title.pieces[i] = PieceState::Done;
+                    emptied.push(i);
+                }
+            }
+            let key = state.title.clone();
+            self.leases.retain(|_, l| !(l.title == key && emptied.contains(&l.piece)));
+        }
         let stats = self.workers.entry(state.worker).or_default();
         let took = now.saturating_duration_since(state.granted).as_secs_f64();
         stats.piece_seconds = Some(stats.piece_seconds.map_or(took, |s| s * 0.7 + took * 0.3));
         stats.pieces += 1;
         stats.last_seen = Some(now);
-        Some((state.title, state.piece))
+        Some((state.title, state.piece, emptied))
     }
 
     pub fn status(&self, key: &str) -> Option<TitleStatus> {
@@ -733,6 +788,7 @@ mod tests {
             models: models(flow),
             source_width: 960,
             source_height: 1080,
+            video_end_frame: None,
         });
         for k in lease.first_frame..lease.end_frame {
             if k + 1 < lease.frame_count {
@@ -812,7 +868,7 @@ mod tests {
         assert_eq!(q.check(lease.lease, "a", &result(&lease, "RIFE 960x576")), Err(UploadError::Profile));
         let good = result(&lease, "RIFE 480x288");
         assert_eq!(q.check(lease.lease, "a", &good), Ok((key.clone(), 0)));
-        q.complete(lease.lease, (960, 1080), now);
+        q.complete(lease.lease, (960, 1080), None, now);
         assert_eq!(q.status(&key).unwrap().pieces_done, 1);
         assert_eq!(q.chunk_pieces(&key, 0), Some((vec![0], false)));
 
@@ -834,7 +890,7 @@ mod tests {
         let (mut q, key) = queue_with(4.0);
         let now = Instant::now();
         let lease = q.claim(&claim("a", false), now).unwrap();
-        q.complete(lease.lease, (960, 1080), now);
+        q.complete(lease.lease, (960, 1080), None, now);
         let mut replaced = info(4.0);
         replaced.identity = "b".into();
         assert_eq!(q.add(SourceRef::jellyfin("abc"), &Workload::defaults()[0], replaced), Ok(AddOutcome::Reset));
@@ -858,6 +914,7 @@ mod tests {
             models: [("flowPair".to_string(), flow.to_string())].into(),
             source_width: 1920,
             source_height: 1080,
+            video_end_frame: None,
         });
         for k in lease.first_frame..lease.end_frame {
             if k + 1 < lease.frame_count {
@@ -923,7 +980,7 @@ mod tests {
             short.extend(record(Kind::FlowPair, 0, k, k + 1, 24, 4, 2));
         }
         assert!(matches!(q.check(lease.lease, "a", &track::parse(&short).unwrap()), Err(UploadError::Count { .. })));
-        q.complete(lease.lease, (1920, 1080), now);
+        q.complete(lease.lease, (1920, 1080), None, now);
         assert_eq!(q.status(&key).unwrap().pieces_done, 1);
     }
 
@@ -948,6 +1005,7 @@ mod tests {
                 models: profile.clone(),
                 source_width: 1280,
                 source_height: 720,
+                video_end_frame: None,
             });
             for k in frames {
                 data.extend(record(Kind::Depth, eye, k, k, 24, 8, 4));
@@ -1013,6 +1071,7 @@ mod tests {
                 models: profile.clone(),
                 source_width: 1280,
                 source_height: 720,
+                video_end_frame: None,
             });
             for k in 0..48 {
                 data.extend(record(Kind::GainMap, 0, k, k, 24, if k == 47 { w } else { 16 }, h));
@@ -1022,5 +1081,52 @@ mod tests {
         // Every frame's grid, all the same shape (the record helper writes one channel).
         assert!(q.check(lease.lease, "a", &upload(16, 9)).is_ok());
         assert_eq!(q.check(lease.lease, "a", &upload(8, 9)), Err(UploadError::Shape("gainMap")));
+    }
+
+    #[test]
+    fn a_video_shorter_than_its_container_ends_the_title() {
+        // The 4K demo: 109.8 s by the container (2635 frames at 24), its picture 2548 frames.
+        let mut q = Queue::new();
+        let source = SourceRef::jellyfin("demo");
+        q.add(source.clone(), &workload(Workload::AI_3D_DEPTH), mono_info(109.8)).unwrap();
+        let key = Title::key_for(&source, Workload::AI_3D_DEPTH);
+        let now = Instant::now();
+        let profile: Profile = [("depth".to_string(), "DA2 Small".to_string())].into();
+        let worker = Claim { models: profile.clone(), ..claim("a", false) };
+        let leases: Vec<Lease> = std::iter::from_fn(|| q.claim(&worker, now)).collect();
+        assert_eq!(leases.len(), 55);
+        let upload = |frames: std::ops::Range<i64>, end: Option<i64>| {
+            let mut data = track::write_header(&Header {
+                media_id: "x".into(),
+                producer: "test".into(),
+                models: profile.clone(),
+                source_width: 1280,
+                source_height: 720,
+                video_end_frame: end,
+            });
+            for k in frames {
+                data.extend(record(Kind::Depth, 0, k, k, 24, 8, 4));
+            }
+            track::parse(&data).unwrap()
+        };
+        // A decode that stopped mid-film can't claim the end.
+        let middle = &leases[41];
+        assert_eq!(q.check(middle.lease, "a", &upload(1968..2000, Some(2000))), Err(UploadError::VideoEnd(2000)));
+        // Without the claim, the short last piece fails its count, as before.
+        let last = &leases[53];
+        assert_eq!((last.first_frame, last.end_frame), (2544, 2592));
+        assert!(matches!(q.check(last.lease, "a", &upload(2544..2548, None)), Err(UploadError::Count { .. })));
+        // With it, the piece holds the four frames there are, and the title ends at 2548.
+        assert!(q.check(last.lease, "a", &upload(2544..2548, Some(2548))).is_ok());
+        let (_, _, emptied) = q.complete(last.lease, (1280, 720), Some(2548), now).unwrap();
+        assert_eq!(emptied, vec![54]);
+        assert_eq!(q.title(&key).unwrap().frame_count(), 2548);
+        assert_eq!(q.title(&key).unwrap().meta().video_frames, Some(2548));
+        for lease in &leases[..53] {
+            let frames = lease.first_frame..lease.end_frame;
+            q.check(lease.lease, "a", &upload(frames, None)).unwrap();
+            q.complete(lease.lease, (1280, 720), None, now);
+        }
+        assert_eq!(q.status(&key).unwrap().state, "ready");
     }
 }

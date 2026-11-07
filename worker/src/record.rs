@@ -240,6 +240,21 @@ struct Header<'a> {
     source_height: u32,
 }
 
+/// `track` with its header saying the video stream ended at frame `end`
+/// (exclusive) inside the piece, which the coordinator takes near a title's
+/// end (a container whose audio outlasts its picture).
+pub fn with_video_end(track: Vec<u8>, end: i64) -> Vec<u8> {
+    let length = u32::from_le_bytes(track[5..9].try_into().expect("a header")) as usize;
+    let mut header: serde_json::Value = serde_json::from_slice(&track[9..9 + length]).expect("our own header");
+    header["videoEndFrame"] = serde_json::json!(end);
+    let json = serde_json::to_vec(&header).expect("a header always encodes");
+    let mut out = b"VGAT\x01".to_vec();
+    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&json);
+    out.extend_from_slice(&track[9 + length..]);
+    out
+}
+
 /// A track's opening bytes.
 pub fn track_header(media_id: &str, producer: &str, models: &BTreeMap<String, String>, source_width: u32,
                     source_height: u32) -> Vec<u8> {
@@ -383,5 +398,19 @@ mod tests {
         let r = Record::int16(&[f32::NAN, 1e9, -1e9, 0.5], 1, 0, 1, 4, 1, Time { value: 0, timescale: 1 },
                               Time { value: 0, timescale: 1 }, STEP * i16::MAX as f32);
         assert_eq!(r.values(), vec![0.0, 1023.96875, -1023.96875, 0.5]);
+    }
+
+    #[test]
+    fn a_video_end_goes_into_the_header() {
+        let models: BTreeMap<String, String> = [("depth".to_string(), "m".to_string())].into_iter().collect();
+        let mut track = track_header("title", "test", &models, 64, 36);
+        track.extend(Record::int16(&[0.0; 8], 3, 0, 1, 4, 2, Time { value: 5, timescale: 24 }, Time { value: 5, timescale: 24 }, 1.0).framed());
+        let ended = with_video_end(track.clone(), 6);
+        let length = u32::from_le_bytes(ended[5..9].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&ended[9..9 + length]).unwrap();
+        assert_eq!(header["videoEndFrame"], 6);
+        assert_eq!(header["sourceWidth"], 64);
+        let old = u32::from_le_bytes(track[5..9].try_into().unwrap()) as usize;
+        assert_eq!(&ended[9 + length..], &track[9 + old..]);
     }
 }

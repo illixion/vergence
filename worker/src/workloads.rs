@@ -170,6 +170,11 @@ pub fn mono_flow(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Resul
     let track = packer.join().map_err(|_| Failure::Error("the record packer panicked".into()))?;
     let messages = decode.finish();
     result?;
+    // Frames ran out inside the piece: the video stream ends there (the coordinator takes that
+    // only near the title's end).
+    if decoded > 0 && decoded < lease.end_frame - lease.first_frame {
+        return Ok(crate::record::with_video_end(track, lease.first_frame + decoded));
+    }
     if decoded < lease.end_frame - lease.first_frame {
         return Err(format!("ffmpeg gave {decoded} of {wanted} frames: {messages}").into());
     }
@@ -233,7 +238,8 @@ pub fn gain_grids(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Resu
     drop(seen);
     let messages = decode.finish();
     result?;
-    if decoded_to < lease.end_frame {
+    let ended_early = decoded_to > lease.first_frame && decoded_to < lease.end_frame;
+    if decoded_to < lease.end_frame && !ended_early {
         return Err(format!("ffmpeg gave frames up to {decoded_to} of {first}..{last}: {messages}").into());
     }
     let mut track = track_header(&lease.title, piece.producer, piece.models, w as u32, h as u32);
@@ -244,7 +250,7 @@ pub fn gain_grids(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Resu
             track.extend(record.deflated().framed());
         }
     }
-    Ok(track)
+    Ok(if ended_early { crate::record::with_video_end(track, decoded_to) } else { track })
 }
 
 // MARK: - ai-3d-depth
@@ -337,7 +343,10 @@ pub fn depth(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Ve
     )?;
     stopped(stop)?;
     let maps = depth::maps(&tools, &entry)?;
-    if (maps.len() as i64) < lease.end_frame.min(last) - first {
+    let decoded_to = first + maps.len() as i64;
+    // ffmpeg made the intermediate cleanly, short of the piece: the video stream ends there.
+    let ended_early = decoded_to > lease.first_frame && decoded_to < lease.end_frame.min(last);
+    if decoded_to < lease.end_frame.min(last) && !ended_early {
         return Err(format!("the depth pass gave {} of {wanted} frames", maps.len()).into());
     }
     let mut track = track_header(&lease.title, piece.producer, piece.models, w as u32, h as u32);
@@ -352,7 +361,7 @@ pub fn depth(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Ve
                                                             map.scale, map.offset);
         track.extend(record.deflated_framed());
     }
-    Ok(track)
+    Ok(if ended_early { crate::record::with_video_end(track, decoded_to) } else { track })
 }
 
 /// The depth profile's name. Depth Anything V2 Small and Base get one name

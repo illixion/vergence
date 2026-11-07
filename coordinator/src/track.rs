@@ -101,6 +101,11 @@ pub struct Header {
     pub models: BTreeMap<String, String>,
     pub source_width: u32,
     pub source_height: u32,
+    /// The video stream ended at this frame (exclusive), inside the piece: a
+    /// container whose audio runs past its picture. Only a worker that hit
+    /// the end of the stream early says it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_end_frame: Option<i64>,
 }
 
 /// Media time as a rational.
@@ -277,6 +282,7 @@ pub(crate) mod tests {
             models: models.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             source_width: 1920,
             source_height: 1080,
+            video_end_frame: None,
         }
     }
 

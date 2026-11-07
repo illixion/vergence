@@ -115,6 +115,10 @@ fn run_3d(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Vec<u
     let status = child.wait().ok();
     let message = errors.join().unwrap_or_default();
     let (track, decoded) = result?;
+    // The stream ended cleanly inside the piece: the video is shorter than its container.
+    if decoded > 0 && decoded < lease.end_frame - lease.first_frame && status.is_some_and(|s| s.success()) {
+        return Ok(crate::record::with_video_end(track, lease.first_frame + decoded));
+    }
     if decoded < lease.end_frame - lease.first_frame {
         let code = status.and_then(|s| s.code()).unwrap_or(-1);
         let message: String = message.chars().take(300).collect();
