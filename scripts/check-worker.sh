@@ -14,10 +14,11 @@
 # default: half or full side by side only, the reference crops the halves)
 # or another of the coordinator's, whose reference is the worker's own
 # `--reference` run over the whole file in one decode. ai-3d-depth takes its
-# model from DEPTH_MODEL (a Depth Anything V2 Small .mlpackage or .mlmodelc).
+# model from DEPTH_MODEL (a Depth Anything V2 Small .mlpackage or .mlmodelc),
+# ai-hdr from GAIN_MODEL (Convolution's GainMapGMNet.mlpackage).
 set -euo pipefail
 if [ "$#" -lt 5 ] || [ "$#" -gt 7 ]; then
-    sed -n '2,20p' "$0" >&2
+    sed -n '2,21p' "$0" >&2
     exit 2
 fi
 jellyfin="$1"; key_file="$2"; item="$3"; file="$4"; models="$5"; workload="${6:-smooth-motion-3d}"
@@ -41,6 +42,7 @@ JSON
 "$vergenced" token add player --grants play --config "$work/vergenced.json" > "$work/play.token"
 depth_model=""
 if [ -n "${DEPTH_MODEL:-}" ]; then depth_model="\"depthModel\": \"$DEPTH_MODEL\","; fi
+if [ -n "${GAIN_MODEL:-}" ]; then depth_model="$depth_model \"gainModel\": \"$GAIN_MODEL\","; fi
 cat > "$work/worker.json" <<JSON
 {"coordinator": "http://127.0.0.1:$port", "tokenFile": "$work/work.token", "name": "check",
  "models": "$models", "workloads": ["$workload"], $depth_model

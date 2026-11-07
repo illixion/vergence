@@ -124,7 +124,7 @@ public final class StereoFlowAnalyzer: @unchecked Sendable {
     }
 
     /// Any output as floats in logical (row-major) order, whatever its strides and type.
-    static func floats(_ array: MLMultiArray) -> [Float] {
+    public static func floats(_ array: MLMultiArray) -> [Float] {
         let shape = array.shape.map(\.intValue)
         let strides = array.strides.map(\.intValue)
         var out = [Float](repeating: 0, count: array.count)

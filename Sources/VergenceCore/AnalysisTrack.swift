@@ -55,7 +55,10 @@ public enum AnalysisKind: UInt8, Sendable, Codable, CaseIterable {
     case disparity = 2
     /// Relative inverse depth, near = high, 0…1.
     case depth = 3
-    /// An HDR gain map for the frame.
+    /// AI HDR's gain for the frame as a bilateral grid (`GainGrid` pins it):
+    /// eye mono, float16, 8 channels (luma bins) of 16×9 cells, each the log2
+    /// of the linear gain for pixels in that cell whose non-linear luma falls
+    /// in that bin, sampled trilinearly at cell and bin centres.
     case gainMap = 4
 }
 

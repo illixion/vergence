@@ -11,6 +11,7 @@
 
 #if canImport(CoreML) && canImport(Network)
 import CoreML
+import CoreVideo
 import Foundation
 import VergenceApple
 import VergenceCore
@@ -128,6 +129,11 @@ struct PieceDecoder {
         let eyeW = packing.stereo && packing.sideBySide ? w / 2 : w
         let eyeH = packing.stereo && !packing.sideBySide ? h / 2 : h
 
+        if let producer = producer as? GainGridProducer {
+            producer.prepare(frameRate: Double(input.rate.num) / Double(input.rate.den))
+            producer.timeScaleNum = Int32(input.rate.num)
+            producer.timeScaleDen = Int64(input.rate.den)
+        }
         let first = max(0, piece.lowerBound - producer.framesBefore)
         let (after, overflow) = piece.upperBound.addingReportingOverflow(producer.framesAfter)
         let last = overflow ? frameCount : min(frameCount, after)
@@ -422,6 +428,129 @@ final class DepthProducer: PieceFileProducer {
             track.append(AnalysisTrack.record(try record.deflated()))
         }
         return track
+    }
+}
+// MARK: - AI HDR
+
+/// ai-hdr: a 2D title's AI HDR as one gain grid per frame (`GainGrid`, the
+/// layout pinned in VergenceCore). GMNet runs on keyframes, every half second
+/// on the title's frame grid and at every cut (the depth pipeline's luma-grid
+/// detector); each keyframe's gain map is fitted into a grid, and the frames
+/// between ease from one grid to the next within a shot and hold before a
+/// cut (`GainGridSchedule`). A piece decodes one keyframe interval either
+/// side, so its frames see the same keyframes a whole-file run does.
+///
+/// The model is Convolution's photo conversion (`GainMapGMNet`, from Hypnos's
+/// `scripts/convert-gainmap-model.py`; GMNet is MIT), named by `gainModel`:
+/// Vergence ships no weights, so the worker is told where they are, as with
+/// depth. Its inputs are an image at one of the enumerated sizes (squeezed
+/// from the frame, as the photo path does) and a 256×256 thumbnail; it gives
+/// the linear gain for each pixel.
+final class GainGridProducer: PieceProducer {
+    static let workload = "ai-hdr"
+    /// The model's enumerated input sizes (w, h), as in the conversion script.
+    static let inputSizes: [(Int, Int)] = [(1024, 768), (768, 1024), (1024, 576), (576, 1024), (896, 896)]
+    let model: MLModel
+    let kinds: Set<String> = ["gainMap"]
+    let models: [String: String]
+    let needsStereo = false
+    private(set) var framesBefore: Int64 = 12
+    private(set) var framesAfter: Int64 = 12
+    private var interval: Int64 = 12
+    private var keyframes: [GainGridSchedule.Keyframe] = []
+    private var previousSignature: [Float]?
+
+    init(modelURL: URL, computeUnits: MLComputeUnits) async throws {
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = computeUnits
+        model = try MLModel(contentsOf: try await InterpolationModelBenchmark.compiledURL(for: modelURL),
+                            configuration: configuration)
+        let keyframes = Int((GainGridSchedule.keyframeSeconds * 1000).rounded())
+        models = ["gainMap": "\(modelURL.deletingPathExtension().lastPathComponent) grid16x9x8 key\(keyframes)ms"]
+    }
+
+    /// Set from the title's rate before a run.
+    func prepare(frameRate: Double) {
+        interval = GainGridSchedule.keyframeInterval(frameRate: frameRate)
+        framesBefore = interval
+        framesAfter = interval
+    }
+
+    func begin() {
+        keyframes = []
+        previousSignature = nil
+    }
+
+    func frame(_ frame: DecodedFrame, index: Int64, time: AnalysisTime, piece: Range<Int64>) throws -> [AnalysisRecord] {
+        let p = frame.left
+        let signature = GainGridSchedule.signature(p[0])
+        let cut = previousSignature.map { GainGridSchedule.isCut($0, signature) } ?? false
+        previousSignature = signature
+        guard GainGridSchedule.isKeyframe(index, interval: interval, cut: cut) else { return [] }
+        keyframes.append(GainGridSchedule.Keyframe(index: index, grid: try grid(p), cut: cut))
+        return []
+    }
+
+    func finish(piece: Range<Int64>) throws -> [AnalysisRecord] {
+        piece.compactMap { index in
+            GainGridSchedule.grid(at: index, keyframes: keyframes)?
+                .record(time: AnalysisTime(value: index * timeScaleDen, timescale: timeScaleNum))
+        }
+    }
+
+    /// The title's rate as a time base, for `finish`.
+    var timeScaleNum: Int32 = 24
+    var timeScaleDen: Int64 = 1
+
+    /// GMNet on one frame, fitted into a grid.
+    private func grid(_ p: [AnalysisPlane]) throws -> GainGrid {
+        let aspect = Double(p[0].width) / Double(max(p[0].height, 1))
+        let (w, h) = Self.inputSizes.min {
+            abs(log(Double($0.0) / Double($0.1) / aspect)) < abs(log(Double($1.0) / Double($1.1) / aspect))
+        }!
+        let image = SharedFieldAnalysis.rgbPlanar(y: p[0], cb: p[1], cr: p[2], width: w, height: h)
+        let thumbnail = SharedFieldAnalysis.rgbPlanar(y: p[0], cb: p[1], cr: p[2], width: 256, height: 256)
+        guard let imageBuffer = Self.bgra(image, width: w, height: h),
+              let thumbnailBuffer = Self.bgra(thumbnail, width: 256, height: 256) else {
+            throw WorkerFailure("couldn't make GMNet's input buffers")
+        }
+        let inputs = try MLDictionaryFeatureProvider(dictionary: [
+            "image": MLFeatureValue(pixelBuffer: imageBuffer), "thumbnail": MLFeatureValue(pixelBuffer: thumbnailBuffer),
+        ])
+        let output = try model.prediction(from: inputs)
+        guard let gain = output.featureValue(for: "gain")?.multiArrayValue, gain.shape.count == 4 else {
+            throw WorkerFailure("GMNet gave no gain map")
+        }
+        let gh = gain.shape[2].intValue, gw = gain.shape[3].intValue
+        let values = StereoFlowAnalyzer.floats(gain)
+        let rgb = SharedFieldAnalysis.rgbPlanar(y: p[0], cb: p[1], cr: p[2], width: gw, height: gh)
+        let n = gw * gh
+        let luma = (0 ..< n).map { GainGrid.luma(r: rgb[$0], g: rgb[n + $0], b: rgb[2 * n + $0]) }
+        return GainGrid.fit(gain: values, luma: luma, width: gw, height: gh)
+    }
+
+    /// Planar RGB 0…1 as a BGRA pixel buffer.
+    static func bgra(_ planar: [Float], width: Int, height: Int) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA,
+                            [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
+        guard let buffer else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let stride = CVPixelBufferGetBytesPerRow(buffer), n = width * height
+        for y in 0 ..< height {
+            let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self)
+            for x in 0 ..< width {
+                let i = y * width + x
+                func byte(_ v: Float) -> UInt8 { UInt8((min(max(v, 0), 1) * 255).rounded()) }
+                row[4 * x] = byte(planar[2 * n + i])
+                row[4 * x + 1] = byte(planar[n + i])
+                row[4 * x + 2] = byte(planar[i])
+                row[4 * x + 3] = 255
+            }
+        }
+        return buffer
     }
 }
 #endif

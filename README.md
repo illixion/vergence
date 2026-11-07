@@ -413,6 +413,7 @@ Workloads (`coordinator/src/queue.rs`; a player names one when it reports where 
 | `smooth-motion-3d` | frame-packed 3D | `flowPair` (left eye), `disparity` (right) | RIFE 4.25 lite 480×288, NeuFlow v2 512×288 |
 | `smooth-motion-2d` | 2D, flat or AI 3D | `flowPair` (whole picture, 240×144 stored) | RIFE 4.25 lite 960×576 on the GPU, about 40 fps for 720p |
 | `ai-3d-depth` | 2D, played as AI 3D | `depth` (the picture's shot-space depth, model resolution) | the offline depth pipeline with `depthModel`, e.g. Depth Anything V2 Small at 770×574: about 9 fps |
+| `ai-hdr` | 2D | `gainMap` (a 16×9×8 grid of log2 gain, `GainGrid`, about 1 KB) | GMNet (`gainModel`, Convolution's conversion) on keyframes every 0.5 s and at cuts, eased between: about 30 fps |
 
 `scripts/check-worker.sh … smooth-motion-2d` checks any workload but the first against the
 worker's own `--reference` run over the whole file in one decode. A depth piece is converted with
@@ -420,7 +421,9 @@ a second of the title before it, so the shot anchoring has settled; against a wh
 conversion its records differ by 0.005 on average (0.05 at most) in shot-space units. A player
 warps a depth track's maps (`AnalysisDepthSource`) and runs its own model only for frames the
 track doesn't hold yet. Only Apache-2.0 weights belong in a profile (Depth Anything V2 Base and
-Large are CC-BY-NC).
+Large are CC-BY-NC). An AI HDR piece decodes one keyframe interval either side and matches a whole-file run
+exactly; a player's `GainGridPass` looks each pixel's gain up with its own luma and holds the
+frame's average gain to a cap.
 
 A Mac worker gives the same records as `vergence analyze` over the whole file (disparity
 identical, flow within Core ML's run-to-run noise; `scripts/check-worker.sh`), at about 37 fps

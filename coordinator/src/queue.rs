@@ -57,6 +57,9 @@ impl Workload {
     /// shot-anchored depth with a larger model than a headset runs live, one
     /// `depth` record per frame (eye mono), which the player warps from.
     pub const AI_3D_DEPTH: &'static str = "ai-3d-depth";
+    /// AI HDR for a 2D title: one `gainMap` record per frame, a 16×9×8
+    /// bilateral grid of log2 gain (VergenceCore's `GainGrid` pins it).
+    pub const AI_HDR: &'static str = "ai-hdr";
 
     pub fn defaults() -> Vec<Workload> {
         vec![
@@ -73,6 +76,7 @@ impl Workload {
                 mono_only: true,
             },
             Workload { name: Self::AI_3D_DEPTH.into(), kinds: vec![Kind::Depth], needs_stereo: false, mono_only: true },
+            Workload { name: Self::AI_HDR.into(), kinds: vec![Kind::GainMap], needs_stereo: false, mono_only: true },
         ]
     }
 }
@@ -955,5 +959,32 @@ mod tests {
         assert_eq!(q.check(lease.lease, "a", &upload(2, 0..48)), Err(UploadError::Eye("depth")));
         // The context frames before and after a piece stay with the worker.
         assert!(matches!(q.check(lease.lease, "a", &upload(0, 0..50)), Err(UploadError::Time(_))));
+    }
+
+    #[test]
+    fn checks_gain_grid_uploads() {
+        let mut q = Queue::new();
+        let source = SourceRef::stash("7");
+        q.add(source.clone(), &workload(Workload::AI_HDR), mono_info(2.0)).unwrap();
+        let now = Instant::now();
+        let profile: Profile = [("gainMap".to_string(), "GainMapGMNet grid16x9x8 key500ms".to_string())].into();
+        let lease = q.claim(&Claim { models: profile.clone(), ..claim("a", false) }, now).unwrap();
+        assert_eq!((lease.kinds.clone(), lease.first_frame, lease.end_frame), (vec![Kind::GainMap], 0, 48));
+        let upload = |w: u16, h: u16| {
+            let mut data = track::write_header(&Header {
+                media_id: "x".into(),
+                producer: "test".into(),
+                models: profile.clone(),
+                source_width: 1280,
+                source_height: 720,
+            });
+            for k in 0..48 {
+                data.extend(record(Kind::GainMap, 0, k, k, 24, if k == 47 { w } else { 16 }, h));
+            }
+            track::parse(&data).unwrap()
+        };
+        // Every frame's grid, all the same shape (the record helper writes one channel).
+        assert!(q.check(lease.lease, "a", &upload(16, 9)).is_ok());
+        assert_eq!(q.check(lease.lease, "a", &upload(8, 9)), Err(UploadError::Shape("gainMap")));
     }
 }

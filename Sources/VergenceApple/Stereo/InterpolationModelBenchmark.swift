@@ -84,7 +84,7 @@ public enum InterpolationModelBenchmark {
         }.value
     }
 
-    static func compiledURL(for url: URL) async throws -> URL {
+    public static func compiledURL(for url: URL) async throws -> URL {
         guard url.pathExtension == "mlpackage" else { return url }
         let fm = FileManager.default
         let cache = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]

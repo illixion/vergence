@@ -12,6 +12,8 @@
    each frame's right→left disparity (NeuFlow 512×288), as `vergence analyze`.
  - smooth-motion-2d: the whole picture's flow (RIFE 960×576), for 2D titles
    and AI 3D; offered when the models folder has a RIFE*960x576.
+ - ai-hdr: a 2D title's AI HDR as a gain grid per frame (GMNet on keyframes
+   with `gainModel`, `GainGrid`); offered when the config names one.
  - ai-3d-depth: a 2D title's AI 3D depth through the offline pipeline with
    `depthModel` (Depth Anything V2 Small at 770×574 rather than the headset's
    518×392); offered when the config names one.
@@ -32,6 +34,7 @@
      "models": "~/Models/interp",                         (RIFE*480x288 and NeuFlow*512x288, as for analyze; RIFE*960x576 for 2D)
      "workloads": ["smooth-motion-3d"],                   (default: every one the models allow)
      "depthModel": "~/Models/DepthAnythingV2Small770x574.mlpackage",   (ai-3d-depth; Apache-2.0 weights only)
+     "gainModel": "~/Models/GainMapGMNet.mlpackage",      (ai-hdr; Convolution's GMNet conversion)
      "computeUnits": "all",                               (ane | gpu | cpu | all)
      "ffmpeg": "/opt/homebrew/bin/ffmpeg",                (default: ffmpeg on PATH)
      "jellyfin": { "url": "http://home-server:8096", "apiKeyFile": "~/.config/vergence/jellyfin.key" },
@@ -77,6 +80,8 @@ struct WorkerConfig: Decodable {
     var workloads: [String]?
     /// The AI 3D depth model (`ai-3d-depth`), a Core ML Depth Anything V2 Small conversion.
     var depthModel: String?
+    /// AI HDR's GMNet (`ai-hdr`): Convolution's GainMapGMNet conversion (MIT).
+    var gainModel: String?
     var computeUnits: String?
     var ffmpeg: String?
     var jellyfin: Server?
@@ -201,6 +206,11 @@ func makeProducers(_ config: WorkerConfig) async throws -> [String: PieceProduce
         } else if wanted != nil {
             throw WorkerFailure("smooth-motion-2d needs RIFE*\(MonoFlowProducer.modelSize) in \(folder.path)")
         }
+    }
+    if wanted?.contains(GainGridProducer.workload) ?? (config.gainModel != nil) {
+        guard let path = config.gainModel else { throw WorkerFailure("ai-hdr needs gainModel in the config") }
+        producers[GainGridProducer.workload] = try await GainGridProducer(
+            modelURL: URL(fileURLWithPath: expandTilde(path)), computeUnits: units)
     }
     if wanted?.contains(DepthProducer.workload) ?? (config.depthModel != nil) {
         guard let path = config.depthModel else { throw WorkerFailure("ai-3d-depth needs depthModel in the config") }
