@@ -1,0 +1,45 @@
+[package]
+name = "vergence-worker"
+description = "Analyses pieces of titles for the Vergence coordinator with ONNX Runtime (CUDA, TensorRT, DirectML, Core ML or CPU)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vergence-worker"
+path = "src/main.rs"
+
+[features]
+# Execution providers beyond the platform's default (Core ML on macOS,
+# DirectML on Windows). Each picks ONNX Runtime binaries built with it.
+cuda = ["ort/cuda"]
+tensorrt = ["ort/tensorrt"]
+directml = ["ort/directml"]
+coreml = ["ort/coreml"]
+
+[dependencies]
+ort = "=2.0.0-rc.15"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+# Native TLS (SChannel, Security.framework, OpenSSL): nothing to compile in C for a Windows target.
+reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls", "stream"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2 = "1"
+rand = "0.9"
+thiserror = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.15", features = ["coreml"] }
+
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.15", features = ["directml"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_UI_Shell", "Win32_System_Registry"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Tests read the worker's tracks back with the coordinator's own parser.
+vergence-coordinator = { path = "../coordinator" }
+tempfile = "3"
