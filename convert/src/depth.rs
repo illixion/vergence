@@ -141,11 +141,29 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
     let provider = model::Provider::from_env()?;
     let model_path = job.model.to_path_buf();
 
-    // Stage A: decode and infer on its own thread.
+    // Stage A: decode and prepare on one thread, infer on another.
+    let (prepared_send, prepared_receive) = mpsc::sync_channel::<(Vec<f16>, Option<Vec<f32>>)>(3);
+    let preparing_thread = std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut gate = FrameChangeDetector::default();
+        let mut frame = Vec::new();
+        let mut preparing = 0f64;
+        while reader.next(&mut frame) {
+            let started = Instant::now();
+            let (video, input) = prepare(&frame, hdr.then_some(hlg), (dw, dh), &mut gate);
+            preparing += started.elapsed().as_secs_f64();
+            if prepared_send.send((video, input)).is_err() {
+                break;
+            }
+        }
+        if std::env::var_os("VERGENCE_CONVERT_DEBUG").is_some() {
+            eprintln!("  depth timing: preparing {preparing:.2} s");
+        }
+        reader.finish()
+    });
     let (send, receive) = mpsc::sync_channel::<Result<Inferred, String>>(2);
     let (loaded_send, loaded_receive) = mpsc::channel::<Result<(String, String), String>>();
-    let stage_a = std::thread::spawn(move || {
-        let mut reader = reader;
+    let stage_a = std::thread::spawn(move || -> Result<(), String> {
         let mut model = match DepthModel::load(&model_path, provider) {
             Ok(m) => {
                 let _ = loaded_send.send(Ok((m.name.clone(), m.provider.name().to_string())));
@@ -153,37 +171,24 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
             }
             Err(e) => {
                 let _ = loaded_send.send(Err(e));
-                return reader.finish();
+                drop(prepared_receive);
+                return preparing_thread.join().map_err(|_| "the decoder's thread panicked".to_string())?;
             }
         };
-        let mut gate = FrameChangeDetector::default();
-        let mut frame = Vec::new();
-        while reader.next(&mut frame) {
-            let rgb: Vec<f32> = if hdr {
-                frame.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]) as f32 / 65535.0).collect()
-            } else {
-                frame.iter().map(|&b| b as f32 / 255.0).collect()
-            };
-            let signature = FrameChangeDetector::signature(dw, dh, |x, y| {
-                let i = (y * dw + x) * 3;
-                [rgb[i] * 255.0, rgb[i + 1] * 255.0, rgb[i + 2] * 255.0]
-            });
-            let mut video = Vec::with_capacity(dw * dh * 4);
-            for px in rgb.chunks_exact(3) {
-                video.extend([f16::from_f32(px[0]), f16::from_f32(px[1]), f16::from_f32(px[2]), f16::ONE]);
-            }
-            let raw = if gate.should_reuse(signature) {
-                None
-            } else {
-                let mut sdr = rgb;
-                if hdr {
-                    model::tone_map(&mut sdr, hlg);
-                }
-                match model.infer(&model::input(&sdr, dw, dh)) {
-                    Ok(map) => Some(map.into_iter().map(f16::from_f32).collect()),
-                    Err(e) => {
-                        let _ = send.send(Err(e));
-                        return reader.finish();
+        let mut inferring = 0f64;
+        for (video, input) in prepared_receive.iter() {
+            let raw = match input {
+                None => None,
+                Some(input) => {
+                    let started = Instant::now();
+                    let inferred = model.infer(&input);
+                    inferring += started.elapsed().as_secs_f64();
+                    match inferred {
+                        Ok(map) => Some(map.into_iter().map(f16::from_f32).collect()),
+                        Err(e) => {
+                            let _ = send.send(Err(e));
+                            break;
+                        }
                     }
                 }
             };
@@ -191,7 +196,11 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
                 break;
             }
         }
-        reader.finish()
+        drop(prepared_receive);
+        if std::env::var_os("VERGENCE_CONVERT_DEBUG").is_some() {
+            eprintln!("  depth timing: inferring {inferring:.2} s");
+        }
+        preparing_thread.join().map_err(|_| "the decoder's thread panicked".to_string())?
     });
     let (model_name, provider_name) = loaded_receive.recv().map_err(|_| "the depth model's thread stopped".to_string())??;
 
@@ -238,10 +247,12 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
         writer.write(&luma)?;
         writer.write(&neutral)
     };
-    let began = Instant::now();
-    let _ = began;
+    let (mut waited, mut refining, mut emitting) = (0f64, 0f64, 0f64);
+    let mut mark = Instant::now();
     for item in receive.iter() {
+        waited += mark.elapsed().as_secs_f64();
         let Inferred { video, raw } = item?;
+        let started = Instant::now();
         let index = stats.len();
         let seconds = index as f64 / fps;
         match raw {
@@ -292,16 +303,22 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
                 stats.push(Stat { lo: repeated.lo, hi: repeated.hi, cut_before: false, relative: Some(crate::maths::Affine::IDENTITY) });
             }
         }
+        refining += started.elapsed().as_secs_f64();
+        let started = Instant::now();
         while next_emit + crate::maths::TEMPORAL_RADIUS < stats.len() {
             emit(&stats, next_emit, stats.len() - 1, &mut refiner, &mut writer)?;
             next_emit += 1;
         }
+        emitting += started.elapsed().as_secs_f64();
+        mark = Instant::now();
         if stats.len().is_multiple_of(10) {
             (job.progress)((stats.len() as f64 / total as f64).min(1.0));
         }
     }
-    let decoded = stage_a.join().map_err(|_| "the depth model's thread panicked".to_string())?;
-    decoded?;
+    if std::env::var_os("VERGENCE_CONVERT_DEBUG").is_some() {
+        eprintln!("  depth timing: waiting for inference {waited:.2} s, refining {refining:.2} s, emitting {emitting:.2} s");
+    }
+    stage_a.join().map_err(|_| "the depth model's thread panicked".to_string())??;
     if stats.is_empty() {
         return Err("no video frames in the range".into());
     }
@@ -341,6 +358,45 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
         .map_err(|e| e.to_string())?;
     (job.progress)(1.0);
     Ok((Entry { directory: job.directory.to_path_buf(), meta }, Some(provider_name)))
+}
+
+/// One decoded frame (RGB at decode size, 8 or 16 bits) as the guide sees it
+/// (RGBA half floats) and as the model sees it, unless it is static against
+/// the last inferred frame (None: its depth repeats). The conversions run on
+/// a few threads: at 1036×582 they are as long as the inference.
+fn prepare(frame: &[u8], hdr: Option<bool>, (dw, dh): (usize, usize), gate: &mut FrameChangeDetector)
+    -> (Vec<f16>, Option<Vec<f32>>) {
+    let sixteen = hdr.is_some();
+    let pixels = dw * dh;
+    let mut rgb = vec![0f32; pixels * 3];
+    let mut video = vec![f16::ZERO; pixels * 4];
+    let bands = 4;
+    let rows = dh.div_ceil(bands);
+    std::thread::scope(|scope| {
+        for (band, (rgb, video)) in rgb.chunks_mut(rows * dw * 3).zip(video.chunks_mut(rows * dw * 4)).enumerate() {
+            let first = band * rows * dw * 3;
+            scope.spawn(move || {
+                for (i, (c, v)) in rgb.chunks_exact_mut(3).zip(video.chunks_exact_mut(4)).enumerate() {
+                    for k in 0..3 {
+                        let at = first + i * 3 + k;
+                        c[k] = if sixteen {
+                            u16::from_le_bytes([frame[2 * at], frame[2 * at + 1]]) as f32 / 65535.0
+                        } else {
+                            frame[at] as f32 / 255.0
+                        };
+                        v[k] = f16::from_f32(c[k]);
+                    }
+                    v[3] = f16::ONE;
+                }
+            });
+        }
+    });
+    let signature = FrameChangeDetector::signature(dw, dh, |x, y| {
+        let i = (y * dw + x) * 3;
+        [rgb[i] * 255.0, rgb[i + 1] * 255.0, rgb[i + 2] * 255.0]
+    });
+    let input = (!gate.should_reuse(signature)).then(|| model::input(&rgb, dw, dh, hdr));
+    (video, input)
 }
 
 /// The anchor fit's sums of this frame's refined map against the previous

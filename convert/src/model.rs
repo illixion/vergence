@@ -236,38 +236,62 @@ pub fn resize(src: &[f32], w: usize, h: usize, channels: usize, tw: usize, th: u
             .collect()
     }
     let (wx, wy) = (weights(w, tw), weights(h, th));
+    // Rows in bands on a few threads: at decode size this is as long as the inference.
+    let bands = 4;
     let mut across = vec![0f32; tw * h * channels];
-    for y in 0..h {
-        for (x, (first, ws)) in wx.iter().enumerate() {
-            for c in 0..channels {
-                let mut v = 0.0;
-                for (k, wt) in ws.iter().enumerate() {
-                    v += wt * src[(y * w + first + k) * channels + c];
+    let rows = h.div_ceil(bands).max(1);
+    std::thread::scope(|scope| {
+        for (band, chunk) in across.chunks_mut(rows * tw * channels).enumerate() {
+            let wx = &wx;
+            scope.spawn(move || {
+                for (r, row) in chunk.chunks_mut(tw * channels).enumerate() {
+                    let y = band * rows + r;
+                    for (x, (first, ws)) in wx.iter().enumerate() {
+                        for c in 0..channels {
+                            let mut v = 0.0;
+                            for (k, wt) in ws.iter().enumerate() {
+                                v += wt * src[(y * w + first + k) * channels + c];
+                            }
+                            row[x * channels + c] = v;
+                        }
+                    }
                 }
-                across[(y * tw + x) * channels + c] = v;
-            }
+            });
         }
-    }
+    });
     let mut out = vec![0f32; tw * th * channels];
-    for (y, (first, ws)) in wy.iter().enumerate() {
-        for x in 0..tw {
-            for c in 0..channels {
-                let mut v = 0.0;
-                for (k, wt) in ws.iter().enumerate() {
-                    v += wt * across[((first + k) * tw + x) * channels + c];
+    let rows = th.div_ceil(bands).max(1);
+    std::thread::scope(|scope| {
+        for (band, chunk) in out.chunks_mut(rows * tw * channels).enumerate() {
+            let (wy, across) = (&wy, &across);
+            scope.spawn(move || {
+                for (r, row) in chunk.chunks_mut(tw * channels).enumerate() {
+                    let (first, ws) = &wy[band * rows + r];
+                    for x in 0..tw {
+                        for c in 0..channels {
+                            let mut v = 0.0;
+                            for (k, wt) in ws.iter().enumerate() {
+                                v += wt * across[((first + k) * tw + x) * channels + c];
+                            }
+                            row[x * channels + c] = v;
+                        }
+                    }
                 }
-                out[(y * tw + x) * channels + c] = v;
-            }
+            });
         }
-    }
+    });
     out
 }
 
 /// The model's input from an RGB frame (0…1, interleaved): fitted, centred on
-/// black, planar, ImageNet-normalised.
-pub fn input(rgb: &[f32], w: usize, h: usize) -> Vec<f32> {
+/// black, planar, ImageNet-normalised. `hdr`: the frame holds PQ (false) or
+/// HLG (true) code values, tone-mapped to BT.709 once at the model's size.
+pub fn input(rgb: &[f32], w: usize, h: usize, hdr: Option<bool>) -> Vec<f32> {
     let (tw, th) = fitted(w, h);
-    let small = resize(rgb, w, h, 3, tw, th);
+    let mut small = resize(rgb, w, h, 3, tw, th);
+    if let Some(hlg) = hdr {
+        tone_map(&mut small, hlg);
+    }
     let (ox, oy) = ((WIDTH - tw) / 2, (HEIGHT - th) / 2);
     let mut out = vec![0f32; 3 * WIDTH * HEIGHT];
     for c in 0..3 {
@@ -288,26 +312,61 @@ pub fn input(rgb: &[f32], w: usize, h: usize) -> Vec<f32> {
 /// global curve (diffuse white at 203 nits, Reinhard toward a 1000-nit peak).
 pub fn tone_map(rgb: &mut [f32], hlg: bool) {
     const M: [[f32; 3]; 3] = [[1.6605, -0.5876, -0.0728], [-0.1246, 1.1329, -0.0083], [-0.0182, -0.1006, 1.1187]];
-    let pq = |e: f32| -> f32 {
-        let (m1, m2, c1, c2, c3) = (0.159_301_76_f32, 78.84375f32, 0.8359375f32, 18.851_563_f32, 18.6875f32);
-        let p = e.clamp(0.0, 1.0).powf(1.0 / m2);
-        10000.0 * ((p - c1).max(0.0) / (c2 - c3 * p)).powf(1.0 / m1)
-    };
-    let hlg_inverse = |e: f32| -> f32 {
-        let (a, b, c) = (0.178_832_77_f32, 0.284_668_92_f32, 0.559_910_7_f32);
-        let e = e.clamp(0.0, 1.0);
-        let scene = if e <= 0.5 { e * e / 3.0 } else { (((e - c) / a).exp() + b) / 12.0 };
-        scene * 1000.0
-    };
+    let (eotf, oetf) = tone_tables(hlg);
     let white = 1000.0f32 / 203.0;
     for px in rgb.chunks_exact_mut(3) {
-        let lin: Vec<f32> = px.iter().map(|&e| if hlg { hlg_inverse(e) } else { pq(e) } / 203.0).collect();
+        let lin = [0, 1, 2].map(|c| lookup(eotf, px[c]));
         for (c, row) in M.iter().enumerate() {
             let x = (row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2]).max(0.0);
             let y = (x * (1.0 + x / (white * white)) / (1.0 + x)).min(1.0);
-            px[c] = if y < 0.018 { 4.5 * y } else { 1.099 * y.powf(0.45) - 0.099 };
+            px[c] = lookup(oetf, y);
         }
     }
+}
+
+const TABLE: usize = 4096;
+
+/// `table` over 0…1, interpolated.
+fn lookup(table: &[f32], v: f32) -> f32 {
+    let p = v.clamp(0.0, 1.0) * (TABLE - 1) as f32;
+    let i = (p as usize).min(TABLE - 2);
+    let f = p - i as f32;
+    table[i] + (table[i + 1] - table[i]) * f
+}
+
+/// Code value → linear light (diffuse white 1), and linear 0…1 → BT.709 code value.
+fn tone_tables(hlg: bool) -> (&'static [f32], &'static [f32]) {
+    use std::sync::OnceLock;
+    static PQ: OnceLock<Vec<f32>> = OnceLock::new();
+    static HLG: OnceLock<Vec<f32>> = OnceLock::new();
+    static OETF: OnceLock<Vec<f32>> = OnceLock::new();
+    let at = |i: usize| i as f32 / (TABLE - 1) as f32;
+    let eotf = if hlg {
+        HLG.get_or_init(|| {
+            let (a, b, c) = (0.178_832_77_f32, 0.284_668_92_f32, 0.559_910_7_f32);
+            (0..TABLE)
+                .map(|i| {
+                    let e = at(i);
+                    let scene = if e <= 0.5 { e * e / 3.0 } else { (((e - c) / a).exp() + b) / 12.0 };
+                    scene * 1000.0 / 203.0
+                })
+                .collect()
+        })
+    } else {
+        PQ.get_or_init(|| {
+            let (m1, m2, c1, c2, c3) = (0.159_301_76_f32, 78.84375f32, 0.8359375f32, 18.851_563_f32, 18.6875f32);
+            (0..TABLE)
+                .map(|i| {
+                    let p = at(i).powf(1.0 / m2);
+                    10000.0 * ((p - c1).max(0.0) / (c2 - c3 * p)).powf(1.0 / m1) / 203.0
+                })
+                .collect()
+        })
+    };
+    let oetf = OETF.get_or_init(|| {
+        (0..TABLE).map(at).map(|y| if y < 0.018 { 4.5 * y } else { 1.099 * y.powf(0.45) - 0.099 }).collect()
+    });
+    (eotf, oetf)
 }
 
 #[cfg(test)]
@@ -336,7 +395,7 @@ mod tests {
     #[test]
     fn letterboxes_on_black() {
         let rgb = vec![1.0f32; 3 * 1036 * 582];
-        let x = input(&rgb, 1036, 582);
+        let x = input(&rgb, 1036, 582, None);
         let white = (1.0 - MEAN[0]) / STD[0];
         let black = (0.0 - MEAN[0]) / STD[0];
         assert!((x[200 * WIDTH + 10] - white).abs() < 1e-5);

@@ -576,7 +576,11 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
     let meta = &job.entry.meta;
     let (mut frames, mut flat) = (0usize, 0usize);
     let mut failure = None;
+    let debug = std::env::var_os("VERGENCE_CONVERT_DEBUG").is_some();
+    let (mut waited, mut rendering, mut sending) = (0f64, 0f64, 0f64);
+    let mut mark = Instant::now();
     for (frame, map) in planes_receive.iter() {
+        waited += mark.elapsed().as_secs_f64();
         let luma = ew * eh * sample;
         let chroma = luma / 4;
         let planes = [&frame[..luma], &frame[luma..luma + chroma], &frame[luma + chroma..luma + 2 * chroma]];
@@ -590,18 +594,39 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
         if depth.is_none() {
             flat += 1;
         }
-        let mut out = Vec::new();
-        if let Err(e) = warper.render(planes, depth.as_ref(), job.strength, job.convergence, &mut out) {
-            failure = Some(e);
+        let started = Instant::now();
+        let out = match warper.render(planes, depth.as_ref(), job.strength, job.convergence) {
+            Ok(out) => out,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        };
+        rendering += started.elapsed().as_secs_f64();
+        let started = Instant::now();
+        if let Some(out) = out
+            && out_send.send(out).is_err()
+        {
             break;
         }
-        if out_send.send(out).is_err() {
-            break;
-        }
+        sending += started.elapsed().as_secs_f64();
+        mark = Instant::now();
         frames += 1;
         if frames % 24 == 0 {
             (job.progress)((frames as f64 / job.expected_frames.max(1) as f64).min(1.0));
         }
+    }
+    if failure.is_none() {
+        match warper.finish() {
+            Ok(Some(out)) => {
+                let _ = out_send.send(out);
+            }
+            Ok(None) => {}
+            Err(e) => failure = Some(e),
+        }
+    }
+    if debug {
+        log(format!("  picture timing: waiting for frames {waited:.2} s, GPU {rendering:.2} s, waiting for the encoder {sending:.2} s"));
     }
     drop(planes_receive);
     drop(out_send);

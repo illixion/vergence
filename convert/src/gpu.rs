@@ -537,7 +537,10 @@ pub struct Warper<'g> {
     colour: wgpu::Buffer,
     pack_params: wgpu::Buffer,
     picture: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    /// Two, so one frame reads back while the next is drawn.
+    readback: [wgpu::Buffer; 2],
+    next_slot: usize,
+    pending: Option<Pending>,
     luma_words: usize,
     chroma_offset_words: usize,
 }
@@ -571,7 +574,10 @@ impl<'g> Warper<'g> {
                 words: [format.bits, luma_words as u32, luma_words as u32, (luma_words * ph) as u32],
             }),
             picture: plain_buffer(device, "picture", picture_bytes, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
-            readback: plain_buffer(device, "picture readback", picture_bytes, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+            readback: [0, 1].map(|_| plain_buffer(device, "picture readback", picture_bytes,
+                                                  wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST)),
+            next_slot: 0,
+            pending: None,
             luma_words,
             chroma_offset_words: luma_words * ph,
             format,
@@ -579,11 +585,13 @@ impl<'g> Warper<'g> {
         }
     }
 
-    /// Both eyes of one frame (`planes`: Y, Cb, Cr as the decoder wrote them,
-    /// 1 or 2 bytes a sample), packed, as NV12 (8-bit) or P010 (10-bit) rows
-    /// `out` receives without padding. Without `depth`, both eyes are the frame.
-    pub fn render(&mut self, planes: [&[u8]; 3], depth: Option<&WarpDepth>, strength: f32, convergence: f32,
-                  out: &mut Vec<u8>) -> Result<(), String> {
+    /// Draws both eyes of one frame (`planes`: Y, Cb, Cr as the decoder wrote
+    /// them, 1 or 2 bytes a sample) and packs them. Returns the frame before it,
+    /// whose read-back overlapped this one, as NV12 (8-bit) or P010 (10-bit)
+    /// without row padding; `finish` returns the last. Without `depth`, both
+    /// eyes are the frame.
+    pub fn render(&mut self, planes: [&[u8]; 3], depth: Option<&WarpDepth>, strength: f32, convergence: f32)
+                  -> Result<Option<Vec<u8>>, String> {
         let gpu = self.gpu;
         let device = &gpu.device;
         let bytes = if self.format.bits > 8 { 2 } else { 1 };
@@ -678,21 +686,53 @@ impl<'g> Warper<'g> {
             let per = if self.format.bits > 8 { 2 } else { 4 };
             dispatch(&mut pass, pw.div_ceil(per) as u32, ph.div_ceil(2) as u32);
         }
-        encoder.copy_buffer_to_buffer(&self.picture, 0, &self.readback, 0, self.picture.size());
-        let mut raw = Vec::new();
-        gpu.read(encoder, &self.readback, &mut raw)?;
-        // Strip NV12's row padding.
-        let (pw, ph) = self.format.picture;
-        let row = if self.format.bits > 8 { pw * 2 } else { pw };
-        let stride = self.luma_words * 4;
-        out.clear();
-        for y in 0..ph {
-            out.extend_from_slice(&raw[y * stride..y * stride + row]);
-        }
-        let chroma = self.chroma_offset_words * 4;
-        for y in 0..ph / 2 {
-            out.extend_from_slice(&raw[chroma + y * stride..chroma + y * stride + row]);
-        }
-        Ok(())
+        let slot = self.next_slot;
+        self.next_slot = 1 - slot;
+        encoder.copy_buffer_to_buffer(&self.picture, 0, &self.readback[slot], 0, self.picture.size());
+        let submission = gpu.queue.submit([encoder.finish()]);
+        let (send, receive) = mpsc::channel();
+        self.readback[slot].map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = send.send(r);
+        });
+        let previous = self.pending.replace(Pending { slot, submission, mapped: receive });
+        previous.map(|p| self.collect(p)).transpose()
     }
+
+    /// The last frame `render` drew.
+    pub fn finish(&mut self) -> Result<Option<Vec<u8>>, String> {
+        self.pending.take().map(|p| self.collect(p)).transpose()
+    }
+
+    fn collect(&self, pending: Pending) -> Result<Vec<u8>, String> {
+        self.gpu
+            .device
+            .poll(wgpu::PollType::Wait { submission_index: Some(pending.submission), timeout: None })
+            .map_err(|e| format!("the GPU stopped: {e}"))?;
+        pending.mapped.recv().map_err(|e| e.to_string())?.map_err(|e| format!("reading back from the GPU: {e}"))?;
+        let buffer = &self.readback[pending.slot];
+        let mut out;
+        {
+            let raw = buffer.get_mapped_range(..).map_err(|e| format!("reading back from the GPU: {e}"))?;
+            // Strip NV12's row padding.
+            let (pw, ph) = self.format.picture;
+            let row = if self.format.bits > 8 { pw * 2 } else { pw };
+            let stride = self.luma_words * 4;
+            out = Vec::with_capacity(row * ph * 3 / 2);
+            for y in 0..ph {
+                out.extend_from_slice(&raw[y * stride..y * stride + row]);
+            }
+            let chroma = self.chroma_offset_words * 4;
+            for y in 0..ph / 2 {
+                out.extend_from_slice(&raw[chroma + y * stride..chroma + y * stride + row]);
+            }
+        }
+        buffer.unmap();
+        Ok(out)
+    }
+}
+
+struct Pending {
+    slot: usize,
+    submission: wgpu::SubmissionIndex,
+    mapped: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
 }
