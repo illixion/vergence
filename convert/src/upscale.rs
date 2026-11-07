@@ -95,18 +95,24 @@ impl Network {
     }
 
     /// The ONNX model: input "image" [N, 3, H, W] float32 RGB 0…1, output
-    /// "upscaled" [N, 3, 2H, 2W].
-    pub fn onnx(&self) -> Vec<u8> {
+    /// "upscaled" [N, 3, 2H, 2W]. `half`: the network in float16 between
+    /// two casts (for a GPU's tensor cores; the CPU provider runs float32).
+    pub fn onnx(&self, half: bool) -> Vec<u8> {
         let mut graph = Proto::default();
         let mut input = "image".to_string();
-        let tensor = |g: &mut Proto, name: &str, dims: &[i64], values: &[f32]| {
+        let tensor = |g: &mut Proto, name: &str, dims: &[i64], values: &[f32], half: bool| {
             g.message(5, |t| {
                 for d in dims {
                     t.uint(1, *d as u64);
                 }
-                t.uint(2, 1); // FLOAT
+                t.uint(2, if half { 10 } else { 1 }); // FLOAT16 or FLOAT
                 t.string(8, name);
-                t.bytes(9, &values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+                let bytes: Vec<u8> = if half {
+                    values.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect()
+                } else {
+                    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+                };
+                t.bytes(9, &bytes);
             });
         };
         let node = |g: &mut Proto, op: &str, inputs: &[&str], output: &str, attributes: &dyn Fn(&mut Proto)| {
@@ -143,10 +149,15 @@ impl Network {
                 a.uint(20, 3); // STRING
             });
         };
+        if half {
+            node(&mut graph, "Cast", &["image"], "image16", &|n| int(n, "to", 10));
+            input = "image16".into();
+        }
+        let image = input.clone();
         for (i, layer) in self.layers.iter().enumerate() {
             let (w, b, conv) = (format!("w{i}"), format!("b{i}"), format!("conv{i}"));
-            tensor(&mut graph, &w, &[layer.outputs as i64, layer.inputs as i64, 3, 3], &layer.weight);
-            tensor(&mut graph, &b, &[layer.outputs as i64], &layer.bias);
+            tensor(&mut graph, &w, &[layer.outputs as i64, layer.inputs as i64, 3, 3], &layer.weight, half);
+            tensor(&mut graph, &b, &[layer.outputs as i64], &layer.bias, half);
             node(&mut graph, "Conv", &[&input, &w, &b], &conv, &|n| {
                 ints(n, "kernel_shape", &[3, 3]);
                 ints(n, "pads", &[1, 1, 1, 1]);
@@ -154,7 +165,7 @@ impl Network {
             input = conv;
             if let Some(slopes) = &layer.slopes {
                 let (s, act) = (format!("s{i}"), format!("prelu{i}"));
-                tensor(&mut graph, &s, &[layer.outputs as i64, 1, 1], slopes);
+                tensor(&mut graph, &s, &[layer.outputs as i64, 1, 1], slopes, half);
                 node(&mut graph, "PRelu", &[&input, &s], &act, &|_| {});
                 input = act;
             }
@@ -164,18 +175,22 @@ impl Network {
             int(n, "blocksize", scale);
             string(n, "mode", "CRD");
         });
-        tensor(&mut graph, "scales", &[4], &[1.0, 1.0, scale as f32, scale as f32]);
-        node(&mut graph, "Resize", &["image", "", "scales"], "base", &|n| {
+        tensor(&mut graph, "scales", &[4], &[1.0, 1.0, scale as f32, scale as f32], false);
+        node(&mut graph, "Resize", &[&image, "", "scales"], "base", &|n| {
             string(n, "mode", "nearest");
             string(n, "coordinate_transformation_mode", "asymmetric");
             string(n, "nearest_mode", "floor");
         });
         node(&mut graph, "Add", &["shuffle", "base"], "sum", &|_| {});
         let pool = scale / 2;
-        node(&mut graph, "AveragePool", &["sum"], "upscaled", &|n| {
+        let pooled = if half { "pooled" } else { "upscaled" };
+        node(&mut graph, "AveragePool", &["sum"], pooled, &|n| {
             ints(n, "kernel_shape", &[pool, pool]);
             ints(n, "strides", &[pool, pool]);
         });
+        if half {
+            node(&mut graph, "Cast", &[pooled], "upscaled", &|n| int(n, "to", 1));
+        }
         graph.string(2, "srvgg");
         for (field, name) in [(11, "image"), (12, "upscaled")] {
             graph.message(field, |v| {
@@ -301,7 +316,6 @@ pub struct Upscaler {
 impl Upscaler {
     pub fn load(network: &Network, provider: Provider) -> Result<Upscaler, String> {
         let env = crate::model::environment("vergence-convert")?;
-        let bytes = network.onnx();
         let cache = std::env::temp_dir().join("vergence-convert-model-cache");
         let mut errors = Vec::new();
         // Core ML wants fixed shapes and TensorRT builds an engine per size:
@@ -323,7 +337,7 @@ impl Upscaler {
                 if let Some(ep) = crate::model::dispatch(candidate, &cache)? {
                     builder = builder.with_execution_providers([ep]).map_err(fail)?;
                 }
-                builder.commit_from_memory(&bytes).map_err(|e| e.to_string())
+                builder.commit_from_memory(&network.onnx(candidate != Provider::Cpu)).map_err(|e| e.to_string())
             })();
             match built {
                 Ok(session) => return Ok(Upscaler { session, provider: candidate, _env: env }),
@@ -362,22 +376,50 @@ pub struct Region {
 /// a copy when the sizes match.
 pub fn sample_eye(planes: [&[f32]; 3], fw: usize, fh: usize, region: Region, w: usize, h: usize, out: &mut Vec<f32>) {
     out.clear();
-    out.reserve(3 * w * h);
-    for plane in planes {
-        for y in 0..h {
-            let sy = (region.y + (y as f64 + 0.5) / h as f64 * region.height - 0.5).clamp(0.0, fh as f64 - 1.0);
-            let (y0, ty) = (sy.floor() as usize, (sy - sy.floor()) as f32);
-            let y1 = (y0 + 1).min(fh - 1);
-            for x in 0..w {
-                let sx = (region.x + (x as f64 + 0.5) / w as f64 * region.width - 0.5).clamp(0.0, fw as f64 - 1.0);
-                let (x0, tx) = (sx.floor() as usize, (sx - sx.floor()) as f32);
-                let x1 = (x0 + 1).min(fw - 1);
-                let top = plane[y0 * fw + x0] * (1.0 - tx) + plane[y0 * fw + x1] * tx;
-                let bottom = plane[y1 * fw + x0] * (1.0 - tx) + plane[y1 * fw + x1] * tx;
-                out.push((top * (1.0 - ty) + bottom * ty).clamp(0.0, 1.0));
-            }
+    out.resize(3 * w * h, 0.0);
+    std::thread::scope(|s| {
+        for (plane, target) in planes.into_iter().zip(out.chunks_mut(w * h)) {
+            s.spawn(move || {
+                for (y, row) in target.chunks_mut(w).enumerate() {
+                    let sy = (region.y + (y as f64 + 0.5) / h as f64 * region.height - 0.5).clamp(0.0, fh as f64 - 1.0);
+                    let (y0, ty) = (sy.floor() as usize, (sy - sy.floor()) as f32);
+                    let y1 = (y0 + 1).min(fh - 1);
+                    for (x, value) in row.iter_mut().enumerate() {
+                        let sx = (region.x + (x as f64 + 0.5) / w as f64 * region.width - 0.5).clamp(0.0, fw as f64 - 1.0);
+                        let (x0, tx) = (sx.floor() as usize, (sx - sx.floor()) as f32);
+                        let x1 = (x0 + 1).min(fw - 1);
+                        let top = plane[y0 * fw + x0] * (1.0 - tx) + plane[y0 * fw + x1] * tx;
+                        let bottom = plane[y1 * fw + x0] * (1.0 - tx) + plane[y1 * fw + x1] * tx;
+                        *value = (top * (1.0 - ty) + bottom * ty).clamp(0.0, 1.0);
+                    }
+                }
+            });
         }
-    }
+    });
+}
+
+/// Eyes of planar RGB (`w`×`h` each) packed into planar 16-bit G, B, R at
+/// `packed` size, eye `e` at `places[e]`: what the encoder's scaler reads.
+pub fn pack_gbrp16(eyes: &[&[f32]], w: usize, h: usize, packed: (usize, usize), places: &[(usize, usize)]) -> Vec<u8> {
+    let (pw, ph) = packed;
+    let mut out = vec![0u8; pw * ph * 3 * 2];
+    std::thread::scope(|s| {
+        // gbrp: the planes are G, B, R; the eyes are R, G, B.
+        for (target, channel) in out.chunks_mut(pw * ph * 2).zip([1usize, 2, 0]) {
+            s.spawn(move || {
+                for (eye, &(ox, oy)) in eyes.iter().zip(places) {
+                    for y in 0..h {
+                        let source = &eye[(channel * h + y) * w..(channel * h + y + 1) * w];
+                        let line = &mut target[((oy + y) * pw + ox) * 2..((oy + y) * pw + ox + w) * 2];
+                        for (v, bytes) in source.iter().zip(line.chunks_exact_mut(2)) {
+                            bytes.copy_from_slice(&((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes());
+                        }
+                    }
+                }
+            });
+        }
+    });
+    out
 }
 
 /// Runs `f(first_row, rows)` over `height` rows split between the cores.
@@ -399,59 +441,100 @@ fn luma(rgb: &[f32], n: usize) -> Vec<f32> {
 
 /// Disparity of `own` against `other` (luma, `w`×`h`): own(x) matches
 /// other(x + d). Returns d and 1 where one match is clearly best, 0 and 0
-/// where the window is flat or the match ambiguous.
+/// where the window is flat or the match ambiguous. Bands of rows run on the
+/// cores; each keeps every disparity's 7×7 sums for its row, slid down a row
+/// at a time.
 fn block_match(own: &[f32], other: &[f32], w: usize, h: usize, radius: i32) -> Vec<(f32, f32)> {
     let n = w * h;
     let count = (2 * radius + 1) as usize;
-    // One cost image per disparity: |own(x) − other(x + d)| summed over 7×7.
-    let mut costs = vec![0f32; count * n];
-    std::thread::scope(|s| {
-        for (k, cost) in costs.chunks_mut(n).enumerate() {
-            s.spawn(move || {
-                let d = k as i32 - radius;
-                let mut diff = vec![0f32; n];
-                for y in 0..h {
-                    for x in 0..w {
-                        let ox = (x as i32 + d).clamp(0, w as i32 - 1) as usize;
-                        diff[y * w + x] = (own[y * w + x] - other[y * w + ox]).abs();
-                    }
-                }
-                box7(&diff, w, h, cost);
-            });
-        }
-    });
     let mut sums = vec![0f32; n];
     let mut squares = vec![0f32; n];
     box7(own, w, h, &mut sums);
     box7(&own.iter().map(|v| v * v).collect::<Vec<_>>(), w, h, &mut squares);
-    (0..n)
-        .map(|i| {
-            let mean = sums[i] / 49.0;
-            if (squares[i] / 49.0 - mean * mean).max(0.0).sqrt() < TEXTURE_FLOOR {
-                return (0.0, 0.0);
-            }
-            let (mut best, mut at) = (f32::INFINITY, 0usize);
-            for k in 0..count {
-                if costs[k * n + i] < best {
-                    best = costs[k * n + i];
-                    at = k;
+    let (sums, squares) = (&sums, &squares);
+    // |own − other shifted by d| along row `y`, summed over 7 across (edges clamped).
+    let across = |y: usize, d: i32, line: &mut Vec<f32>, out: &mut [f32]| {
+        line.clear();
+        line.push(0.0);
+        let mut total = 0.0;
+        for x in -3..w as i32 + 3 {
+            let xc = x.clamp(0, w as i32 - 1) as usize;
+            let xo = (x + d).clamp(0, w as i32 - 1) as usize;
+            total += (own[y * w + xc] - other[y * w + xo]).abs();
+            line.push(total);
+        }
+        for (x, o) in out.iter_mut().enumerate() {
+            *o = line[x + 7] - line[x];
+        }
+    };
+    let mut result = vec![(0f32, 0f32); n];
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
+    let band = h.div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (b, chunk) in result.chunks_mut(band * w).enumerate() {
+            let across = &across;
+            s.spawn(move || {
+                let mut costs = vec![0f32; count * w];
+                let (mut row, mut line) = (vec![0f32; w], Vec::with_capacity(w + 8));
+                let clamp_y = |y: i64| y.clamp(0, h as i64 - 1) as usize;
+                let y0 = b * band;
+                for k in 0..count {
+                    let d = k as i32 - radius;
+                    for j in -3..=3 {
+                        across(clamp_y(y0 as i64 + j), d, &mut line, &mut row);
+                        for (c, v) in costs[k * w..(k + 1) * w].iter_mut().zip(&row) {
+                            *c += v;
+                        }
+                    }
                 }
-            }
-            let second = (0..count).filter(|k| k.abs_diff(at) > 1).map(|k| costs[k * n + i]).fold(f32::INFINITY, f32::min);
-            if best >= second * 0.95 || best.is_nan() {
-                return (0.0, 0.0);
-            }
-            let mut offset = 0.0;
-            if at > 0 && at + 1 < count {
-                let (before, after) = (costs[(at - 1) * n + i], costs[(at + 1) * n + i]);
-                let curve = before - 2.0 * best + after;
-                if curve > 0.0 {
-                    offset = (0.5 * (before - after) / curve).clamp(-0.5, 0.5);
+                for (r, out) in chunk.chunks_mut(w).enumerate() {
+                    let y = y0 + r;
+                    if r > 0 {
+                        for k in 0..count {
+                            let d = k as i32 - radius;
+                            let cost = &mut costs[k * w..(k + 1) * w];
+                            across(clamp_y(y as i64 + 3), d, &mut line, &mut row);
+                            for (c, v) in cost.iter_mut().zip(&row) {
+                                *c += v;
+                            }
+                            across(clamp_y(y as i64 - 4), d, &mut line, &mut row);
+                            for (c, v) in cost.iter_mut().zip(&row) {
+                                *c -= v;
+                            }
+                        }
+                    }
+                    for (x, o) in out.iter_mut().enumerate() {
+                        let i = y * w + x;
+                        let mean = sums[i] / 49.0;
+                        if (squares[i] / 49.0 - mean * mean).max(0.0).sqrt() < TEXTURE_FLOOR {
+                            continue;
+                        }
+                        let (mut best, mut at) = (f32::INFINITY, 0usize);
+                        for k in 0..count {
+                            if costs[k * w + x] < best {
+                                best = costs[k * w + x];
+                                at = k;
+                            }
+                        }
+                        let second = (0..count).filter(|k| k.abs_diff(at) > 1).map(|k| costs[k * w + x]).fold(f32::INFINITY, f32::min);
+                        if best >= second * 0.95 || best.is_nan() {
+                            continue;
+                        }
+                        let mut offset = 0.0;
+                        if at > 0 && at + 1 < count {
+                            let (before, after) = (costs[(at - 1) * w + x], costs[(at + 1) * w + x]);
+                            let curve = before - 2.0 * best + after;
+                            if curve > 0.0 {
+                                offset = (0.5 * (before - after) / curve).clamp(-0.5, 0.5);
+                            }
+                        }
+                        *o = (at as f32 - radius as f32 + offset, 1.0);
+                    }
                 }
-            }
-            (at as f32 - radius as f32 + offset, 1.0)
-        })
-        .collect()
+            });
+        }
+    });
+    result
 }
 
 const TEXTURE_FLOOR: f32 = 0.008;
@@ -521,7 +604,7 @@ fn blur(rgb: &[f32], w: usize, h: usize) -> Vec<f32> {
 /// Both eyes' upscaled detail brought into agreement. `low`: the two eyes
 /// as the network took them (planar RGB, `w`×`h` each); `high`: as it gave
 /// them (2w×2h each), changed in place.
-pub fn fuse_eyes(low: [&[f32]; 2], high: [&mut Vec<f32>; 2], w: usize, h: usize) {
+pub fn fuse_eyes(low: [&[f32]; 2], high: [&mut [f32]; 2], w: usize, h: usize) {
     let n = w * h;
     let radius = ((w as f64 * 0.04).round() as i32).clamp(4, 48);
     let lumas = [luma(low[0], n), luma(low[1], n)];
@@ -544,7 +627,7 @@ pub fn fuse_eyes(low: [&[f32]; 2], high: [&mut Vec<f32>; 2], w: usize, h: usize)
         })
         .collect();
     let (hw, hh) = (2 * w, 2 * h);
-    let pictures = [high[0].clone(), high[1].clone()];
+    let pictures = [high[0].to_vec(), high[1].to_vec()];
     let blurred = [blur(&pictures[0], hw, hh), blur(&pictures[1], hw, hh)];
     for (e, out) in high.into_iter().enumerate() {
         let (mine, mine_blurred) = (&pictures[e], &blurred[e]);
@@ -662,6 +745,23 @@ mod tests {
         assert!(worst < 1e-4, "{worst}");
     }
 
+    /// The float16 graph a GPU runs gives the same picture within float16's
+    /// steps (run here on the CPU provider, which takes float16 too).
+    #[test]
+    fn half_graph_matches() {
+        let network = Network::load(&fixture("tiny-srvgg.pth")).unwrap();
+        let env = crate::model::environment("vergence-convert").unwrap();
+        let run = |half: bool| -> Vec<f32> {
+            let mut session = Session::builder(&env).unwrap().commit_from_memory(&network.onnx(half)).unwrap();
+            let input: Vec<f32> = (0..3 * 16 * 24).map(|i| (i % 97) as f32 / 97.0).collect();
+            let outputs = session.run(ort::inputs!["image" => TensorRef::from_array_view(([1usize, 3, 16, 24], &input[..])).unwrap()]).unwrap();
+            outputs["upscaled"].try_extract_tensor::<f32>().unwrap().1.to_vec()
+        };
+        let (full, half) = (run(false), run(true));
+        let worst = full.iter().zip(&half).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(worst < 0.01, "{worst}");
+    }
+
     /// The fused pair agrees better than the pair it came from, where a
     /// texture shifted between the eyes carries different detail in each.
     #[test]
@@ -703,7 +803,7 @@ mod tests {
         };
         let before = disagreement(&high);
         let [a, b] = &mut high;
-        fuse_eyes([&low[0], &low[1]], [a, b], w, h);
+        fuse_eyes([&low[0], &low[1]], [a.as_mut_slice(), b.as_mut_slice()], w, h);
         let after = disagreement(&high);
         assert!(after < before * 0.8, "{before} -> {after}");
     }

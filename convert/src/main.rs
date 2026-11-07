@@ -875,6 +875,34 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
     let (mut waited, mut rendering, mut sending) = (0f64, 0f64, 0f64);
     let mut mark = Instant::now();
     let (mut eyes_in, mut batch, mut yuv) = (Vec::new(), Vec::new(), Vec::new());
+    let mut network = 0f64;
+    // An upscaled pair's fusion and packing run on a thread of their own,
+    // beside the network working on the next frame.
+    let finishing = job.upscale.as_ref().filter(|_| rgb_out).map(|stage| {
+        let (send, receive) = mpsc::sync_channel::<(Vec<Vec<f32>>, Vec<f32>)>(2);
+        let (out_send, (iw, ih), side_by_side) = (out_send.clone(), stage.input_eye, job.side_by_side);
+        let thread = std::thread::spawn(move || -> f64 {
+            let mut fusing = 0.0;
+            let each = 3 * ew * eh;
+            let places = [(0, 0), if side_by_side { (ew, 0) } else { (0, eh) }];
+            for (eyes_in, mut out) in receive {
+                let began = Instant::now();
+                if eyes_in.len() == 2 {
+                    let (a, b) = out.split_at_mut(each);
+                    upscale::fuse_eyes([&eyes_in[0], &eyes_in[1]], [a, b], iw, ih);
+                }
+                let eyes: Vec<&[f32]> = out.chunks_exact(each).collect();
+                let packed_frame = upscale::pack_gbrp16(&eyes, ew, eh, packed, &places[..eyes.len()]);
+                fusing += began.elapsed().as_secs_f64();
+                if out_send.send(packed_frame).is_err() {
+                    break;
+                }
+            }
+            fusing
+        });
+        (send, thread)
+    });
+    let (finish_send, finish_thread) = finishing.map(|(s, t)| (Some(s), Some(t))).unwrap_or((None, None));
     for (decoded, map) in planes_receive.iter() {
         waited += mark.elapsed().as_secs_f64();
         let mut frame = decoded;
@@ -894,6 +922,7 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
                 batch.extend_from_slice(&eye);
                 eyes_in.push(eye);
             }
+            let network_began = Instant::now();
             let out = match stage.upscaler.borrow_mut().run(&batch, stage.regions.len(), iw, ih) {
                 Ok(out) => out,
                 Err(e) => {
@@ -901,32 +930,15 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
                     break;
                 }
             };
-            let each = 3 * ew * eh;
-            let mut eyes: Vec<Vec<f32>> = out.chunks_exact(each).map(<[f32]>::to_vec).collect();
-            if let [a, b] = &mut eyes[..] {
-                upscale::fuse_eyes([&eyes_in[0], &eyes_in[1]], [a, b], iw, ih);
-            }
+            network += network_began.elapsed().as_secs_f64();
             rendering += started.elapsed().as_secs_f64();
             if stage.mode == Mode::Depth {
-                upscale::rgb_to_yuv420(&eyes[0], ew, eh, gpu::matrix_coefficients(&colour.matrix), if job.ten_bit { 10 } else { 8 }, &mut yuv);
+                upscale::rgb_to_yuv420(&out[..3 * ew * eh], ew, eh, gpu::matrix_coefficients(&colour.matrix),
+                                       if job.ten_bit { 10 } else { 8 }, &mut yuv);
                 frame = std::mem::take(&mut yuv);
             } else {
-                // Packed gbrp16le: each eye at its place.
-                let (pw, ph) = packed;
-                let mut out = vec![0u8; pw * ph * 3 * 2];
-                for (e, eye) in eyes.iter().enumerate() {
-                    let (ox, oy) = if e == 0 { (0, 0) } else if job.side_by_side { (ew, 0) } else { (0, eh) };
-                    for (plane, channel) in [1usize, 2, 0].into_iter().enumerate() {
-                        for y in 0..eh {
-                            for x in 0..ew {
-                                let v = (eye[(channel * eh + y) * ew + x].clamp(0.0, 1.0) * 65535.0).round() as u16;
-                                let at = ((plane * ph + oy + y) * pw + ox + x) * 2;
-                                out[at..at + 2].copy_from_slice(&v.to_le_bytes());
-                            }
-                        }
-                    }
-                }
-                if out_send.send(out).is_err() {
+                // Fused and packed as gbrp16le on the finishing thread.
+                if finish_send.as_ref().is_none_or(|s| s.send((std::mem::take(&mut eyes_in), out)).is_err()) {
                     break;
                 }
                 mark = Instant::now();
@@ -982,8 +994,14 @@ fn encode_picture(job: PictureJob) -> Result<PictureResult, String> {
             Err(e) => failure = Some(e),
         }
     }
+    drop(finish_send);
+    let fusing = finish_thread.map(|t| t.join().unwrap_or(0.0)).unwrap_or(0.0);
     if debug {
         log(format!("  picture timing: waiting for frames {waited:.2} s, GPU {rendering:.2} s, waiting for the encoder {sending:.2} s"));
+        if let Some(stage) = &job.upscale {
+            log(format!("  upscaling: network {network:.2} s on {}, fusing and packing {fusing:.2} s (beside it)",
+                        stage.upscaler.borrow().provider.name()));
+        }
     }
     drop(planes_receive);
     drop(out_send);
