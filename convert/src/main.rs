@@ -63,6 +63,10 @@
 //! as `--layout` says (`VIDEO.2x.3D.FSBS.mp4`). Unlike the Mac it runs an
 //! eye in one piece (no tiles).
 //!
+//! `--antialias` smooths an old SD source's stair-stepped edges in every
+//! decoding pass with the Mac's ffmpeg graph (`probe::ANTIALIAS`); `--ai-hdr`
+//! is made on a Mac only for now.
+//!
 //! A video that repeats one frame in five (`repeats.rs`) has the repeats
 //! dropped by ffmpeg's decimate in every pass, at four fifths of the rate,
 //! unless `--keep-repeated-frames`.
@@ -94,7 +98,8 @@ const USAGE: &str = "usage: vergence-convert [convert] VIDEO|FOLDER... [--output
          [--strength S] [--convergence C] [--sample SECONDS] [--start S] [--frames N]
          [--model PATH.onnx] [--download-model] [--variant small|base|large] [--depth-track FILE.vgat]
          [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio] [--dry-run] [--force]
-         [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab] [--keep-repeated-frames]";
+         [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab] [--keep-repeated-frames]
+         [--antialias] [--ai-hdr (Mac only)]";
 
 /// `Pseudo3DSettings`' defaults: Convolution's Subtle.
 const DEFAULT_STRENGTH: f64 = 0.008;
@@ -438,7 +443,11 @@ fn convert_one(input: &Path, output: &Path, o: &Options, cx: &Context) -> Result
         log(format!("vergence: {file}: {} is already made (--force to redo)", name(output)));
         return Ok(false);
     }
+    if o.ai_hdr {
+        return Err("--ai-hdr is made on a Mac only for now (vergence convert)".into());
+    }
     let mut probe = cx.tools.probe(input)?;
+    probe.antialias = o.antialias;
     let video = probe.video().ok_or("no video stream")?;
     let (width, height) = (video.width.unwrap_or(0), video.height.unwrap_or(0));
     let upscaling = o.upscale.is_some();
@@ -565,6 +574,9 @@ fn convert_one(input: &Path, output: &Path, o: &Options, cx: &Context) -> Result
     if let Some(network) = cx.network {
         log(format!("  upscaled 2× from {}×{} by {} (Real-ESRGAN, {} convolutions)", model_eye.0, model_eye.1, network.name,
                     network.convolutions()));
+    }
+    if o.antialias {
+        log("  antialiased: edges smoothed (both fields by edge-slope tracing, along edges)");
     }
     if let Some(v) = verdict.filter(|v| v.is_pulldown()) {
         log(format!("  frames: one in five repeats the one before ({} of {} moving stretches): {}", v.repeating, v.moving,

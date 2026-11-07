@@ -135,7 +135,16 @@ pub struct Probe {
     /// decodes through `video_filter`'s decimate.
     #[serde(skip)]
     pub drop_repeats: bool,
+    /// `--antialias`: every pass decodes through `ANTIALIAS` (after the decimate).
+    #[serde(skip)]
+    pub antialias: bool,
 }
+
+/// `--antialias`'s ffmpeg graph, the Mac's (`Antialias.filter`): both fields
+/// re-interpolated by edge-slope tracing, averaged, kept along edges.
+pub const ANTIALIAS: &str = "format=yuv420p10le,split=4[o][a][b][m];\
+    [a]estdif=mode=frame:parity=tff:deint=all[t];[b]estdif=mode=frame:parity=bff:deint=all[u];\
+    [t][u]blend=all_mode=average[aa];[m]sobel=planes=7:scale=4,gblur=sigma=1.5:planes=7[mk];[o][aa][mk]maskedmerge";
 
 /// A frame rate as a fraction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,7 +209,15 @@ impl Probe {
     /// The start of a decoding pass's `-vf`: ffmpeg's decimate when the
     /// repeats are dropped, else nothing.
     pub fn video_filter(&self, rest: &str) -> String {
-        if self.drop_repeats { format!("decimate=cycle=5,{rest}") } else { rest.to_string() }
+        let mut chain = String::new();
+        if self.drop_repeats {
+            chain += "decimate=cycle=5,";
+        }
+        if self.antialias {
+            chain += ANTIALIAS;
+            chain += ",";
+        }
+        chain + rest
     }
 
     /// The video's own bit rate: its stream's, a Matroska statistics tag, or

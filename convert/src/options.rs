@@ -90,6 +90,11 @@ pub struct Options {
     pub input_layout: String,
     /// `--keep-repeated-frames`: keep a pulldown's repeats.
     pub keep_repeated_frames: bool,
+    /// `--antialias`: smooth an old SD source's stair-stepped edges first.
+    pub antialias: bool,
+    /// `--ai-hdr` (refused here: made on a Mac only for now) and `--gain-model`.
+    pub ai_hdr: bool,
+    pub gain_model: Option<String>,
 }
 
 impl Default for Options {
@@ -117,6 +122,9 @@ impl Default for Options {
             upscale_model: None,
             input_layout: "auto".into(),
             keep_repeated_frames: false,
+            antialias: false,
+            ai_hdr: false,
+            gain_model: None,
         }
     }
 }
@@ -253,6 +261,15 @@ pub fn parse(args: &[String]) -> Result<Options, UsageError> {
                 flag(&inline, &name)?;
                 o.keep_repeated_frames = true;
             }
+            "--antialias" => {
+                flag(&inline, &name)?;
+                o.antialias = true;
+            }
+            "--ai-hdr" => {
+                flag(&inline, &name)?;
+                o.ai_hdr = true;
+            }
+            "--gain-model" => o.gain_model = Some(value()?),
             _ => return Err(UsageError(format!("unknown option {name}"))),
         }
     }
@@ -285,8 +302,9 @@ pub fn parse_bitrate(text: &str) -> Option<u64> {
 /// for a sample; beside the input, or in/at --output.
 pub fn converted(input: &Path, o: &Options, single: bool) -> PathBuf {
     let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let name = format!("{stem}{}{}{}", if o.sample.is_some() { ".sample" } else { "" },
-                       o.upscale.map(|s| format!(".{s}x")).unwrap_or_default(), o.layout.name_suffix());
+    let name = format!("{stem}{}{}{}{}", if o.sample.is_some() { ".sample" } else { "" },
+                       o.upscale.map(|s| format!(".{s}x")).unwrap_or_default(), if o.ai_hdr { ".hdr" } else { "" },
+                       o.layout.name_suffix());
     if o.output == "-" {
         return input.parent().unwrap_or(Path::new("")).join(name);
     }
@@ -418,6 +436,9 @@ mod tests {
         let o = parse(&args("a.mkv --upscale 2x --upscale-model /w.pth --input-layout HSBS --keep-repeated-frames --layout 2d")).unwrap();
         assert_eq!((o.upscale, o.upscale_model.as_deref(), o.input_layout.as_str()), (Some(2), Some("/w.pth"), "hsbs"));
         assert!(o.keep_repeated_frames && o.layout == Layout::Flat);
+        let o = parse(&args("a.mkv --antialias --ai-hdr --gain-model /g.mlpackage --upscale 2x")).unwrap();
+        assert!(o.antialias && o.ai_hdr && o.gain_model.as_deref() == Some("/g.mlpackage"));
+        assert_eq!(converted(Path::new("/f/a.mkv"), &o, true), PathBuf::from("/f/a.2x.hdr.3D.FSBS.mp4"));
         let o = Options { upscale: Some(2), ..Options::default() };
         assert_eq!(converted(Path::new("/f/Film.mkv"), &o, true), PathBuf::from("/f/Film.2x.3D.FSBS.mp4"));
         let o = Options { upscale: Some(2), layout: Layout::Flat, sample: Some(10.0), ..Options::default() };
