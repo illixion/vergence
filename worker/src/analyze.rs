@@ -30,6 +30,9 @@ pub struct Piece<'a> {
     pub ffmpeg: Option<&'a str>,
     pub models: &'a BTreeMap<String, String>,
     pub producer: &'a str,
+    /// Sticky runs are on (`stickyRuns` isn't false): a piece may carry on
+    /// from state its workload kept from the title's previous piece.
+    pub sticky: bool,
 }
 
 /// ffmpeg's arguments for a piece: half a frame early so the first frame out

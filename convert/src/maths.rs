@@ -29,6 +29,13 @@ impl Affine {
         self.a * x + self.b
     }
 
+    /// The mapping that sends a frame's raw `lo`…`hi` onto `range` (shot
+    /// space): `DepthAffine(mappingLo:hi:onto:)`.
+    pub fn onto(lo: f32, hi: f32, range: ShotRange) -> Affine {
+        let a = (range.hi - range.lo) / (hi - lo).max(1e-6);
+        Affine { a, b: range.lo - a * lo }
+    }
+
     /// `self(inner(x))`.
     pub fn after(self, inner: Affine) -> Affine {
         Affine { a: self.a * inner.a, b: self.a * inner.b + self.b }
@@ -162,7 +169,21 @@ pub struct ScaleShiftTracker {
     pub state: Option<Affine>,
 }
 
+/// A frame's robust depth range in shot space, where an earlier run's
+/// anchoring put it (`DepthShotRange`): what carries a worker's run on into a
+/// title's next piece.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShotRange {
+    pub lo: f32,
+    pub hi: f32,
+}
+
 impl ScaleShiftTracker {
+    /// A tracker carrying on from `state`, the mapping an earlier run locked.
+    pub fn carrying_on(state: Affine) -> ScaleShiftTracker {
+        ScaleShiftTracker { state: Some(state) }
+    }
+
     const HOLD_SECONDS: f64 = 3.0;
     const RECOVER_SECONDS: f64 = 0.6;
     const UNANCHORED_SECONDS: f64 = 0.5;
@@ -292,14 +313,32 @@ pub struct ShotFrame {
 /// Raw units → shot space for every frame (`DepthShotMapping.map`, single
 /// lattice: `vergence-convert` makes depth in one sweep).
 pub fn shot_mapping(frames: &[ShotFrame]) -> Vec<Affine> {
+    shot_mapping_seeded(frames, None).0
+}
+
+/// The same, carrying on from an earlier run (`DepthShotMapping.map(_:seed:)`):
+/// `seed` is where that run's anchoring put the first frame here (a frame
+/// both decoded) in shot space, so the chain continues as if the timeline had
+/// never been cut. Also returns each frame's locked mapping, what a later run
+/// seeds from.
+pub fn shot_mapping_seeded(frames: &[ShotFrame], seed: Option<ShotRange>) -> (Vec<Affine>, Vec<Affine>) {
     let n = frames.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut tracker = ScaleShiftTracker::default();
     let mut last_seconds: Option<f64> = None;
     let mut locked = vec![Affine::IDENTITY; n];
     for (i, f) in frames.iter().enumerate() {
+        if i == 0
+            && let Some(seed) = seed
+        {
+            let state = Affine::onto(f.lo, f.hi, seed);
+            tracker = ScaleShiftTracker::carrying_on(state);
+            last_seconds = Some(f.seconds);
+            locked[0] = state;
+            continue;
+        }
         if f.cut_before {
             tracker.reset();
         }
@@ -338,7 +377,7 @@ pub fn shot_mapping(frames: &[ShotFrame]) -> Vec<Affine> {
         }
         start = i;
     }
-    result
+    (result, locked)
 }
 
 /// UV transform from frame UV into the content region of a letterboxed depth
@@ -656,5 +695,32 @@ mod tests {
         assert!(gate.should_reuse(flat(100.5)));
         assert!(!gate.should_reuse(flat(110.0)));
         assert!(!gate.should_reuse(FrameChangeDetector::signature(16, 16, |_, _| [0.0; 3])));
+    }
+
+    /// As VergenceCore's `aSeededRunCarriesOnTheChainAsIfNeverCut`: a run from
+    /// frame 30 seeded with the whole run's lock there maps every later frame
+    /// as the uncut run does; a fresh start doesn't.
+    #[test]
+    fn a_seeded_run_carries_on_the_chain_as_if_never_cut() {
+        let frames: Vec<ShotFrame> = (0..80)
+            .map(|i| ShotFrame {
+                seconds: i as f64 / 24.0,
+                lo: 0.1 + 0.01 * i as f32,
+                hi: 0.9 + 0.03 * i as f32,
+                cut_before: false,
+                relative: (i > 0).then_some(Affine { a: 0.97, b: 0.01 }),
+            })
+            .collect();
+        let (whole, locked) = shot_mapping_seeded(&frames, None);
+        let seed = ShotRange { lo: locked[30].apply(frames[30].lo), hi: locked[30].apply(frames[30].hi) };
+        let (piece, _) = shot_mapping_seeded(&frames[30..], Some(seed));
+        let fresh = shot_mapping(&frames[30..]);
+        let (mut seeded, mut unseeded) = (0f32, 0f32);
+        for i in 32..79 {
+            seeded = seeded.max((piece[i - 30].apply(0.5) - whole[i].apply(0.5)).abs());
+            unseeded = unseeded.max((fresh[i - 30].apply(0.5) - whole[i].apply(0.5)).abs());
+        }
+        assert!(seeded < 1e-5, "{seeded}");
+        assert!(unseeded > 0.01, "{unseeded}");
     }
 }

@@ -630,7 +630,7 @@ fn convert_one(input: &Path, output: &Path, o: &Options, cx: &Context) -> Result
             let model = cx.loaded.get().expect("just loaded").clone();
             let (entry, provider) = depth::convert(depth::Job {
                 tools: cx.tools, input, probe: &probe, span, first_frame, expected_frames, encoder, directory: &depth_dir, model,
-                progress: &mut |f| progress.report(f),
+                progress: &mut |f| progress.report(f), seed: None, worker_run: false,
             }, gpu)?;
             progress.end();
             log(format!("  engines: depth model on {}, warp on {}, encoder {encoder}", provider.unwrap_or_default(), gpu.adapter_name));

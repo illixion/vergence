@@ -210,7 +210,7 @@ struct Worker {
     producer: String,
     yielder: Arc<dyn Yield>,
     /// A sticky run: the title and frame the last piece ended at, when its
-    /// workload keeps state for the next (AI HDR here).
+    /// workload keeps state for the next (AI HDR and AI 3D depth).
     last_run: Mutex<Option<(String, i64)>>,
 }
 
@@ -419,8 +419,9 @@ impl Worker {
                     started.elapsed().as_secs_f64(),
                     size as f64 / 1024.0
                 ));
-                // Only AI HDR keeps state across pieces here: depth's lives in the converter crate.
-                if self.config.sticky_runs != Some(false) && lease.workload == workloads::AI_HDR
+                // AI HDR keeps its keyframes across pieces, AI 3D depth its anchoring.
+                if self.config.sticky_runs != Some(false)
+                    && (lease.workload == workloads::AI_HDR || lease.workload == workloads::AI_3D_DEPTH)
                     && lease.end_frame < lease.frame_count
                 {
                     *self.last_run.lock().unwrap_or_else(|p| p.into_inner()) = Some((lease.title.clone(), lease.end_frame));
@@ -450,8 +451,9 @@ impl Worker {
         let models = self.profiles.get(&lease.workload).cloned().ok_or(format!("a lease for {}, which this worker didn't ask for", lease.workload))?;
         let (engine, producer) = (self.engine.clone(), self.producer.clone());
         let ffmpeg = self.config.ffmpeg.as_deref().map(|p| expand_tilde(p).to_string_lossy().into_owned());
+        let sticky = self.config.sticky_runs != Some(false);
         let result = tokio::task::spawn_blocking(move || {
-            let piece = Piece { lease: &lease, url: &url, ffmpeg: ffmpeg.as_deref(), models: &models, producer: &producer };
+            let piece = Piece { lease: &lease, url: &url, ffmpeg: ffmpeg.as_deref(), models: &models, producer: &producer, sticky };
             let mut slot = engine.lock().unwrap_or_else(|p| p.into_inner());
             let engine = slot.as_mut().ok_or_else(|| Failure::Error("the models aren't loaded".into()))?;
             analyze::run(&piece, engine, &stop)

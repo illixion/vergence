@@ -14,6 +14,7 @@
 //!   a ProRes intermediate of at most 1036 pixels as the Mac worker decodes it
 //!   (`DepthProducer`).
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -307,14 +308,36 @@ impl Drop for Scratch {
     }
 }
 
+/// A sticky depth run (`DepthProducer.run` on the Mac): the title, where its
+/// next piece starts, and the shot-space ranges the anchoring locked for the
+/// last piece's final frames, which the next piece's overlap starts from.
+#[derive(Clone, Debug)]
+pub struct DepthRun {
+    pub title: String,
+    pub next: i64,
+    pub locks: BTreeMap<i64, vergence_convert::maths::ShotRange>,
+}
+
+/// Frames a carried-on piece decodes before its own: the temporal window's
+/// reach. The anchoring's state comes from the last piece, so its second of
+/// context isn't needed (`DepthProducer.runOverlap`).
+pub const DEPTH_RUN_OVERLAP: i64 = 2;
+
 pub fn depth(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Vec<u8>, Failure> {
     use vergence_convert::{decode::Span, depth};
     let lease = piece.lease;
     let (w, h) = mono_size(lease)?;
-    let engine = engine.depth.as_ref().ok_or_else(|| Failure::Error("the depth model isn't loaded".into()))?;
+    // Carrying on a run: the anchoring goes on from the lock the last piece gave this
+    // piece's first overlap frame, as one decode of the whole title would have it.
+    let previous = engine.depth_run.take();
+    let seed = previous
+        .as_ref()
+        .filter(|run| piece.sticky && run.title == lease.title && run.next == lease.first_frame)
+        .and_then(|run| run.locks.get(&(lease.first_frame - DEPTH_RUN_OVERLAP)).copied());
+    let depth_engine = engine.depth.as_ref().ok_or_else(|| Failure::Error("the depth model isn't loaded".into()))?;
     let rate = lease.info.frame_rate;
     let before = (DEPTH_CONTEXT_SECONDS * rate.num as f64 / rate.den as f64).round() as i64;
-    let first = (lease.first_frame - before).max(0);
+    let first = if seed.is_some() { lease.first_frame - DEPTH_RUN_OVERLAP } else { (lease.first_frame - before).max(0) };
     let last = lease.frame_count.min(lease.end_frame + 2);
     let wanted = last - first;
     let scratch = Scratch(std::env::temp_dir().join(format!("vergence-depth-{}-{}", std::process::id(), lease.lease)));
@@ -356,11 +379,14 @@ pub fn depth(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Ve
             expected_frames: wanted as usize,
             encoder: &encoder,
             directory: &directory,
-            model: engine.model.clone(),
+            model: depth_engine.model.clone(),
             progress: &mut |_| {},
+            seed,
+            worker_run: true,
         },
-        &engine.gpu,
+        &depth_engine.gpu,
     )?;
+    let lock = entry.meta.shot_lock.clone();
     stopped(stop)?;
     let maps = depth::maps(&tools, &entry)?;
     let decoded_to = first + maps.len() as i64;
@@ -380,6 +406,17 @@ pub fn depth(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Ve
         let record = vergence_convert::track::Record::depth(map.payload, map.width, map.height, at.value, at.timescale,
                                                             map.scale, map.offset);
         track.extend(record.deflated_framed());
+    }
+    // Keep the anchoring's state at the end of this piece for the next one.
+    if piece.sticky
+        && !ended_early
+        && let Some(lock) = lock.filter(|l| l.len() == 2 * (decoded_to - first) as usize)
+    {
+        let locks = (0..(decoded_to - first) as usize)
+            .map(|k| (first + k as i64, vergence_convert::maths::ShotRange { lo: lock[2 * k], hi: lock[2 * k + 1] }))
+            .filter(|(index, _)| *index >= lease.end_frame - DEPTH_RUN_OVERLAP)
+            .collect();
+        engine.depth_run = Some(DepthRun { title: lease.title.clone(), next: lease.end_frame, locks });
     }
     Ok(if ended_early { crate::record::with_video_end(track, decoded_to) } else { track })
 }

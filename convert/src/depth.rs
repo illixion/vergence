@@ -26,7 +26,7 @@ use crate::decode::{FrameReader, FrameWriter, Span, encoder_args, input_args, sc
 use crate::gpu::{DepthRefiner, Gpu, Refined};
 use crate::maths::{
     AlignmentSums, AnchorCeiling, BINS, CutDetector, FrameChangeDetector, STATIC_LUMA_THRESHOLD, ScaleShiftTracker,
-    ShotFrame, TEMPORAL_DEPTH_SIGMA, letterbox, percentile, relative_mapping, shot_mapping, temporal_window,
+    ShotFrame, ShotRange, TEMPORAL_DEPTH_SIGMA, letterbox, percentile, relative_mapping, shot_mapping_seeded, temporal_window,
 };
 use crate::model::{self, DepthModel};
 use crate::probe::{Probe, Rate, Tools};
@@ -58,6 +58,11 @@ pub struct Meta {
     /// Stored byte / 255 → display depth: `v · scale + bias`, per frame.
     pub display_scale: Vec<f32>,
     pub display_bias: Vec<f32>,
+    /// Each frame's robust range in shot space as the anchoring locked it, lo
+    /// then hi (a worker's run, `Job::worker_run`): what the next piece of the
+    /// same title seeds from (`Meta.shotLock` on the Mac).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shot_lock: Option<Vec<f32>>,
 }
 
 pub struct Entry {
@@ -128,6 +133,13 @@ pub struct Job<'a> {
     /// Loaded once and kept: a converter's files and a worker's pieces share it.
     pub model: std::sync::Arc<std::sync::Mutex<DepthModel>>,
     pub progress: &'a mut dyn FnMut(f64),
+    /// Carry Stable Depth's anchoring on from an earlier run: where that run
+    /// put this part's first frame in shot space (a sticky worker run).
+    pub seed: Option<ShotRange>,
+    /// A worker's piece: every frame inferred (no repeat for a frame that
+    /// looks static, since which ones are depends on where a run started),
+    /// and the anchoring's locks kept in the meta for the next piece.
+    pub worker_run: bool,
 }
 
 /// Makes the depth for `job` into its directory (replacing what is there).
@@ -164,6 +176,7 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
 
     // Stage A: decode and prepare on one thread, infer on another.
     let (prepared_send, prepared_receive) = mpsc::sync_channel::<(Vec<f16>, Option<Vec<f32>>)>(3);
+    let reuse = !job.worker_run;
     let preparing_thread = std::thread::spawn(move || {
         let mut reader = reader;
         let mut gate = FrameChangeDetector::default();
@@ -171,7 +184,7 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
         let mut preparing = 0f64;
         while reader.next(&mut frame) {
             let started = Instant::now();
-            let (video, input) = prepare(&frame, hdr.then_some(hlg), (dw, dh), (mw, mh), &mut gate);
+            let (video, input) = prepare(&frame, hdr.then_some(hlg), (dw, dh), (mw, mh), reuse.then_some(&mut gate));
             preparing += started.elapsed().as_secs_f64();
             if prepared_send.send((video, input)).is_err() {
                 break;
@@ -288,7 +301,15 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
                 }
                 let relative = if cut_before { None } else { anchor.as_ref().and_then(|(sums, _)| sums.fit(mw * mh, p98 - p02)) };
                 let dt = tracker_seconds.map(|s| (seconds - s).max(0.0)).unwrap_or(0.0);
-                let live = tracker.update(p02, p98, relative, cut_before || index == 0, dt);
+                let live = match job.seed.filter(|_| index == 0) {
+                    // Carrying on from an earlier run: this frame where that run's anchoring put it.
+                    Some(seed) => {
+                        let state = crate::maths::Affine::onto(p02, p98, seed);
+                        tracker = ScaleShiftTracker::carrying_on(state);
+                        state
+                    }
+                    None => tracker.update(p02, p98, relative, cut_before || index == 0, dt),
+                };
                 tracker_seconds = Some(seconds);
                 background = AnchorCeiling::new(live);
                 previous = Some(refined);
@@ -343,7 +364,7 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
         .enumerate()
         .map(|(i, s)| ShotFrame { seconds: i as f64 / fps, lo: s.lo, hi: s.hi, cut_before: s.cut_before, relative: s.relative })
         .collect();
-    let mapping = shot_mapping(&frames);
+    let (mapping, locked) = shot_mapping_seeded(&frames, job.seed);
     let (uv_scale, uv_offset) = letterbox(dw, dh, hw, hh);
     let meta = Meta {
         version: META_VERSION,
@@ -361,6 +382,7 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
         uv_offset,
         display_scale: stats.iter().zip(&mapping).map(|(s, m)| m.a * (s.hi - s.lo)).collect(),
         display_bias: stats.iter().zip(&mapping).map(|(s, m)| m.apply(s.lo)).collect(),
+        shot_lock: job.worker_run.then(|| stats.iter().zip(&locked).flat_map(|(s, l)| [l.apply(s.lo), l.apply(s.hi)]).collect()),
     };
     std::fs::write(job.directory.join("meta.json"), serde_json::to_vec(&meta).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
@@ -372,7 +394,7 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
 /// (RGBA half floats) and as the model sees it, unless it is static against
 /// the last inferred frame (None: its depth repeats). The conversions run on
 /// a few threads: at 1036×582 they are as long as the inference.
-fn prepare(frame: &[u8], hdr: Option<bool>, (dw, dh): (usize, usize), model_size: (usize, usize), gate: &mut FrameChangeDetector)
+fn prepare(frame: &[u8], hdr: Option<bool>, (dw, dh): (usize, usize), model_size: (usize, usize), gate: Option<&mut FrameChangeDetector>)
     -> (Vec<f16>, Option<Vec<f32>>) {
     let sixteen = hdr.is_some();
     let pixels = dw * dh;
@@ -403,7 +425,8 @@ fn prepare(frame: &[u8], hdr: Option<bool>, (dw, dh): (usize, usize), model_size
         let i = (y * dw + x) * 3;
         [rgb[i] * 255.0, rgb[i + 1] * 255.0, rgb[i + 2] * 255.0]
     });
-    let input = (!gate.should_reuse(signature)).then(|| model::input(&rgb, dw, dh, hdr, model_size));
+    let reuse = gate.is_some_and(|gate| gate.should_reuse(signature));
+    let input = (!reuse).then(|| model::input(&rgb, dw, dh, hdr, model_size));
     (video, input)
 }
 
@@ -520,5 +543,77 @@ mod tests {
         assert_eq!(decode_size(1920, 1080), (1036, 582));
         assert_eq!(display_width(720, Some("0:1")), 720.0);
         assert_eq!(display_width(720, None), 720.0);
+    }
+
+    /// A worker's sticky run: a piece that starts two frames before frame 30,
+    /// seeded with where one run over the whole clip locked frame 28, gives
+    /// frames 30 on the same depth as that run. Needs Depth Anything V2 Small
+    /// as ONNX in VERGENCE_DEPTH_MODEL, ffmpeg and a GPU, and takes a minute
+    /// on a CPU in release (`cargo test --release -p vergence-convert seeded`);
+    /// skipped without them.
+    #[test]
+    fn a_seeded_piece_matches_one_run_over_the_whole_clip() {
+        let model_path = std::env::var_os("VERGENCE_DEPTH_MODEL").map(PathBuf::from).unwrap_or_default();
+        let (Ok(tools), true) = (Tools::locate(), model_path.is_file()) else {
+            eprintln!("skipped: no depth model at {} or no ffmpeg", model_path.display());
+            return;
+        };
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipped: no GPU");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // 72 frames of a moving scene, and the same from frame 28 on.
+        let clip = dir.path().join("clip.mp4");
+        let made = Tools::command(&tools.ffmpeg)
+            .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=480x270:rate=24:duration=3",
+                   "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-y"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let piece_clip = dir.path().join("piece.mp4");
+        let made = Tools::command(&tools.ffmpeg)
+            .args(["-nostdin", "-v", "error", "-i"]).arg(&clip)
+            .args(["-vf", "trim=start_frame=28,setpts=PTS-STARTPTS", "-c:v", "libx264", "-crf", "0", "-y"])
+            .arg(&piece_clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let model = std::sync::Arc::new(std::sync::Mutex::new(DepthModel::load(&model_path, model::Provider::Cpu, None).unwrap()));
+        let encoder = crate::decode::hevc_encoder(&tools).unwrap();
+        let run = |input: &Path, name: &str, seed: Option<ShotRange>| -> (Entry, Vec<DepthMap>) {
+            let probe = tools.probe(input).unwrap();
+            let (entry, _) = convert(Job {
+                tools: &tools, input, probe: &probe, span: Span { start: 0.0, length: None, frames: None }, first_frame: 0,
+                expected_frames: 72, encoder: &encoder, directory: &dir.path().join(name), model: model.clone(),
+                progress: &mut |_| {}, seed, worker_run: true,
+            }, &gpu).unwrap();
+            let maps = maps(&tools, &entry).unwrap();
+            (entry, maps)
+        };
+        let (whole, whole_maps) = run(&clip, "whole", None);
+        let lock = whole.meta.shot_lock.clone().expect("a worker's run keeps its locks");
+        assert_eq!(lock.len(), 2 * whole.meta.frame_count);
+        let seed = ShotRange { lo: lock[56], hi: lock[57] };
+        let (_, seeded_maps) = run(&piece_clip, "seeded", Some(seed));
+        let (_, fresh_maps) = run(&piece_clip, "fresh", None);
+        // Display depth (byte · scale + offset), frames 30 on.
+        let difference = |maps: &[DepthMap]| -> (f32, f32) {
+            let mut all = Vec::new();
+            for (k, map) in maps.iter().enumerate().skip(2) {
+                let reference = &whole_maps[28 + k];
+                for (a, b) in map.payload.iter().zip(&reference.payload) {
+                    all.push(((*a as f32 * map.scale + map.offset) - (*b as f32 * reference.scale + reference.offset)).abs());
+                }
+            }
+            let mean = all.iter().sum::<f32>() / all.len() as f32;
+            all.sort_by(f32::total_cmp);
+            (mean, all[all.len() * 99 / 100])
+        };
+        let (mean, p99) = difference(&seeded_maps);
+        let (fresh_mean, _) = difference(&fresh_maps);
+        eprintln!("seeded: mean {mean:.4}, p99 {p99:.4}; unseeded: mean {fresh_mean:.4}");
+        assert!(mean < 0.005 && p99 < 0.03, "seeded piece off the whole run: mean {mean}, p99 {p99}");
     }
 }
