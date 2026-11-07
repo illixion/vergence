@@ -2,6 +2,7 @@
 import AVFoundation
 import Foundation
 import Testing
+import VergenceCommandLine
 import VergenceCore
 import VergenceTestSupport
 
@@ -66,6 +67,40 @@ import VergenceTestSupport
         let stereo = try CLI.run(["convert", "clip.mp4", "--upscale", "2x", "--upscale-model", Self.network.path,
                                   "--input-layout", "sbs", "--layout", "2d", "--force"], in: directory)
         #expect(stereo.status == 1 && stereo.stderr.contains("--layout 2d is for 2D sources"), "\(stereo.stderr)")
+    }
+
+    static let gainModel: URL? = {
+        let path = ProcessInfo.processInfo.environment["VERGENCE_GAIN_MODEL"]
+            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                .deletingLastPathComponent().appendingPathComponent("Hypnos/Hypnos/Hypnos/Resources/GainMapGMNet.mlpackage").path
+        return FileManager.default.fileExists(atPath: path) ? URL(fileURLWithPath: path) : nil
+    }()
+
+    /// --antialias and --ai-hdr on a 3D source: 10-bit HEVC tagged BT.2020 PQ
+    /// with HDR10 static metadata, the eyes upscaled.
+    @Test(.enabled(if: gainModel != nil, "no GMNet: set VERGENCE_GAIN_MODEL to GainMapGMNet.mlpackage"))
+    func antialiasesAndMakesHDR() async throws {
+        let directory = try CLI.temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await SyntheticClip.writeSideBySide(to: directory.appendingPathComponent("clip.mp4"), frames: 24, audio: true)
+        let run = try CLI.run(["convert", "clip.mp4", "--upscale", "2x", "--upscale-model", Self.network.path, "--antialias",
+                               "--ai-hdr", "--gain-model", try #require(Self.gainModel).path], in: directory)
+        #expect(run.status == 0, "\(run.stderr)")
+        #expect(run.stderr.contains("antialiased:") && run.stderr.contains("AI HDR grids: 24 frames"), "\(run.stderr)")
+        let output = directory.appendingPathComponent("clip.2x.hdr.3D.FSBS.mp4")
+        let video = try #require(try await AVURLAsset(url: output).loadTracks(withMediaType: .video).first)
+        let format = try #require(try await video.load(.formatDescriptions).first)
+        let extensions = CMFormatDescriptionGetExtensions(format) as? [String: Any] ?? [:]
+        #expect(extensions[kCMFormatDescriptionExtension_TransferFunction as String] as? String
+            == kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+        #expect(extensions[kCMFormatDescriptionExtension_ColorPrimaries as String] as? String
+            == kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String)
+        #expect(extensions[kCMFormatDescriptionExtension_MasteringDisplayColorVolume as String] != nil)
+        #expect(extensions[kCMFormatDescriptionExtension_ContentLightLevelInfo as String] != nil)
+        #expect(try SphericalMetadata.read(output).stereoMode == .leftRight)
+        // An HDR source isn't made HDR again; --ai-hdr names its output.
+        #expect(OutputNames.converted(for: URL(fileURLWithPath: "/f/a.mkv"), try parse(["convert", "a", "--ai-hdr", "--upscale", "2x"]),
+                                      single: true).lastPathComponent == "a.2x.hdr.3D.FSBS.mp4")
     }
 }
 #endif

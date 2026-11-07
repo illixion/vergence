@@ -6,7 +6,8 @@
                     [--model PATH] [--download-model] [--depth-track FILE.vgat]
                     [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio]
                     [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab]
-                    [--keep-repeated-frames] [--dry-run] [--force]
+                    [--keep-repeated-frames] [--antialias] [--ai-hdr] [--gain-model PATH]
+                    [--dry-run] [--force]
 
  The offline path Convolution's Pre-Process takes, run to a file instead of a
  cache, in two passes over the video:
@@ -242,7 +243,7 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
             return false
         }
     }
-    let source = try await SpatialVideoSource.open(readable)
+    var source = try await SpatialVideoSource.open(readable)
     if source.isMultiviewStereo {
         log("vergence: \(name): already 3D (MV-HEVC spatial video)\(o.upscale != nil ? "; upscaling spatial video isn't done yet" : ""), skipped")
         return false
@@ -294,14 +295,27 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
 
     // The part to convert.
     let fps = source.frameRate > 0 ? source.frameRate : 30
-    let start = o.seek ?? o.sample.map { max(0, (source.duration - $0) / 2) } ?? 0
+    var start = o.seek ?? o.sample.map { max(0, (source.duration - $0) / 2) } ?? 0
     guard start < source.duration else { throw FormatError("--start \(start) is past the end (\(clockTime(source.duration)))") }
     var length = min(o.sample ?? .infinity, source.duration - start)
     // The depth window looks two frames ahead; give it those.
     if o.frames != Int.max { length = min(length, (Double(o.frames) + 2.5) / fps) }
-    let whole = start == 0 && length >= source.duration
-    let range = whole ? nil : CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 90_000),
+    var whole = start == 0 && length >= source.duration
+    var range = whole ? nil : CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 90_000),
                                           duration: CMTime(seconds: length, preferredTimescale: 90_000))
+    if o.aiHDR, source.isHDR { throw FormatError("--ai-hdr makes SDR video HDR; this is HDR already") }
+    // --antialias: the part, its edges smoothed, as a ProRes intermediate everything after reads.
+    var antialiasSeconds: Double?
+    if o.antialias, !o.dryRun {
+        let began = Date()
+        let antialiased = work.appendingPathComponent("antialiased.mov")
+        try Antialias.make(readable, start: start, length: whole ? nil : length, into: antialiased)
+        if !source.needsTenBit { eightBitSource = true }
+        readable = antialiased
+        source = try await SpatialVideoSource.open(antialiased)
+        (start, length, whole, range) = (0, source.duration, true, nil)
+        antialiasSeconds = Date().timeIntervalSince(began)
+    }
 
     // Each eye as it shows (a squeezed eye stretched back out), then as it
     // is made: twice that with --upscale, capped by --max-eye.
@@ -328,7 +342,8 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
         : layout.isSideBySide ? (width: made.width * 2, height: made.height) : (width: made.width, height: made.height * 2)
     // Half layouts squeeze both eyes into one frame's size.
     let picture = layout.isHalf ? made : packed
-    let tenBit = source.needsTenBit && !eightBitSource
+    // AI HDR is 10-bit BT.2020 PQ whatever the source was.
+    let tenBit = source.needsTenBit && !eightBitSource || o.aiHDR
     let strength = Float(o.strength ?? Pseudo3DSettings.default.depthStrength)
     let convergence = Float(o.convergence ?? Pseudo3DSettings.default.convergence)
 
@@ -365,6 +380,10 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
     if let network {
         log("  upscaled 2× from \(modelEye.width)×\(modelEye.height) by \(network.name) (Real-ESRGAN, \(network.convolutions) convolutions)")
     }
+    if let antialiasSeconds {
+        log(String(format: "  antialiased: edges smoothed (both fields by edge-slope tracing, along edges) in %.1f s", antialiasSeconds))
+    }
+    if o.aiHDR { log("  AI HDR: GMNet gain grids, BT.2020 PQ, SDR white at 203 nits, average gain held to 2.5×") }
     if let repeats, repeats.isPulldown {
         log(String(format: "  frames: one in five repeats the one before (%d of %d moving stretches): %@", repeats.repeating,
                    repeats.moving, dropRepeats ? String(format: "dropped, %.3f fps becomes %.3f", fps, outputFPS)
@@ -423,6 +442,18 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
     }
     }
 
+    // AI HDR's grids, as the ai-hdr workload makes them (from the left eye of a 3D source).
+    var grids: AIHDRGrids?
+    if o.aiHDR {
+        let began = Date()
+        let eye: PackedStereoLayout? = if case .stereoUpscale(let packing) = mode { packing } else { nil }
+        grids = try await AIHDRGrids.make(readable, start: start, length: whole ? nil : length, frameRate: fps, eye: eye,
+                                          model: try AIHDRGrids.model(o))
+        let seconds = Date().timeIntervalSince(began)
+        log(String(format: "  AI HDR grids: %d frames, %d keyframes in %.1f s (%.1f fps)", grids!.grids.count, grids!.keyframes,
+                   seconds, Double(grids!.grids.count) / max(seconds, 0.001)))
+    }
+
     // Pass 2: both eyes, encoded.
     let pictureBegan = Date()
     let stereoTarget = layout == .spatial ? work.appendingPathComponent("stereo.mov") : output
@@ -432,7 +463,7 @@ func convertOne(_ input: URL, _ output: URL, models: ConvertModels, _ o: Options
         arrangement: layout.isSideBySide ? .sideBySide : .topAndBottom, eye: made, picture: picture,
         strength: strength, convergence: convergence, bitsPerSecond: bitsPerSecond, tenBit: tenBit,
         includeAudio: o.includeAudio, progress: report("picture"), mode: mode, upscaler: upscaler, regions: regions,
-        dropRepeats: dropRepeats, outputFrameRate: outputFPS)
+        dropRepeats: dropRepeats, outputFrameRate: outputFPS, gains: grids)
     let result = try await encodeStereo(job)
     if terminal { FileHandle.standardError.write(Data("\r".utf8)) }
     let pictureSeconds = Date().timeIntervalSince(pictureBegan)
@@ -528,6 +559,8 @@ struct StereoEncodeJob: @unchecked Sendable {
     /// Drop one frame in five, the repeat, and space the rest evenly.
     var dropRepeats = false
     var outputFrameRate: Double = 30
+    /// AI HDR: each frame's grid, by its time from the part's start.
+    var gains: AIHDRGrids?
 }
 
 struct StereoEncodeResult: Sendable {
@@ -591,7 +624,9 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
     }
     let source = job.source
     let hdr = source.isHDR
-    let frameFormat = hdr ? FramePixelFormat.hdr : FramePixelFormat.sdr
+    // AI HDR draws in half floats (SDR code values) and writes PQ into them.
+    let aiHDR = job.gains != nil
+    let frameFormat = hdr || aiHDR ? FramePixelFormat.hdr : FramePixelFormat.sdr
     let encodeFormat = job.tenBit ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     let packedSize: (width: Int, height: Int) = if case .flatUpscale = job.mode { job.eye }
         else { job.arrangement.packedSize(width: job.eye.width, height: job.eye.height) }
@@ -633,9 +668,12 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
     let writer = try AVAssetWriter(outputURL: partial, fileType: job.fileType)
     // moov at the end, so the st3d box can be added without moving media.
     writer.shouldOptimizeForNetworkUse = false
-    let primaries = source.colorPrimaries ?? (hdr ? AVVideoColorPrimaries_ITU_R_2020 : AVVideoColorPrimaries_ITU_R_709_2)
-    let transferFunction = source.transferFunction ?? (hdr ? AVVideoTransferFunction_SMPTE_ST_2084_PQ : AVVideoTransferFunction_ITU_R_709_2)
-    let matrix = source.yCbCrMatrix ?? (hdr ? AVVideoYCbCrMatrix_ITU_R_2020 : AVVideoYCbCrMatrix_ITU_R_709_2)
+    let primaries = aiHDR ? AVVideoColorPrimaries_ITU_R_2020
+        : source.colorPrimaries ?? (hdr ? AVVideoColorPrimaries_ITU_R_2020 : AVVideoColorPrimaries_ITU_R_709_2)
+    let transferFunction = aiHDR ? AVVideoTransferFunction_SMPTE_ST_2084_PQ
+        : source.transferFunction ?? (hdr ? AVVideoTransferFunction_SMPTE_ST_2084_PQ : AVVideoTransferFunction_ITU_R_709_2)
+    let matrix = aiHDR ? AVVideoYCbCrMatrix_ITU_R_2020
+        : source.yCbCrMatrix ?? (hdr ? AVVideoYCbCrMatrix_ITU_R_2020 : AVVideoYCbCrMatrix_ITU_R_709_2)
     var compression: [String: Any] = [
         AVVideoAverageBitRateKey: job.bitsPerSecond,
         AVVideoExpectedSourceFrameRateKey: job.outputFrameRate,
@@ -643,6 +681,11 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
         AVVideoAllowFrameReorderingKey: true,
     ]
     if job.tenBit { compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String }
+    if aiHDR {
+        // HDR10 static metadata for an SDR picture made HDR (GainGridPass.staticMetadata).
+        compression[kVTCompressionPropertyKey_MasteringDisplayColorVolume as String] = GainGridPass.staticMetadata.masteringDisplay
+        compression[kVTCompressionPropertyKey_ContentLightLevelInfo as String] = GainGridPass.staticMetadata.contentLightLevel
+    }
     if hdr {
         for (extensionKey, frameKey, propertyKey) in [
             (kCMFormatDescriptionExtension_MasteringDisplayColorVolume, kCVImageBufferMasteringDisplayColorVolumeKey,
@@ -701,6 +744,7 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
     VTSessionSetProperty(transfer, key: kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, value: matrix as CFString)
 
     let depthSource = job.entry.map { CachedDepthSource(entry: $0, device: metal.device) }
+    let baker = job.gains == nil ? nil : try AIHDRBaker()
     defer { depthSource?.invalidate() }
 
     guard writer.startWriting() else { throw SpatialVideoError.writer(writer.error?.localizedDescription ?? "unknown") }
@@ -753,6 +797,20 @@ private func encodeStereoFrames(_ job: StereoEncodeJob, _ asset: AVURLAsset, _ v
                                 try job.upscaler?.upscale(frame, regions: job.regions, into: packed, at: [(0, 0), second])
                             case .flatUpscale:
                                 try job.upscaler?.upscale(frame, regions: job.regions, into: packed, at: [(0, 0)])
+                            }
+                            if let gains = job.gains, let baker,
+                               let grid = gains.grid(at: CMSampleBufferGetPresentationTimeStamp(sample).seconds - first) {
+                                // The left (first) eye's grid and capped scale for every eye, as a player draws them.
+                                let origins: [(x: Int, y: Int)]
+                                if case .flatUpscale = job.mode { origins = [(0, 0)] }
+                                else if job.arrangement == .sideBySide { origins = [(0, 0), (job.eye.width, 0)] }
+                                else { origins = [(0, 0), (0, job.eye.height)] }
+                                try baker.bake(packed, grid: grid, eye: job.eye, origins: origins)
+                                // PQ BT.2020 already: the transfer only changes the format.
+                                CVBufferSetAttachment(packed, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+                                CVBufferSetAttachment(packed, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+                                                      .shouldPropagate)
+                                CVBufferSetAttachment(packed, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
                             }
                             guard let pool = adaptor.pixelBufferPool else { throw SpatialVideoError.writer("the writer has no buffer pool") }
                             var encodedOut: CVPixelBuffer?

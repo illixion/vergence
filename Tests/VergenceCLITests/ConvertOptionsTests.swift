@@ -73,6 +73,9 @@ import VergenceCommandLine
                            "--keep-repeated-frames", "--layout", "2d"])
         #expect(o.upscale == 2 && o.upscaleModel == "~/w.pth" && o.inputLayout == "hsbs" && o.keepRepeatedFrames)
         #expect(o.convertLayout == .flat)
+        let passes = try parse(["convert", "a", "--antialias", "--ai-hdr", "--gain-model", "~/g.mlpackage"])
+        #expect(passes.antialias && passes.aiHDR && passes.gainModel == "~/g.mlpackage")
+        #expect(try parse(["convert", "a"]).antialias == false)
         #expect(try parse(["convert", "a", "--input-layout", "flat", "--upscale", "2"]).inputLayout == "2d")
         let input = URL(fileURLWithPath: "/films/Film.mkv")
         func name(_ args: String...) throws -> String {

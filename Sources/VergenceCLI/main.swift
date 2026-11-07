@@ -12,7 +12,7 @@
                     [--convergence 0...1] [--sample SECONDS] [--start S] [--frames N] [--model PATH]
                     [--download-model] [--depth-track FILE.vgat] [--quality ...] [--bitrate MBPS] [--max-eye PIXELS]
                     [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab]
-                    [--keep-repeated-frames]
+                    [--keep-repeated-frames] [--antialias] [--ai-hdr] [--gain-model PATH]
    vergence audio VIDEO [--track N] [--bitrate KBPS] --output FILE.opus|.ogg|.mka|.webm|.mp4|.wav
    vergence info DISC
    vergence decode DISC [--playlist NNNNN] [options]
@@ -149,7 +149,7 @@ func usage(_ problem: String? = nil) -> Never {
                             [--model PATH] [--download-model] [--depth-track FILE.vgat]
                             [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio]
                             [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab]
-                            [--keep-repeated-frames]
+                            [--keep-repeated-frames] [--antialias] [--ai-hdr] [--gain-model PATH]
            vergence info DISC
            vergence decode DISC [--playlist NNNNN] [options]
            vergence decode BASE.m2ts [DEPENDENT.m2ts] [options]

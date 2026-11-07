@@ -91,6 +91,15 @@ public struct Options: Equatable, Sendable {
     /// `--keep-repeated-frames`: keep the frames a pulldown repeats (one in
     /// five), which are otherwise found and dropped.
     public var keepRepeatedFrames = false
+    /// `--antialias`: smooth an old SD source's stair-stepped edges (line
+    /// doubling, NTSC deinterlacing) before anything else sees the picture.
+    public var antialias = false
+    /// `--ai-hdr`: make an SDR source HDR with GMNet's gain grids, as the
+    /// `ai-hdr` workload and the players do (10-bit BT.2020 PQ out).
+    public var aiHDR = false
+    /// `--gain-model PATH`: GMNet as Core ML (Convolution's GainMapGMNet
+    /// conversion), for `--ai-hdr`.
+    public var gainModel: String?
 
     public init() {}
 
@@ -310,6 +319,9 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
             }
             o.inputLayout = v == "flat" ? "2d" : v
         case "--keep-repeated-frames": try flag(); o.keepRepeatedFrames = true
+        case "--antialias": try flag(); o.antialias = true
+        case "--ai-hdr": try flag(); o.aiHDR = true
+        case "--gain-model": o.gainModel = try value()
         default: throw UsageError("unknown option \(name)")
         }
     }
@@ -364,10 +376,11 @@ public enum OutputNames {
     /// `convert`: VIDEO.ext becomes VIDEO.3D.FSBS.mp4 (.3D.HSBS.mp4, .3D.FTAB.mp4,
     /// .3D.HTAB.mp4 or .spatial.mov by --layout); a --sample piece is
     /// VIDEO.sample.3D.FSBS.mp4; upscaled, VIDEO.2x.3D.FSBS.mp4, or VIDEO.2x.mp4
-    /// with --layout 2d.
+    /// with --layout 2d; made HDR, VIDEO.hdr.3D.FSBS.mp4.
     public static func converted(for input: URL, _ o: Options, single: Bool) -> URL {
         placed(input.deletingPathExtension().lastPathComponent + (o.sample != nil ? ".sample" : "")
-                   + (o.upscale.map { ".\($0)x" } ?? "") + o.convertLayout.nameSuffix, beside: input, o, single: single)
+                   + (o.upscale.map { ".\($0)x" } ?? "") + (o.aiHDR ? ".hdr" : "") + o.convertLayout.nameSuffix,
+               beside: input, o, single: single)
     }
 
     /// `sbs --segments DIR`: the folder (the current one for `--info` alone)
