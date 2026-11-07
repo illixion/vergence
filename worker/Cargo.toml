@@ -12,10 +12,10 @@ path = "src/main.rs"
 [features]
 # Execution providers beyond the platform's default (Core ML on macOS,
 # DirectML on Windows). Each picks ONNX Runtime binaries built with it.
-cuda = ["ort/cuda"]
-tensorrt = ["ort/tensorrt"]
-directml = ["ort/directml"]
-coreml = ["ort/coreml"]
+cuda = ["ort/cuda", "vergence-convert/cuda"]
+tensorrt = ["ort/tensorrt", "vergence-convert/tensorrt"]
+directml = ["ort/directml", "vergence-convert/directml"]
+coreml = ["ort/coreml", "vergence-convert/coreml"]
 
 [dependencies]
 ort = "=2.0.0-rc.15"
@@ -28,6 +28,9 @@ serde_json = "1"
 flate2 = "1"
 rand = "0.9"
 thiserror = "2"
+half = "2"
+# The offline depth pipeline (ai-3d-depth), as the Windows converter runs it.
+vergence-convert = { path = "../convert" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ort = { version = "=2.0.0-rc.15", features = ["coreml"] }

@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::client::Lease;
-use crate::engine::Engine;
+use crate::engine::{Engine, StereoModels};
 use crate::preprocess::{DISPARITY_SIZE, FLOW_SIZE, eyes, rgb_planar};
 use crate::record::{Time, disparity_record, flow_pair_record, track_header};
 
@@ -37,9 +37,20 @@ pub struct Piece<'a> {
 /// doesn't repeat the first frame after a seek, and (H.264) no SEI, whose
 /// frame-packing messages make ffmpeg 8 and 9 fail.
 pub fn ffmpeg_args(lease: &Lease, url: &str) -> Vec<String> {
+    let mut args = ffmpeg_input_args(lease, url, lease.first_frame);
+    args.extend(
+        ["-map", "0:v:0", "-fps_mode", "passthrough", "-frames:v", &frames_wanted(lease).to_string(), "-f", "rawvideo",
+         "-pix_fmt", "yuv420p", "-"]
+            .map(String::from),
+    );
+    args
+}
+
+/// The arguments up to and including the input, seeking so that the first
+/// frame out is `first`.
+pub fn ffmpeg_input_args(lease: &Lease, url: &str, first: i64) -> Vec<String> {
     let rate = lease.info.frame_rate;
-    let wanted = frames_wanted(lease);
-    let seek = (lease.first_frame as f64 - 0.5) * rate.den as f64 / rate.num as f64;
+    let seek = (first as f64 - 0.5) * rate.den as f64 / rate.num as f64;
     let mut args: Vec<String> = ["-nostdin", "-v", "error"].map(String::from).to_vec();
     if lease.info.codec.eq_ignore_ascii_case("h264") {
         args.extend(["-bsf:v", "filter_units=remove_types=6"].map(String::from));
@@ -47,11 +58,7 @@ pub fn ffmpeg_args(lease: &Lease, url: &str) -> Vec<String> {
     if seek > 0.0 {
         args.extend(["-ss".to_string(), format!("{seek:.6}")]);
     }
-    args.extend(
-        ["-i", url, "-map", "0:v:0", "-fps_mode", "passthrough", "-frames:v", &wanted.to_string(), "-f", "rawvideo",
-         "-pix_fmt", "yuv420p", "-"]
-            .map(String::from),
-    );
+    args.extend(["-i".to_string(), url.to_string()]);
     args
 }
 
@@ -61,6 +68,16 @@ pub fn frames_wanted(lease: &Lease) -> i64 {
 }
 
 pub fn run(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Vec<u8>, Failure> {
+    match piece.lease.workload.as_str() {
+        crate::workloads::SMOOTH_MOTION_3D => run_3d(piece, engine, stop),
+        crate::workloads::SMOOTH_MOTION_2D => crate::workloads::mono_flow(piece, engine, stop),
+        crate::workloads::AI_HDR => crate::workloads::gain_grids(piece, engine, stop),
+        crate::workloads::AI_3D_DEPTH => crate::workloads::depth(piece, engine, stop),
+        other => Err(format!("this worker doesn't make {other}").into()),
+    }
+}
+
+fn run_3d(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Result<Vec<u8>, Failure> {
     let lease = piece.lease;
     let mut kinds = lease.kinds.clone();
     kinds.sort();
@@ -173,7 +190,8 @@ fn frames(piece: &Piece, engine: &mut Engine, stop: &AtomicBool, mut output: imp
                 return Err(Failure::Yielded("asked to stop".into()));
             }
             let time = Time { value: index * rate.den, timescale: rate.num as i32 };
-            let Engine { flow, disparity, .. } = &mut *engine;
+            let StereoModels { flow, disparity } =
+                engine.stereo.as_mut().ok_or_else(|| Failure::Error("the 3D models aren't loaded".into()))?;
             // The two models run at once, as the Swift worker runs them.
             let (flow_out, disparity_out) = std::thread::scope(|scope| {
                 let flow_job = previous.as_ref().map(|(prev, _)| scope.spawn(|| flow.run(prev, &left_flow)));
@@ -209,6 +227,7 @@ mod tests {
         Lease {
             lease: 1,
             title: "t".into(),
+            workload: "smooth-motion-3d".into(),
             source: Source { server: "jellyfin".into(), id: "x".into() },
             kinds: vec!["flowPair".into(), "disparity".into()],
             piece: 0,

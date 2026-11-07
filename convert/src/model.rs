@@ -12,6 +12,8 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::value::TensorRef;
 use sha2::{Digest, Sha256};
 
+/// The size a model takes when it doesn't say (an export with free height
+/// and width, such as the onnx-community one): Apple's Core ML build's.
 pub const WIDTH: usize = 518;
 pub const HEIGHT: usize = 392;
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -101,12 +103,28 @@ pub struct DepthModel {
     session: Session,
     pub provider: Provider,
     pub name: String,
+    /// The input's size: the model's own when fixed, else the size asked for.
+    pub width: usize,
+    pub height: usize,
     _env: Environment,
 }
 
+/// ONNX Runtime's environment, one per process (the worker loads its models
+/// again after standing aside).
+pub fn environment(name: &str) -> Result<Environment, String> {
+    static ENVIRONMENT: std::sync::OnceLock<Environment> = std::sync::OnceLock::new();
+    if let Some(env) = ENVIRONMENT.get() {
+        return Ok(env.clone());
+    }
+    let env = ort::init().with_name(name).build().map_err(|e| e.to_string())?;
+    Ok(ENVIRONMENT.get_or_init(|| env).clone())
+}
+
 impl DepthModel {
-    pub fn load(path: &Path, provider: Provider) -> Result<DepthModel, String> {
-        let env = ort::init().with_name("vergence-convert").build().map_err(|e| e.to_string())?;
+    /// `size`: (width, height) for a model whose input size is free (multiples
+    /// of 14); 518×392 when None. A fixed-size model keeps its own.
+    pub fn load(path: &Path, provider: Provider, size: Option<(usize, usize)>) -> Result<DepthModel, String> {
+        let env = environment("vergence-convert")?;
         // What TensorRT and Core ML compile, kept between runs (only they make it).
         let cache = std::env::temp_dir().join("vergence-convert-model-cache");
         let mut errors = Vec::new();
@@ -130,14 +148,25 @@ impl DepthModel {
             })();
             match built {
                 Ok(session) => {
+                    let declared: Vec<i64> = session
+                        .inputs()
+                        .first()
+                        .and_then(|i| i.dtype().tensor_shape().map(|s| s.iter().copied().collect()))
+                        .unwrap_or_default();
+                    let (width, height) = match declared[..] {
+                        [_, _, h, w] if h > 0 && w > 0 => (w as usize, h as usize),
+                        _ => size.unwrap_or((WIDTH, HEIGHT)),
+                    };
                     let mut model = DepthModel {
                         session,
                         provider: candidate,
                         name: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                        width,
+                        height,
                         _env: env,
                     };
                     // The first run specialises the graph for the device; pay it here.
-                    model.infer(&vec![0.0; 3 * WIDTH * HEIGHT])?;
+                    model.infer(&vec![0.0; 3 * width * height])?;
                     return Ok(model);
                 }
                 Err(e) => errors.push(format!("{}: {e}", candidate.name())),
@@ -146,17 +175,18 @@ impl DepthModel {
         Err(format!("no execution provider could load the depth model ({})", errors.join("; ")))
     }
 
-    /// `input`: planar normalised RGB at 518×392. Returns the map divided by
-    /// its maximum, at 518×392.
+    /// `input`: planar normalised RGB at the model's size. Returns the map
+    /// divided by its maximum, at that size.
     pub fn infer(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
+        let (w, h) = (self.width, self.height);
         let e = |e: ort::Error| format!("the depth model: {e}");
         let outputs = self
             .session
-            .run(ort::inputs!["pixel_values" => TensorRef::from_array_view(([1usize, 3, HEIGHT, WIDTH], input)).map_err(e)?])
+            .run(ort::inputs!["pixel_values" => TensorRef::from_array_view(([1usize, 3, h, w], input)).map_err(e)?])
             .map_err(e)?;
         let (_, depth) = outputs["predicted_depth"].try_extract_tensor::<f32>().map_err(e)?;
-        if depth.len() != WIDTH * HEIGHT {
-            return Err(format!("the depth model gave {} values, not {}", depth.len(), WIDTH * HEIGHT));
+        if depth.len() != w * h {
+            return Err(format!("the depth model gave {} values, not {}", depth.len(), w * h));
         }
         let max = depth.iter().copied().filter(|v| v.is_finite()).fold(f32::MIN, f32::max);
         let scale = if max > 0.0 { 1.0 / max } else { 1.0 };
@@ -210,11 +240,11 @@ pub fn download() -> Result<PathBuf, String> {
 
 // MARK: - The model's input
 
-/// The fitted size inside 518×392, even, as `CoreMLDepthProvider.preparedInput` makes it.
-pub fn fitted(width: usize, height: usize) -> (usize, usize) {
-    let scale = (WIDTH as f64 / width as f64).min(HEIGHT as f64 / height as f64).min(1.0);
+/// The fitted size inside the model's (`mw`×`mh`), even, as `CoreMLDepthProvider.preparedInput` makes it.
+pub fn fitted(width: usize, height: usize, (mw, mh): (usize, usize)) -> (usize, usize) {
+    let scale = (mw as f64 / width as f64).min(mh as f64 / height as f64).min(1.0);
     let even = |v: usize| ((v as f64 * scale / 2.0).round() as usize * 2).max(2);
-    (even(width).min(WIDTH), even(height).min(HEIGHT))
+    (even(width).min(mw), even(height).min(mh))
 }
 
 /// Resamples one channel-interleaved image with a tent filter as wide as the
@@ -289,21 +319,21 @@ pub fn resize(src: &[f32], w: usize, h: usize, channels: usize, tw: usize, th: u
 /// The model's input from an RGB frame (0…1, interleaved): fitted, centred on
 /// black, planar, ImageNet-normalised. `hdr`: the frame holds PQ (false) or
 /// HLG (true) code values, tone-mapped to BT.709 once at the model's size.
-pub fn input(rgb: &[f32], w: usize, h: usize, hdr: Option<bool>) -> Vec<f32> {
-    let (tw, th) = fitted(w, h);
+pub fn input(rgb: &[f32], w: usize, h: usize, hdr: Option<bool>, (mw, mh): (usize, usize)) -> Vec<f32> {
+    let (tw, th) = fitted(w, h, (mw, mh));
     let mut small = resize(rgb, w, h, 3, tw, th);
     if let Some(hlg) = hdr {
         tone_map(&mut small, hlg);
     }
-    let (ox, oy) = ((WIDTH - tw) / 2, (HEIGHT - th) / 2);
-    let mut out = vec![0f32; 3 * WIDTH * HEIGHT];
+    let (ox, oy) = ((mw - tw) / 2, (mh - th) / 2);
+    let mut out = vec![0f32; 3 * mw * mh];
     for c in 0..3 {
         let black = (0.0 - MEAN[c]) / STD[c];
-        let plane = &mut out[c * WIDTH * HEIGHT..(c + 1) * WIDTH * HEIGHT];
+        let plane = &mut out[c * mw * mh..(c + 1) * mw * mh];
         plane.fill(black);
         for y in 0..th {
             for x in 0..tw {
-                plane[(y + oy) * WIDTH + x + ox] = (small[(y * tw + x) * 3 + c].clamp(0.0, 1.0) - MEAN[c]) / STD[c];
+                plane[(y + oy) * mw + x + ox] = (small[(y * tw + x) * 3 + c].clamp(0.0, 1.0) - MEAN[c]) / STD[c];
             }
         }
     }
@@ -317,7 +347,7 @@ pub fn tone_map(rgb: &mut [f32], hlg: bool) {
     const M: [[f32; 3]; 3] = [[1.6605, -0.5876, -0.0728], [-0.1246, 1.1329, -0.0083], [-0.0182, -0.1006, 1.1187]];
     let (eotf, oetf) = tone_tables(hlg);
     let white = 1000.0f32 / 203.0;
-    for px in rgb.chunks_exact_mut(3) {
+    for px in rgb.as_chunks_mut::<3>().0 {
         let lin = [0, 1, 2].map(|c| lookup(eotf, px[c]));
         for (c, row) in M.iter().enumerate() {
             let x = (row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2]).max(0.0);
@@ -379,9 +409,11 @@ mod tests {
     #[test]
     fn fits_like_the_provider() {
         // A 1080p frame decoded at 1036×582 goes in at 518×292, letterboxed by 50 rows.
-        assert_eq!(fitted(1036, 582), (518, 292));
-        assert_eq!(fitted(400, 400), (392, 392));
-        assert_eq!(fitted(300, 200), (300, 200));
+        let size = (WIDTH, HEIGHT);
+        assert_eq!(fitted(1036, 582, size), (518, 292));
+        assert_eq!(fitted(400, 400, size), (392, 392));
+        assert_eq!(fitted(300, 200, size), (300, 200));
+        assert_eq!(fitted(1036, 582, (770, 574)), (770, 432));
     }
 
     #[test]
@@ -398,7 +430,7 @@ mod tests {
     #[test]
     fn letterboxes_on_black() {
         let rgb = vec![1.0f32; 3 * 1036 * 582];
-        let x = input(&rgb, 1036, 582, None);
+        let x = input(&rgb, 1036, 582, None, (WIDTH, HEIGHT));
         let white = (1.0 - MEAN[0]) / STD[0];
         let black = (0.0 - MEAN[0]) / STD[0];
         assert!((x[200 * WIDTH + 10] - white).abs() < 1e-5);

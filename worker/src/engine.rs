@@ -12,9 +12,15 @@
 //! models (float16 inputs, RIFE computed in float16) these are float32
 //! throughout; how far apart the two land is what `scripts/check-onnx-worker.sh`
 //! measures.
+//!
+//! The other workloads' models load beside them on the same provider: RIFE at
+//! 960×576 for 2D titles (the same model at another size), Depth Anything V2
+//! Small through `vergence_convert`'s depth pipeline, and GMNet
+//! (`scripts/export-gmnet-onnx.py`): `image` 1×3×H×W and `thumbnail`
+//! 1×3×256×256, RGB 0…1; `gain` 1×1×H×W, the linear multiplier.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use ort::ep::{self, ExecutionProviderDispatch};
 use ort::environment::Environment;
@@ -158,12 +164,8 @@ fn session_with(env: &Environment, path: &Path, provider: Provider, options: &En
 /// ONNX Runtime's environment: one per process, kept for good, so the models
 /// can be loaded again after standing aside.
 fn environment() -> Result<Environment, String> {
-    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
-    if let Some(env) = ENVIRONMENT.get() {
-        return Ok(env.clone());
-    }
-    let env = ort::init().with_name("vergence-worker").build().map_err(|e| e.to_string())?;
-    Ok(ENVIRONMENT.get_or_init(|| env).clone())
+    // Shared with the depth pipeline's, which makes its own sessions.
+    vergence_convert::model::environment("vergence-worker")
 }
 
 /// The newest-named `prefix*size*.onnx` in `folder`, preferring one-way NeuFlow
@@ -202,6 +204,9 @@ fn expect_input(session: &Session, name: &str, shape: &[i64], model: &str) -> Re
 pub struct FlowModel {
     session: Session,
     pub name: String,
+    /// The model's working size, from its input.
+    pub width: usize,
+    pub height: usize,
 }
 
 pub struct DisparityModel {
@@ -209,57 +214,150 @@ pub struct DisparityModel {
     pub name: String,
 }
 
-/// Both models on one execution provider. `flow` and `disparity` may run at
-/// the same time from two threads (each needs only its own half).
-pub struct Engine {
+/// The 3D workload's pair.
+pub struct StereoModels {
     pub flow: FlowModel,
     pub disparity: DisparityModel,
+}
+
+pub struct GainModel {
+    session: Session,
+    pub name: String,
+}
+
+/// Depth Anything through the converter's offline pipeline, and the GPU its
+/// refinement runs on.
+pub struct DepthEngine {
+    pub model: Arc<Mutex<vergence_convert::model::DepthModel>>,
+    pub gpu: vergence_convert::gpu::Gpu,
+}
+
+/// What to load: the workloads this worker takes.
+#[derive(Clone, Debug, Default)]
+pub struct Wanted {
+    pub stereo: bool,
+    /// Required (named in `workloads`), or only when its model is there.
+    pub mono: Option<bool>,
+    /// The model and the size to run it at when its input size is free.
+    pub depth: Option<(PathBuf, (usize, usize))>,
+    pub gain: Option<PathBuf>,
+}
+
+/// Every model this worker runs, on one execution provider. In the 3D pair,
+/// `flow` and `disparity` may run at the same time from two threads.
+pub struct Engine {
+    pub stereo: Option<StereoModels>,
+    pub mono: Option<FlowModel>,
+    pub gain: Option<GainModel>,
+    pub depth: Option<DepthEngine>,
     /// The provider that loaded (never `Auto`).
     pub provider: Provider,
     _env: Environment,
 }
 
 impl Engine {
-    pub fn load(models: &Path, provider: Provider, options: &EngineOptions) -> Result<Engine, String> {
-        let flow_path = find_model(models, "RIFE", "480x288")?;
-        let disparity_path = find_model(models, "NeuFlow", "512x288")?;
+    pub fn load(models: &Path, wanted: &Wanted, provider: Provider, options: &EngineOptions) -> Result<Engine, String> {
+        let stereo_paths = if wanted.stereo {
+            Some((find_model(models, "RIFE", "480x288")?, find_model(models, "NeuFlow", "512x288")?))
+        } else {
+            None
+        };
+        // The family the 3D workload and the export use first, as `vergence worker` picks.
+        let mono_path = match wanted.mono {
+            None => None,
+            Some(required) => match find_model(models, "RIFE425lite", "960x576").or_else(|_| find_model(models, "RIFE", "960x576")) {
+                Ok(path) => Some(path),
+                Err(e) if required => return Err(format!("smooth-motion-2d: {e}")),
+                Err(_) => None,
+            },
+        };
         let env = environment()?;
         let mut errors = Vec::new();
         for candidate in provider.candidates() {
-            let loaded = session(&env, &flow_path, candidate, options)
-                .and_then(|f| session(&env, &disparity_path, candidate, options).map(|d| (f, d)));
-            match loaded {
-                Ok((flow, disparity)) => {
-                    let (fw, fh) = FLOW_SIZE;
-                    let (dw, dh) = DISPARITY_SIZE;
-                    expect_input(&flow, "img0", &[1, 3, fh as i64, fw as i64], "RIFE")?;
-                    expect_input(&disparity, "img0", &[1, 3, dh as i64, dw as i64], "NeuFlow")?;
-                    let mut engine = Engine {
-                        flow: FlowModel { session: flow, name: stem(&flow_path) },
-                        disparity: DisparityModel { session: disparity, name: stem(&disparity_path) },
-                        provider: candidate,
-                        _env: env,
-                    };
-                    // The first run specialises the models for the device; pay it here.
-                    let grey = vec![0.5f32; 3 * fw * fh];
-                    engine.flow.run(&grey, &grey)?;
-                    let grey = vec![0.5f32; 3 * dw * dh];
-                    engine.disparity.run(&grey, &grey)?;
-                    return Ok(engine);
-                }
+            match Engine::load_on(&env, candidate, options, stereo_paths.as_ref(), mono_path.as_deref(), wanted) {
+                Ok(engine) => return Ok(engine),
                 Err(e) => errors.push(format!("{}: {e}", candidate.name())),
             }
         }
         Err(format!("no execution provider could load the models ({})", errors.join("; ")))
     }
+
+    fn load_on(env: &Environment, candidate: Provider, options: &EngineOptions, stereo: Option<&(PathBuf, PathBuf)>,
+               mono: Option<&Path>, wanted: &Wanted) -> Result<Engine, String> {
+        let flow_model = |path: &Path| -> Result<FlowModel, String> {
+            let session = session(env, path, candidate, options)?;
+            let (w, h) = input_size(&session, "img0").ok_or(format!("{}: img0 isn't 1×3×H×W", path.display()))?;
+            let mut model = FlowModel { session, name: stem(path), width: w, height: h };
+            // The first run specialises the model for the device; pay it here.
+            let grey = vec![0.5f32; 3 * w * h];
+            model.run(&grey, &grey)?;
+            Ok(model)
+        };
+        let stereo = match stereo {
+            Some((flow_path, disparity_path)) => {
+                let flow = flow_model(flow_path)?;
+                let (fw, fh) = FLOW_SIZE;
+                let (dw, dh) = DISPARITY_SIZE;
+                if (flow.width, flow.height) != (fw, fh) {
+                    return Err(format!("RIFE: {}x{}, wanted {fw}x{fh}", flow.width, flow.height));
+                }
+                let disparity = session(env, disparity_path, candidate, options)?;
+                expect_input(&disparity, "img0", &[1, 3, dh as i64, dw as i64], "NeuFlow")?;
+                let mut disparity = DisparityModel { session: disparity, name: stem(disparity_path) };
+                disparity.run(&vec![0.5f32; 3 * dw * dh], &vec![0.5f32; 3 * dw * dh])?;
+                Some(StereoModels { flow, disparity })
+            }
+            None => None,
+        };
+        let mono = mono.map(flow_model).transpose()?;
+        // GMNet and Depth Anything take free input sizes, for which TensorRT
+        // builds an engine per size (minutes, gigabytes): CUDA runs them instead.
+        let free_size = if candidate == Provider::TensorRt { Provider::Cuda } else { candidate };
+        let gain = match &wanted.gain {
+            Some(path) => {
+                let mut model = GainModel { session: session(env, path, free_size, options)?, name: stem(path) };
+                let (w, h) = GAIN_SIZES[0];
+                model.run(&vec![0.5f32; 3 * w * h], w, h, &vec![0.5f32; 3 * 256 * 256])?;
+                Some(model)
+            }
+            None => None,
+        };
+        let depth = match &wanted.depth {
+            Some((path, size)) => {
+                use vergence_convert::model::{DepthModel, Provider as DepthProvider};
+                let provider = match free_size {
+                    Provider::Auto => DepthProvider::Auto,
+                    Provider::Cuda => DepthProvider::Cuda,
+                    Provider::TensorRt => DepthProvider::TensorRt,
+                    Provider::DirectMl => DepthProvider::DirectMl,
+                    Provider::CoreMl => DepthProvider::CoreMl,
+                    Provider::Cpu => DepthProvider::Cpu,
+                };
+                let model = DepthModel::load(path, provider, Some(*size))?;
+                Some(DepthEngine { model: Arc::new(Mutex::new(model)), gpu: vergence_convert::gpu::Gpu::new()? })
+            }
+            None => None,
+        };
+        Ok(Engine { stereo, mono, gain, depth, provider: candidate, _env: env.clone() })
+    }
+}
+
+/// An input's (width, height) when it is 1×3×H×W with both fixed.
+fn input_size(session: &Session, name: &str) -> Option<(usize, usize)> {
+    let outlet = session.inputs().iter().find(|i| i.name() == name)?;
+    let shape: Vec<i64> = outlet.dtype().tensor_shape().map(|s| s.iter().copied().collect())?;
+    match shape[..] {
+        [1, 3, h, w] if h > 0 && w > 0 => Some((w as usize, h as usize)),
+        _ => None,
+    }
 }
 
 impl FlowModel {
-    /// The left eye's motion between two real frames, at t = ½.
-    /// `a`, `b`: planar RGB 0…1 at 480×288. Returns F½→0 (x, y), F½→1 (x, y)
-    /// planar, and frame 0's blend weight, at 480×288.
+    /// The motion between two frames, at t = ½.
+    /// `a`, `b`: planar RGB 0…1 at the model's size. Returns F½→0 (x, y), F½→1 (x, y)
+    /// planar, and frame 0's blend weight, at the model's size.
     pub fn run(&mut self, a: &[f32], b: &[f32]) -> Result<(Vec<f32>, Vec<f32>), String> {
-        let (w, h) = FLOW_SIZE;
+        let (w, h) = (self.width, self.height);
         let shape = [1usize, 3, h, w];
         let t = [0.5f32];
         let e = |e: ort::Error| format!("RIFE: {e}");
@@ -302,6 +400,32 @@ impl DisparityModel {
             return Err("NeuFlow's output has the wrong size".into());
         }
         Ok(flow[..2 * w * h].to_vec())
+    }
+}
+
+/// GMNet's input sizes (w, h): the Core ML conversion's enumerated ones.
+pub const GAIN_SIZES: [(usize, usize); 5] = [(1024, 768), (768, 1024), (1024, 576), (576, 1024), (896, 896)];
+
+impl GainModel {
+    /// The linear gain per pixel of `image` (planar RGB 0…1 at `w`×`h`, one of
+    /// `GAIN_SIZES`) given the whole frame's 256×256 `thumbnail`. Both are
+    /// rounded to bytes first, as the Core ML model's pixel buffers are.
+    /// Returns the gain and its (width, height).
+    pub fn run(&mut self, image: &[f32], w: usize, h: usize, thumbnail: &[f32]) -> Result<(Vec<f32>, usize, usize), String> {
+        let bytes = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| (x.clamp(0.0, 1.0) * 255.0).round() / 255.0).collect() };
+        let (image, thumbnail) = (bytes(image), bytes(thumbnail));
+        let e = |e: ort::Error| format!("GMNet: {e}");
+        let outputs = self
+            .session
+            .run(ort::inputs![
+                "image" => TensorRef::from_array_view(([1usize, 3, h, w], &image[..])).map_err(e)?,
+                "thumbnail" => TensorRef::from_array_view(([1usize, 3, 256, 256], &thumbnail[..])).map_err(e)?,
+            ])
+            .map_err(e)?;
+        let (shape, gain) = outputs["gain"].try_extract_tensor::<f32>().map_err(e)?;
+        let dims: Vec<i64> = shape.iter().copied().collect();
+        let [_, _, gh, gw] = dims[..] else { return Err("GMNet's gain isn't 1×1×H×W".into()) };
+        Ok((gain.to_vec(), gw as usize, gh as usize))
     }
 }
 

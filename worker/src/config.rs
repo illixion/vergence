@@ -16,12 +16,25 @@
 //!   "executionProvider": "auto",
 //!   "deviceId": 0,
 //!   "shareCoreMLProfile": false,
-//!   "yieldProcesses": ["obs64.exe"]
+//!   "yieldProcesses": ["obs64.exe"],
+//!
+//!   "workloads": ["smooth-motion-3d", "smooth-motion-2d", "ai-3d-depth", "ai-hdr"],
+//!   "depthModel": "~/Models/DepthAnythingV2Small.onnx",
+//!   "depthSize": "770x574",
+//!   "gainModel": "~/Models/GainMapGMNet.onnx"
 //! }
 //! ```
 //!
 //! - `models` holds `RIFE*480x288*.onnx` and `NeuFlow*512x288*.onnx`
-//!   (`scripts/export-onnx-models.py`).
+//!   (`scripts/export-onnx-models.py`), and `RIFE*960x576*.onnx` for 2D titles.
+//! - `workloads`: the ones it takes (the coordinator's names); by default every
+//!   one its models allow: 3D always, 2D when the larger RIFE is there, depth
+//!   with `depthModel`, AI HDR with `gainModel`, as `vergence worker` decides.
+//! - `depthModel`: Depth Anything V2 Small as ONNX (`scripts/export-depth-onnx.py`
+//!   or `vergence-convert --download-model`; Apache-2.0 weights only), run at
+//!   `depthSize` when its input size is free (770×574 by default, the Mac
+//!   worker's).
+//! - `gainModel`: GMNet as ONNX (`scripts/export-gmnet-onnx.py`).
 //! - `executionProvider`: `auto` (the default: CUDA, then DirectML, then Core
 //!   ML, then CPU, whichever loads first), `cuda`, `tensorrt`, `directml`,
 //!   `coreml` or `cpu`. `--ep` overrides it.
@@ -87,12 +100,30 @@ pub struct Config {
     pub share_core_ml_profile: Option<bool>,
     #[serde(default)]
     pub yield_processes: Option<Vec<String>>,
+    #[serde(default)]
+    pub workloads: Option<Vec<String>>,
+    #[serde(default)]
+    pub depth_model: Option<String>,
+    #[serde(default)]
+    pub depth_size: Option<String>,
+    #[serde(default)]
+    pub gain_model: Option<String>,
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// `depthSize` as (width, height): 770×574 unless set.
+    pub fn depth_size(&self) -> Result<(usize, usize), String> {
+        let Some(text) = &self.depth_size else { return Ok((770, 574)) };
+        let parsed = text.split_once('x').and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)));
+        match parsed {
+            Some((w, h)) if w % 14 == 0 && h % 14 == 0 && w > 0 && h > 0 => Ok((w, h)),
+            _ => Err(format!("depthSize {text} isn't WIDTHxHEIGHT in multiples of 14")),
+        }
     }
 
     pub fn token(&self) -> Result<String, String> {

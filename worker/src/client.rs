@@ -45,6 +45,9 @@ pub struct Lease {
     pub lease: u64,
     pub title: String,
     pub source: Source,
+    /// An older coordinator names none: Smooth Motion for 3D titles was all it had.
+    #[serde(default = "default_workload")]
+    pub workload: String,
     pub kinds: Vec<String>,
     pub piece: usize,
     pub first_frame: i64,
@@ -53,6 +56,10 @@ pub struct Lease {
     pub info: Info,
     pub lease_seconds: f64,
     pub live: bool,
+}
+
+fn default_workload() -> String {
+    "smooth-motion-3d".into()
 }
 
 #[derive(Clone)]
@@ -77,12 +84,18 @@ impl Coordinator {
         format!("{}/v1/work/leases/{lease}/{action}", self.base)
     }
 
-    pub async fn claim(&self, remote: bool, models: &BTreeMap<String, String>) -> Result<Option<Lease>, String> {
+    /// `profiles`: each workload this worker takes, with its models per kind.
+    pub async fn claim(&self, remote: bool, profiles: &BTreeMap<String, BTreeMap<String, String>>)
+        -> Result<Option<Lease>, String> {
+        // `models` for a coordinator that knows only one workload.
+        let models = profiles.get("smooth-motion-3d").or_else(|| profiles.values().next()).cloned().unwrap_or_default();
+        let workloads: Vec<&String> = profiles.keys().collect();
         let response = self
             .http
             .post(format!("{}/v1/work/claim", self.base))
             .bearer_auth(&self.token)
-            .json(&json!({ "worker": self.name, "remote": remote, "models": models }))
+            .json(&json!({ "worker": self.name, "remote": remote, "models": models, "workloads": workloads,
+                           "workloadModels": profiles }))
             .send()
             .await
             .map_err(|e| e.to_string())?;

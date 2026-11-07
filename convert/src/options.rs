@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::maths::Quality;
+use vergence_convert::maths::Quality;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layout {

@@ -494,6 +494,19 @@ Core ML's float16 run by up to 1 px (p99 0.06 px), as the Mac's ONNX CPU run doe
 (`scripts/check-onnx-worker.sh` on a Mac, then the PC's chunks against its `KEEP_COREML` track with
 `scripts/compare-analysis-tracks.py`). So PCs share one profile, and Core ML titles keep theirs.
 
+The 2D workloads run on the PC worker too, each under its own ONNX profile (`workloads`,
+`depthModel`, `depthSize` and `gainModel` in its config; `worker/src/config.rs`):
+
+| Workload | Model (export) | RTX 3080, a 720p title's pieces | Against the Core ML worker |
+| --- | --- | --- | --- |
+| `smooth-motion-2d` | RIFE 4.25 lite 960×576 (`export-onnx-models.py --only rife-2d`); 89 fps alone on TensorRT, 71 DirectML, 60 CUDA | 58 fps (TensorRT) | flow p99 0.06 px, mean 0.003; up to 3 px where Core ML's float16 run drifts |
+| `ai-3d-depth` | Depth Anything V2 Small at 770×574 (any free-size export, e.g. `vergence-convert --download-model`'s), through `vergence-convert`'s depth pipeline | 13 fps of title (CUDA), each piece with its second of context; DirectML about a third of that | mean 0.012, max 0.09 (shot-space depth) |
+| `ai-hdr` | GMNet (`export-gmnet-onnx.py`, MIT) on keyframes | 59 fps (CUDA) | log2 gain within 0.01 |
+
+TensorRT builds an engine per input size, so the two free-size models (Depth Anything, GMNet) run on
+CUDA when TensorRT is chosen. `scripts/check-onnx-workload.sh` runs both workers on one title and
+prints the differences.
+
 A shared PC stays the owner's: the worker runs at below-normal priority, and stands aside (no
 claims, its piece given back, its models unloaded so the GPU's memory goes back) while a game, an
 app launched through a Sunshine stream, SteamVR or another program keeps the GPU busy, or while its

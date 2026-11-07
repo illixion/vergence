@@ -27,8 +27,10 @@ mod client;
 mod config;
 mod engine;
 mod forwarder;
+mod gain;
 mod preprocess;
 mod record;
+mod workloads;
 mod yielding;
 
 use std::collections::BTreeMap;
@@ -41,7 +43,7 @@ use std::time::{Duration, Instant};
 use crate::analyze::{Failure, Piece};
 use crate::client::{Coordinator, Lease};
 use crate::config::{Config, expand_tilde};
-use crate::engine::{Engine, EngineOptions, Provider};
+use crate::engine::{Engine, EngineOptions, Provider, Wanted};
 use crate::forwarder::Forwarder;
 use crate::preprocess::{DISPARITY_SIZE, FLOW_SIZE};
 use crate::yielding::Yield;
@@ -117,15 +119,71 @@ fn host_name() -> String {
         .unwrap_or_else(|| "worker".into())
 }
 
-/// What the track headers name each kind's model; the coordinator's profile.
-fn profile(engine: &Engine, share_core_ml: bool) -> BTreeMap<String, String> {
+/// What the track headers name each kind's model, per workload: the
+/// coordinator's profiles. The Mac worker's names, with " onnx" after them
+/// unless `shareCoreMLProfile` (a title never mixes the two families).
+fn profiles(engine: &Engine, wanted: &Wanted, share_core_ml: bool) -> BTreeMap<String, BTreeMap<String, String>> {
     let suffix = if share_core_ml { "" } else { " onnx" };
-    let (fw, fh) = FLOW_SIZE;
-    let (dw, dh) = DISPARITY_SIZE;
-    BTreeMap::from([
-        ("flowPair".to_string(), format!("{} {fw}x{fh}{suffix}", engine.flow.name)),
-        ("disparity".to_string(), format!("{} {dw}x{dh}{suffix}", engine.disparity.name)),
-    ])
+    let one = |kind: &str, name: String| BTreeMap::from([(kind.to_string(), name)]);
+    let mut out = BTreeMap::new();
+    if let Some(stereo) = &engine.stereo {
+        let (fw, fh) = FLOW_SIZE;
+        let (dw, dh) = DISPARITY_SIZE;
+        out.insert(workloads::SMOOTH_MOTION_3D.to_string(), BTreeMap::from([
+            ("flowPair".to_string(), format!("{} {fw}x{fh}{suffix}", stereo.flow.name)),
+            ("disparity".to_string(), format!("{} {dw}x{dh}{suffix}", stereo.disparity.name)),
+        ]));
+    }
+    if let Some(mono) = &engine.mono {
+        out.insert(workloads::SMOOTH_MOTION_2D.to_string(),
+                   one("flowPair", format!("{} {}x{}{suffix}", mono.name, mono.width, mono.height)));
+    }
+    if let (Some(depth), Some((path, _))) = (&engine.depth, &wanted.depth) {
+        let model = depth.model.lock().unwrap_or_else(|p| p.into_inner());
+        out.insert(workloads::AI_3D_DEPTH.to_string(),
+                   one("depth", workloads::depth_profile(path, (model.width, model.height), suffix)));
+    }
+    if let Some(gain) = &engine.gain {
+        let key = (gain::KEYFRAME_SECONDS * 1000.0).round() as i64;
+        out.insert(workloads::AI_HDR.to_string(), one("gainMap", format!("{} grid16x9x8 key{key}ms{suffix}", gain.name)));
+    }
+    out
+}
+
+/// The workloads the config asks for, or every one its models allow (3D
+/// always, 2D when the larger RIFE is there, depth and AI HDR when their
+/// models are named), as `vergence worker` decides.
+fn wanted(config: &Config) -> Result<Wanted, String> {
+    let named = config.workloads.as_ref();
+    let asked = |w: &str| named.map(|n| n.iter().any(|x| x == w));
+    let known = [workloads::SMOOTH_MOTION_3D, workloads::SMOOTH_MOTION_2D, workloads::AI_3D_DEPTH, workloads::AI_HDR];
+    if let Some(unknown) = named.and_then(|n| n.iter().find(|w| !known.contains(&w.as_str()))) {
+        return Err(format!("this worker doesn't make {unknown}"));
+    }
+    let depth = match (asked(workloads::AI_3D_DEPTH).unwrap_or(config.depth_model.is_some()), &config.depth_model) {
+        (false, _) => None,
+        (true, None) => return Err("ai-3d-depth needs depthModel in the config".into()),
+        (true, Some(path)) => Some((expand_tilde(path), config.depth_size()?)),
+    };
+    let gain = match (asked(workloads::AI_HDR).unwrap_or(config.gain_model.is_some()), &config.gain_model) {
+        (false, _) => None,
+        (true, None) => return Err("ai-hdr needs gainModel in the config".into()),
+        (true, Some(path)) => Some(expand_tilde(path)),
+    };
+    let wanted = Wanted {
+        stereo: asked(workloads::SMOOTH_MOTION_3D).unwrap_or(true),
+        mono: match asked(workloads::SMOOTH_MOTION_2D) {
+            Some(false) => None,
+            Some(true) => Some(true),
+            None => Some(false),
+        },
+        depth,
+        gain,
+    };
+    if !wanted.stereo && wanted.mono.is_none() && wanted.depth.is_none() && wanted.gain.is_none() {
+        return Err("the config asks for no workload this worker makes".into());
+    }
+    Ok(wanted)
 }
 
 /// How long the machine must have been free before the worker goes back to work.
@@ -140,7 +198,8 @@ struct Worker {
     /// None while standing aside: the models are unloaded then.
     engine: Arc<Mutex<Option<Engine>>>,
     loader: Loader,
-    models: BTreeMap<String, String>,
+    /// Per workload: what its track headers name each kind's model.
+    profiles: BTreeMap<String, BTreeMap<String, String>>,
     producer: String,
     yielder: Arc<dyn Yield>,
 }
@@ -160,14 +219,19 @@ async fn run(config_path: &Path, provider: Option<Provider>, once: bool) -> Resu
         let _ = std::fs::create_dir_all(dir);
     }
     let models_dir = expand_tilde(&config.models);
+    let wanted = wanted(&config)?;
     let engine = {
-        let (models_dir, options) = (models_dir.clone(), options.clone());
-        tokio::task::spawn_blocking(move || Engine::load(&models_dir, provider, &options)).await.map_err(|e| e.to_string())??
+        let (models_dir, options, wanted) = (models_dir.clone(), options.clone(), wanted.clone());
+        tokio::task::spawn_blocking(move || Engine::load(&models_dir, &wanted, provider, &options))
+            .await
+            .map_err(|e| e.to_string())??
     };
     let loaded = engine.provider;
-    let loader: Loader = Arc::new(move || Engine::load(&models_dir, loaded, &options));
+    let profiles = profiles(&engine, &wanted, config.share_core_ml_profile.unwrap_or(false));
+    // Loads again exactly what loaded: a 2D model found once is required after.
+    let again = Wanted { mono: engine.mono.as_ref().map(|_| true), ..wanted };
+    let loader: Loader = Arc::new(move || Engine::load(&models_dir, &again, loaded, &options));
     let name = config.name.clone().unwrap_or_else(host_name);
-    let models = profile(&engine, config.share_core_ml_profile.unwrap_or(false));
     let producer = format!("vergence-worker {} (ONNX Runtime, {})", env!("CARGO_PKG_VERSION"), engine.provider.name());
     lower_priority();
     let worker = Worker {
@@ -176,10 +240,15 @@ async fn run(config_path: &Path, provider: Option<Provider>, once: bool) -> Resu
         config,
         engine: Arc::new(Mutex::new(Some(engine))),
         loader,
-        models,
+        profiles,
         producer,
     };
-    log(format!("{name} on {}, {}, {}", worker.producer, worker.models["flowPair"], worker.models["disparity"]));
+    let list: Vec<String> = worker
+        .profiles
+        .iter()
+        .map(|(workload, models)| format!("{workload} ({})", models.values().cloned().collect::<Vec<_>>().join(", ")))
+        .collect();
+    log(format!("{name} on {}: {}", worker.producer, list.join("; ")));
     worker.run(once).await
 }
 
@@ -253,7 +322,7 @@ impl Worker {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 continue;
             }
-            let lease = match self.coordinator.claim(self.config.remote.unwrap_or(false), &self.models).await {
+            let lease = match self.coordinator.claim(self.config.remote.unwrap_or(false), &self.profiles).await {
                 Ok(lease) => lease,
                 Err(e) => {
                     log(format!("claim failed: {e}"));
@@ -357,7 +426,8 @@ impl Worker {
         let (url, headers) = self.media_request(lease)?;
         let forwarder = Forwarder::start(url, headers).await.map_err(|e| format!("the loopback forwarder: {e}"))?;
         let (lease, url) = (lease.clone(), forwarder.url());
-        let (engine, models, producer) = (self.engine.clone(), self.models.clone(), self.producer.clone());
+        let models = self.profiles.get(&lease.workload).cloned().ok_or(format!("a lease for {}, which this worker didn't ask for", lease.workload))?;
+        let (engine, producer) = (self.engine.clone(), self.producer.clone());
         let ffmpeg = self.config.ffmpeg.as_deref().map(|p| expand_tilde(p).to_string_lossy().into_owned());
         let result = tokio::task::spawn_blocking(move || {
             let piece = Piece { lease: &lease, url: &url, ffmpeg: ffmpeg.as_deref(), models: &models, producer: &producer };
@@ -399,11 +469,14 @@ impl Worker {
 /// Times each model alone and both at once, as a piece runs them.
 fn bench(models: &Path, provider: Provider, options: &EngineOptions, runs: usize) -> Result<(), String> {
     let loading = Instant::now();
-    let mut engine = Engine::load(models, provider, options)?;
+    let wanted = Wanted { stereo: true, mono: Some(false), ..Default::default() };
+    let mut engine = Engine::load(models, &wanted, provider, options)?;
+    let stereo = engine.stereo.as_mut().expect("asked for");
     log(format!(
-        "{} and {} on {} (loaded and warmed in {:.1} s)",
-        engine.flow.name,
-        engine.disparity.name,
+        "{} and {}{} on {} (loaded and warmed in {:.1} s)",
+        stereo.flow.name,
+        stereo.disparity.name,
+        engine.mono.as_ref().map(|m| format!(" and {}", m.name)).unwrap_or_default(),
         engine.provider.name(),
         loading.elapsed().as_secs_f64()
     ));
@@ -421,9 +494,9 @@ fn bench(models: &Path, provider: Provider, options: &EngineOptions, runs: usize
         }
         Ok(start.elapsed().as_secs_f64() * 1000.0 / runs as f64)
     };
-    let flow_ms = time(&mut || engine.flow.run(&a, &b).map(drop))?;
-    let disparity_ms = time(&mut || engine.disparity.run(&l, &r).map(drop))?;
-    let Engine { flow, disparity, .. } = &mut engine;
+    let flow_ms = time(&mut || stereo.flow.run(&a, &b).map(drop))?;
+    let disparity_ms = time(&mut || stereo.disparity.run(&l, &r).map(drop))?;
+    let engine::StereoModels { flow, disparity } = stereo;
     let both_ms = time(&mut || {
         std::thread::scope(|s| {
             let job = s.spawn(|| flow.run(&a, &b).map(drop));
@@ -436,5 +509,11 @@ fn bench(models: &Path, provider: Provider, options: &EngineOptions, runs: usize
          a frame ({:.1} fps) over {runs} runs",
         1000.0 / both_ms
     ));
+    if let Some(mono) = engine.mono.as_mut() {
+        let (w, h) = (mono.width, mono.height);
+        let (a, b) = (noise(3 * w * h, 5), noise(3 * w * h, 6));
+        let ms = time(&mut || mono.run(&a, &b).map(drop))?;
+        log(format!("RIFE {w}x{h} (2D) {ms:.1} ms a frame ({:.1} fps)", 1000.0 / ms));
+    }
     Ok(())
 }

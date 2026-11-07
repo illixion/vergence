@@ -19,6 +19,8 @@ the same inputs and outputs as the Core ML conversions `vergence worker` and
   RIFE 4.25 lite at 480x288, block scales 8 4 2 1 1, timestep an input (½)
     inputs  img0, img1: [1,3,288,480] float32, RGB 0…1;  timestep: [1,1,1,1]
     outputs flow: [1,4,288,480] (F½→0 x,y then F½→1 x,y, pixels), mask: [1,1,288,480]
+  RIFE 4.25 lite at 960x576, block scales 16 8 4 2 1 (convert-interp-model.py's
+    defaults), for the 2D workload (smooth-motion-2d); same inputs and outputs
   NeuFlow v2 at 512x288, one way (img0→img1), 4 refinement iterations, fp32
     inputs  img0, img1: [1,3,288,512] float32, RGB 0…255
     outputs flow: [1,2,288,512] (x, y, pixels)
@@ -57,6 +59,10 @@ RIFE_SCALES = [8, 4, 2, 1, 1]
 NEUFLOW_SIZE = (512, 288)
 NEUFLOW_ITERS = 4
 RIFE_NAME = "RIFE425lite_480x288"
+# The 2D workload's RIFE: Hypnos's conversion at its default size and scales.
+RIFE_2D_SIZE = (960, 576)
+RIFE_2D_SCALES = [16, 8, 4, 2, 1]
+RIFE_2D_NAME = "RIFE425lite_960x576"
 NEUFLOW_NAME = "NeuFlowV2_512x288_1way_i4_fp32"
 
 
@@ -109,7 +115,7 @@ def main():
     ap.add_argument("--neuflow-repo", help="NeuFlow_v2 clone with neuflow_mixed.pth")
     ap.add_argument("--out", default=str(root / "onnx-models"))
     ap.add_argument("--coreml", help="folder of the Core ML conversions, to compare against")
-    ap.add_argument("--only", choices=["rife", "neuflow"])
+    ap.add_argument("--only", choices=["rife", "rife-2d", "neuflow"])
     args = ap.parse_args()
 
     conv = load_converter(args.hypnos)
@@ -119,19 +125,21 @@ def main():
     coreml = Path(args.coreml) if args.coreml else None
     torch.manual_seed(0)
 
-    if args.only in (None, "rife"):
-        w, h = RIFE_SIZE
-        net = conv.load_rife(args.rife_weights or spike / "dl" / "rife425lite" / "train_log", RIFE_SCALES)
+    for only, (w, h), scales, name in [("rife", RIFE_SIZE, RIFE_SCALES, RIFE_NAME),
+                                       ("rife-2d", RIFE_2D_SIZE, RIFE_2D_SCALES, RIFE_2D_NAME)]:
+        if args.only not in (None, only):
+            continue
+        net = conv.load_rife(args.rife_weights or spike / "dl" / "rife425lite" / "train_log", scales)
         a, b = conv.test_pair(h, w, scale255=False)
         ts = torch.full((1, 1, 1, 1), 0.5)
         noise = (torch.rand(1, 3, h, w), torch.rand(1, 3, h, w), ts)
-        path = out / f"{RIFE_NAME}.onnx"
+        path = out / f"{name}.onnx"
         export(net, (a, b, ts), ["img0", "img1", "timestep"], ["flow", "mask"], path)
         cases = {"pan": (a, b, ts), "noise": noise}
         with torch.no_grad():
             reference = {k: net(*v) for k, v in cases.items()}
         feeds = {k: dict(zip(["img0", "img1", "timestep"], v)) for k, v in cases.items()}
-        check(path, feeds, reference, ["flow", "mask"], coreml / f"{RIFE_NAME}.mlpackage" if coreml else None)
+        check(path, feeds, reference, ["flow", "mask"], coreml / f"{name}.mlpackage" if coreml else None)
 
     if args.only in (None, "neuflow"):
         w, h = NEUFLOW_SIZE

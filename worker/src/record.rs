@@ -20,8 +20,10 @@ use crate::preprocess::{STEP, STORAGE_FACTOR, area_downsample};
 
 pub const KIND_FLOW_PAIR: u8 = 1;
 pub const KIND_DISPARITY: u8 = 2;
+pub const KIND_GAIN_MAP: u8 = 4;
 pub const EYE_MONO: u8 = 0;
 pub const EYE_RIGHT: u8 = 2;
+pub const ENCODING_FLOAT16: u8 = 1;
 pub const ENCODING_INT16: u8 = 2;
 const DEFLATED: u8 = 0x80;
 
@@ -73,6 +75,29 @@ impl Record {
             time,
             end,
             scale,
+            offset: 0.0,
+            payload,
+            deflated: false,
+        }
+    }
+
+    /// Planar float samples as half floats, scale 1, offset 0
+    /// (`AnalysisRecord.encoding(_:as: .float16)`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn float16(values: &[f32], kind: u8, eye: u8, channels: usize, width: usize, height: usize, time: Time, end: Time)
+        -> Record {
+        assert_eq!(values.len(), channels * width * height, "sample count");
+        let payload = values.iter().flat_map(|&v| half::f16::from_f32(if v.is_nan() { 0.0 } else { v }).to_le_bytes()).collect();
+        Record {
+            kind,
+            eye,
+            encoding: ENCODING_FLOAT16,
+            channels: channels as u8,
+            width: width as u16,
+            height: height as u16,
+            time,
+            end,
+            scale: 1.0,
             offset: 0.0,
             payload,
             deflated: false,
@@ -230,6 +255,12 @@ pub fn track_header(media_id: &str, producer: &str, models: &BTreeMap<String, St
 /// `flow`: 4 planar channels at the model's size, F½→0 (x, y) then F½→1 (x, y);
 /// `mask`: frame 0's blend weight at ½.
 pub fn flow_pair_record(flow: &[f32], mask: &[f32], width: usize, height: usize, time: Time, end: Time) -> Record {
+    flow_pair_record_with_step(flow, mask, width, height, time, end, STEP)
+}
+
+/// The same with another stored step, in stored pixels (`monoFlowStep` for 2D titles).
+pub fn flow_pair_record_with_step(flow: &[f32], mask: &[f32], width: usize, height: usize, time: Time, end: Time, step: f32)
+    -> Record {
     let f = STORAGE_FACTOR;
     let small = area_downsample(flow, 4, width, height, f);
     let m = area_downsample(mask, 1, width, height, f);
@@ -244,7 +275,7 @@ pub fn flow_pair_record(flow: &[f32], mask: &[f32], width: usize, height: usize,
         values[3 * n + i] = small[n + i] * k;
         values[4 * n + i] = m[i];
     }
-    Record::int16(&values, KIND_FLOW_PAIR, EYE_MONO, 5, width / f, height / f, time, end, STEP * i16::MAX as f32)
+    Record::int16(&values, KIND_FLOW_PAIR, EYE_MONO, 5, width / f, height / f, time, end, step * i16::MAX as f32)
 }
 
 /// NeuFlow's right→left flow as a `disparity` record on the right eye,

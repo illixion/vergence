@@ -54,15 +54,10 @@
 //! (TrueHD, DTS-HD MA, FLAC, PCM) become ALAC and other lossy ones AAC, as the
 //! Mac's remux makes them. Subtitles are left out. Then the `st3d` box.
 
-mod decode;
-mod depth;
-mod gpu;
-mod maths;
-mod model;
 mod mp4;
 mod options;
-mod probe;
-mod track;
+
+use vergence_convert::{decode, depth, gpu, maths, model};
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -70,9 +65,9 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use crate::decode::{FrameReader, FrameWriter, Span, encoder_args, input_args, scale_matrix};
+use vergence_convert::decode::{FrameReader, FrameWriter, Span, encoder_args, input_args, scale_matrix};
 use crate::options::{Layout, Options};
-use crate::probe::{Probe, Tools};
+use vergence_convert::probe::{Probe, Tools};
 
 const USAGE: &str = "usage: vergence-convert [convert] VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab]
          [--strength S] [--convergence C] [--sample SECONDS] [--start S] [--frames N]
@@ -197,9 +192,12 @@ fn convert(o: &Options) -> Result<bool, String> {
     let gpu = if o.dry_run { None } else { Some(gpu::Gpu::new()?) };
     let encoder = if o.dry_run { None } else { Some(decode::hevc_encoder(&tools)?) };
     let (mut made, mut skipped, mut failed) = (0, 0, 0);
+    // Loaded the first time a file needs depth, then kept for the rest.
+    let loaded = std::cell::OnceCell::new();
     for input in &inputs {
         let output = options::converted(input, o, inputs.len() == 1);
-        let context = Context { tools: &tools, model: model.as_deref(), gpu: gpu.as_ref(), encoder: encoder.as_deref() };
+        let context =
+            Context { tools: &tools, model: model.as_deref(), loaded: &loaded, gpu: gpu.as_ref(), encoder: encoder.as_deref() };
         match convert_one(input, &output, o, &context) {
             Ok(true) => made += 1,
             Ok(false) => skipped += 1,
@@ -246,9 +244,12 @@ fn depth_model(o: &Options) -> Result<PathBuf, String> {
     model::download()
 }
 
+type SharedModel = std::sync::Arc<std::sync::Mutex<model::DepthModel>>;
+
 struct Context<'a> {
     tools: &'a Tools,
     model: Option<&'a Path>,
+    loaded: &'a std::cell::OnceCell<SharedModel>,
     gpu: Option<&'a gpu::Gpu>,
     encoder: Option<&'a str>,
 }
@@ -371,6 +372,11 @@ fn convert_one(input: &Path, output: &Path, o: &Options, cx: &Context) -> Result
             let depth_began = Instant::now();
             let mut progress = Progress::new("depth");
             let span = Span { start, length: (!whole).then_some(length), frames: None };
+            if cx.loaded.get().is_none() {
+                let loaded = model::DepthModel::load(model, model::Provider::from_env()?, None)?;
+                let _ = cx.loaded.set(std::sync::Arc::new(std::sync::Mutex::new(loaded)));
+            }
+            let model = cx.loaded.get().expect("just loaded").clone();
             let (entry, provider) = depth::convert(depth::Job {
                 tools: cx.tools, input, probe: &probe, span, first_frame, expected_frames, encoder, directory: &depth_dir, model,
                 progress: &mut |f| progress.report(f),

@@ -81,8 +81,25 @@ impl Entry {
 
 /// The decode size: within 1036 a side, never larger than the frame, even.
 pub fn decode_size(width: usize, height: usize) -> (usize, usize) {
-    let scale = (MAX_DECODE_DIMENSION as f64 / width.max(height) as f64).min(1.0);
-    (((width as f64 * scale) as usize) & !1, ((height as f64 * scale) as usize) & !1)
+    display_decode_size(width as f64, height as f64)
+}
+
+/// The same from the picture's display size (non-square pixels applied to its
+/// width, as AVFoundation's `naturalSize` gives it the Mac's converter).
+pub fn display_decode_size(width: f64, height: f64) -> (usize, usize) {
+    let scale = (MAX_DECODE_DIMENSION as f64 / width.max(height)).min(1.0);
+    (((width * scale) as usize) & !1, ((height * scale) as usize) & !1)
+}
+
+/// The picture's width with its pixel aspect applied.
+pub fn display_width(width: usize, sample_aspect_ratio: Option<&str>) -> f64 {
+    let ratio = sample_aspect_ratio
+        .and_then(|r| r.split_once(':'))
+        .and_then(|(n, d)| Some((n.parse::<f64>().ok()?, d.parse::<f64>().ok()?)))
+        .filter(|&(n, d)| n > 0.0 && d > 0.0)
+        .map(|(n, d)| n / d)
+        .unwrap_or(1.0);
+    width as f64 * ratio
 }
 
 struct Stat {
@@ -108,7 +125,8 @@ pub struct Job<'a> {
     pub expected_frames: usize,
     pub encoder: &'a str,
     pub directory: &'a Path,
-    pub model: &'a Path,
+    /// Loaded once and kept: a converter's files and a worker's pieces share it.
+    pub model: std::sync::Arc<std::sync::Mutex<DepthModel>>,
     pub progress: &'a mut dyn FnMut(f64),
 }
 
@@ -121,7 +139,7 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
     }
     let _ = std::fs::remove_dir_all(job.directory);
     std::fs::create_dir_all(job.directory).map_err(|e| format!("{}: {e}", job.directory.display()))?;
-    let (dw, dh) = decode_size(width, height);
+    let (dw, dh) = display_decode_size(display_width(width, video.sample_aspect_ratio.as_deref()), height as f64);
     let hdr = job.probe.is_hdr();
     let hlg = video.color_transfer.as_deref() == Some("arib-std-b67");
     let colour = job.probe.colour();
@@ -138,8 +156,11 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
     ]);
     let bytes_per = if hdr { 6 } else { 3 };
     let reader = FrameReader::start(job.tools, &args, dw * dh * bytes_per)?;
-    let provider = model::Provider::from_env()?;
-    let model_path = job.model.to_path_buf();
+    let shared = job.model.clone();
+    let (mw, mh, model_name, provider_name) = {
+        let m = shared.lock().unwrap_or_else(|p| p.into_inner());
+        (m.width, m.height, m.name.clone(), m.provider.name().to_string())
+    };
 
     // Stage A: decode and prepare on one thread, infer on another.
     let (prepared_send, prepared_receive) = mpsc::sync_channel::<(Vec<f16>, Option<Vec<f32>>)>(3);
@@ -150,7 +171,7 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
         let mut preparing = 0f64;
         while reader.next(&mut frame) {
             let started = Instant::now();
-            let (video, input) = prepare(&frame, hdr.then_some(hlg), (dw, dh), &mut gate);
+            let (video, input) = prepare(&frame, hdr.then_some(hlg), (dw, dh), (mw, mh), &mut gate);
             preparing += started.elapsed().as_secs_f64();
             if prepared_send.send((video, input)).is_err() {
                 break;
@@ -162,19 +183,8 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
         reader.finish()
     });
     let (send, receive) = mpsc::sync_channel::<Result<Inferred, String>>(2);
-    let (loaded_send, loaded_receive) = mpsc::channel::<Result<(String, String), String>>();
     let stage_a = std::thread::spawn(move || -> Result<(), String> {
-        let mut model = match DepthModel::load(&model_path, provider) {
-            Ok(m) => {
-                let _ = loaded_send.send(Ok((m.name.clone(), m.provider.name().to_string())));
-                m
-            }
-            Err(e) => {
-                let _ = loaded_send.send(Err(e));
-                drop(prepared_receive);
-                return preparing_thread.join().map_err(|_| "the decoder's thread panicked".to_string())?;
-            }
-        };
+        let mut model = shared.lock().unwrap_or_else(|p| p.into_inner());
         let mut inferring = 0f64;
         for (video, input) in prepared_receive.iter() {
             let raw = match input {
@@ -202,9 +212,7 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
         }
         preparing_thread.join().map_err(|_| "the decoder's thread panicked".to_string())?
     });
-    let (model_name, provider_name) = loaded_receive.recv().map_err(|_| "the depth model's thread stopped".to_string())??;
 
-    let (mw, mh) = (model::WIDTH, model::HEIGHT);
     let mut refiner = DepthRefiner::new(gpu, (dw, dh), (mw, mh));
     let (hw, hh) = refiner.hi_size;
     let rate = job.probe.rate();
@@ -364,7 +372,7 @@ pub fn convert(job: Job, gpu: &Gpu) -> Result<(Entry, Option<String>), String> {
 /// (RGBA half floats) and as the model sees it, unless it is static against
 /// the last inferred frame (None: its depth repeats). The conversions run on
 /// a few threads: at 1036×582 they are as long as the inference.
-fn prepare(frame: &[u8], hdr: Option<bool>, (dw, dh): (usize, usize), gate: &mut FrameChangeDetector)
+fn prepare(frame: &[u8], hdr: Option<bool>, (dw, dh): (usize, usize), model_size: (usize, usize), gate: &mut FrameChangeDetector)
     -> (Vec<f16>, Option<Vec<f32>>) {
     let sixteen = hdr.is_some();
     let pixels = dw * dh;
@@ -376,7 +384,7 @@ fn prepare(frame: &[u8], hdr: Option<bool>, (dw, dh): (usize, usize), gate: &mut
         for (band, (rgb, video)) in rgb.chunks_mut(rows * dw * 3).zip(video.chunks_mut(rows * dw * 4)).enumerate() {
             let first = band * rows * dw * 3;
             scope.spawn(move || {
-                for (i, (c, v)) in rgb.chunks_exact_mut(3).zip(video.chunks_exact_mut(4)).enumerate() {
+                for (i, (c, v)) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(video.as_chunks_mut::<4>().0.iter_mut()).enumerate() {
                     for k in 0..3 {
                         let at = first + i * 3 + k;
                         c[k] = if sixteen {
@@ -395,7 +403,7 @@ fn prepare(frame: &[u8], hdr: Option<bool>, (dw, dh): (usize, usize), gate: &mut
         let i = (y * dw + x) * 3;
         [rgb[i] * 255.0, rgb[i + 1] * 255.0, rgb[i + 2] * 255.0]
     });
-    let input = (!gate.should_reuse(signature)).then(|| model::input(&rgb, dw, dh, hdr));
+    let input = (!gate.should_reuse(signature)).then(|| model::input(&rgb, dw, dh, hdr, model_size));
     (video, input)
 }
 
@@ -438,16 +446,21 @@ pub fn reader(tools: &Tools, entry: &Entry) -> Result<FrameReader, String> {
     FrameReader::start(tools, &args, w * h + (w / 2) * (h / 2) * 2)
 }
 
-/// Writes the depth as analysis-track `depth` records (`OfflineDepthConversion.writeAnalysisTrack`):
-/// the picture's part of each map, halved to the model's resolution, with the
-/// frame's display mapping as the record's scale and offset.
-pub fn write_track(tools: &Tools, entry: &Entry, path: &Path, media_id: &str, source: (usize, usize)) -> Result<usize, String> {
+/// One stored map as a `depth` record's samples: the picture's part, halved
+/// to the model's resolution, with the frame's display mapping.
+pub struct DepthMap {
+    pub payload: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    /// value = byte · scale + offset.
+    pub scale: f32,
+    pub offset: f32,
+}
+
+/// The entry's maps as `depth` records' samples, frame by frame
+/// (`OfflineDepthConversion.records`).
+pub fn maps(tools: &Tools, entry: &Entry) -> Result<Vec<DepthMap>, String> {
     let meta = &entry.meta;
-    let models = std::collections::BTreeMap::from([(
-        "depth".to_string(),
-        format!("{} (Vergence offline depth v5, shot space before the depth budget)", meta.model_name),
-    )]);
-    let mut out = crate::track::header(media_id, "vergence convert", &models, source.0 as u32, source.1 as u32);
     let (w, h) = (meta.depth_width, meta.depth_height);
     let x0 = (meta.uv_offset[0] * w as f32).round() as usize;
     let y0 = (meta.uv_offset[1] * h as f32).round() as usize;
@@ -456,9 +469,9 @@ pub fn write_track(tools: &Tools, entry: &Entry, path: &Path, media_id: &str, so
     let (ow, oh) = (cw / 2, ch / 2);
     let mut reader = reader(tools, entry)?;
     let mut frame = Vec::new();
-    let mut index = 0usize;
-    let rate = Rate { num: meta.rate.0, den: meta.rate.1 };
-    while index < meta.frame_count && reader.next(&mut frame) {
+    let mut out = Vec::with_capacity(meta.frame_count);
+    while out.len() < meta.frame_count && reader.next(&mut frame) {
+        let index = out.len();
         let mut payload = vec![0u8; ow * oh];
         for y in 0..oh {
             let r0 = (y0 + 2 * y) * w + x0;
@@ -468,15 +481,44 @@ pub fn write_track(tools: &Tools, entry: &Entry, path: &Path, media_id: &str, so
                 payload[y * ow + x] = ((sum + 2) / 4) as u8;
             }
         }
-        let value = (meta.first_frame + index as i64) * rate.den as i64;
-        let record = crate::track::Record::depth(payload, ow, oh, value, rate.num as i32,
-                                                 meta.display_scale[index] / 255.0, meta.display_bias[index]);
-        out.extend(record.deflated_framed());
-        index += 1;
+        out.push(DepthMap { payload, width: ow, height: oh, scale: meta.display_scale[index] / 255.0, offset: meta.display_bias[index] });
     }
     reader.finish()?;
+    Ok(out)
+}
+
+/// Writes the depth as analysis-track `depth` records (`OfflineDepthConversion.writeAnalysisTrack`).
+pub fn write_track(tools: &Tools, entry: &Entry, path: &Path, media_id: &str, source: (usize, usize)) -> Result<usize, String> {
+    let meta = &entry.meta;
+    let models = std::collections::BTreeMap::from([(
+        "depth".to_string(),
+        format!("{} (Vergence offline depth v5, shot space before the depth budget)", meta.model_name),
+    )]);
+    let mut out = crate::track::header(media_id, "vergence convert", &models, source.0 as u32, source.1 as u32);
+    let rate = Rate { num: meta.rate.0, den: meta.rate.1 };
+    let maps = maps(tools, entry)?;
+    for (index, map) in maps.iter().enumerate() {
+        let value = (meta.first_frame + index as i64) * rate.den as i64;
+        let record = crate::track::Record::depth(map.payload.clone(), map.width, map.height, value, rate.num as i32, map.scale, map.offset);
+        out.extend(record.deflated_framed());
+    }
     let partial = path.with_extension("partial.vgat");
     std::fs::write(&partial, &out).map_err(|e| format!("{}: {e}", partial.display()))?;
     std::fs::rename(&partial, path).map_err(|e| e.to_string())?;
-    Ok(index)
+    Ok(maps.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_at_the_display_size() {
+        // ffmpeg's even-rounded 1036×582 intermediate of a 16:9 picture has
+        // pixels of 776:777: AVFoundation, and so the Mac, decodes it at 1034×582.
+        assert_eq!(display_decode_size(display_width(1036, Some("776:777")), 582.0), (1034, 582));
+        assert_eq!(decode_size(1920, 1080), (1036, 582));
+        assert_eq!(display_width(720, Some("0:1")), 720.0);
+        assert_eq!(display_width(720, None), 720.0);
+    }
 }

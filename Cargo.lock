@@ -5637,6 +5637,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "futures-util",
+ "half",
  "libc",
  "ort",
  "rand 0.9.5",
@@ -5646,6 +5647,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "vergence-convert",
  "vergence-coordinator",
  "windows-sys 0.61.2",
 ]

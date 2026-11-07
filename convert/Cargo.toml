@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# The depth pipeline is also a library: vergence-worker's ai-3d-depth runs it per piece.
+[lib]
+name = "vergence_convert"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vergence-convert"
 path = "src/main.rs"

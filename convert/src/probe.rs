@@ -109,6 +109,10 @@ pub struct Stream {
     pub color_primaries: Option<String>,
     pub color_transfer: Option<String>,
     pub view_ids_available: Option<String>,
+    /// "num:den", when the pixels aren't square (an anamorphic DVD, or a
+    /// scaled intermediate rounded to even sizes).
+    #[serde(default)]
+    pub sample_aspect_ratio: Option<String>,
     #[serde(default)]
     pub tags: Tags,
     #[serde(default)]

@@ -15,7 +15,7 @@ pub struct Plane<'a> {
 impl Plane<'_> {
     /// Bilinear sample at (x, y), edges clamped (`AnalysisPlane.sample`).
     #[inline(always)]
-    fn sample(&self, x: f32, y: f32) -> f32 {
+    pub fn sample(&self, x: f32, y: f32) -> f32 {
         let cx = x.max(0.0).min((self.width - 1) as f32);
         let cy = y.max(0.0).min((self.height - 1) as f32);
         let (x0, y0) = (cx as usize, cy as usize);
@@ -48,13 +48,42 @@ pub const STEP: f32 = 1.0 / 32.0;
 pub fn rgb_planar(y: Plane, cb: Plane, cr: Plane, width: usize, height: usize, scale: f32) -> Vec<f32> {
     let plane = width * height;
     let mut out = vec![0f32; 3 * plane];
+    let (r, rest) = out.split_at_mut(plane);
+    let (g, b) = rest.split_at_mut(plane);
+    rgb_rows(&y, &cb, &cr, width, height, scale, 0, r, g, b);
+    out
+}
+
+/// `rgb_planar` on several threads, a band of rows each: the same numbers,
+/// for the larger pictures a frame's models wait on (the 2D flow's 960×576).
+pub fn rgb_planar_parallel(y: Plane, cb: Plane, cr: Plane, width: usize, height: usize, scale: f32) -> Vec<f32> {
+    let plane = width * height;
+    let mut out = vec![0f32; 3 * plane];
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+    let rows = height.div_ceil(threads);
+    let (r, rest) = out.split_at_mut(plane);
+    let (g, b) = rest.split_at_mut(plane);
+    std::thread::scope(|scope| {
+        for (band, ((r, g), b)) in
+            r.chunks_mut(rows * width).zip(g.chunks_mut(rows * width)).zip(b.chunks_mut(rows * width)).enumerate()
+        {
+            let (y, cb, cr) = (&y, &cb, &cr);
+            scope.spawn(move || rgb_rows(y, cb, cr, width, height, scale, band * rows, r, g, b));
+        }
+    });
+    out
+}
+
+/// Rows from `first` on, as many as `r` holds.
+#[allow(clippy::too_many_arguments)]
+fn rgb_rows(y: &Plane, cb: &Plane, cr: &Plane, width: usize, height: usize, scale: f32, first: usize, r: &mut [f32],
+            g: &mut [f32], b: &mut [f32]) {
     let sx = y.width as f32 / width as f32;
     let sy = y.height as f32 / height as f32;
     let csx = cb.width as f32 / y.width as f32;
     let csy = cb.height as f32 / y.height as f32;
-    let (r, rest) = out.split_at_mut(plane);
-    let (g, b) = rest.split_at_mut(plane);
-    for oy in 0..height {
+    for row in 0..r.len() / width {
+        let oy = first + row;
         let fy = (oy as f32 + 0.5) * sy - 0.5;
         let cfy = (fy + 0.5) * csy - 0.5;
         for ox in 0..width {
@@ -63,13 +92,12 @@ pub fn rgb_planar(y: Plane, cb: Plane, cr: Plane, width: usize, height: usize, s
             let luma = (y.sample(fx, fy) - 16.0) / 219.0;
             let u = (cb.sample(cfx, cfy) - 128.0) / 224.0;
             let v = (cr.sample(cfx, cfy) - 128.0) / 224.0;
-            let i = oy * width + ox;
+            let i = row * width + ox;
             r[i] = (luma + 1.5748 * v).clamp(0.0, 1.0) * scale;
             g[i] = (luma - 0.18733 * u - 0.46812 * v).clamp(0.0, 1.0) * scale;
             b[i] = (luma + 1.8556 * u).clamp(0.0, 1.0) * scale;
         }
     }
-    out
 }
 
 /// Box average over `factor`×`factor` blocks, planar. Dimensions must divide.
@@ -93,6 +121,17 @@ pub fn area_downsample(planar: &[f32], channels: usize, width: usize, height: us
         }
     }
     out
+}
+
+/// A whole I420 picture's planes (Y, Cb, Cr), read in place.
+pub fn whole(frame: &[u8], w: usize, h: usize) -> [Plane<'_>; 3] {
+    let (luma, chroma) = frame.split_at(w * h);
+    let (cb, cr) = chroma.split_at((w / 2) * (h / 2));
+    [
+        Plane { data: luma, width: w, height: h, stride: w },
+        Plane { data: cb, width: w / 2, height: h / 2, stride: w / 2 },
+        Plane { data: cr, width: w / 2, height: h / 2, stride: w / 2 },
+    ]
 }
 
 /// The two eyes of a frame-packed I420 picture, read in place: (Y, Cb, Cr) each.
@@ -154,6 +193,16 @@ mod tests {
         );
         let bits: Vec<u32> = rgb.iter().map(|v| v.to_bits()).collect();
         assert_eq!(bits, SWIFT_RGB);
+        // The banded version gives the same numbers, at any size.
+        for (w, h) in [(6, 3), (13, 7), (40, 21)] {
+            let planes = || {
+                (Plane { data: &y, width: 16, height: 8, stride: 16 }, Plane { data: &cb, width: 8, height: 4, stride: 8 },
+                 Plane { data: &cr, width: 8, height: 4, stride: 8 })
+            };
+            let (a, b, c) = planes();
+            let (d, e, f) = planes();
+            assert_eq!(rgb_planar(a, b, c, w, h, 1.0), rgb_planar_parallel(d, e, f, w, h, 1.0));
+        }
     }
 
     #[test]
