@@ -123,6 +123,19 @@ fn dispatch(provider: Provider, options: &EngineOptions) -> Result<Option<Execut
 }
 
 fn session(env: &Environment, path: &Path, provider: Provider, options: &EngineOptions) -> Result<Session, String> {
+    if provider != Provider::DirectMl {
+        return session_with(env, path, provider, options, false);
+    }
+    // DirectML fuses the graph into its own, and its fusion rejects NeuFlow
+    // ("The parameter is incorrect" in DmlGraphFusionHelper); without fusion
+    // the same operators run one by one.
+    session_with(env, path, provider, options, false).or_else(|fused| {
+        session_with(env, path, provider, options, true).map_err(|unfused| format!("{fused}; without graph fusion: {unfused}"))
+    })
+}
+
+fn session_with(env: &Environment, path: &Path, provider: Provider, options: &EngineOptions, no_dml_fusion: bool)
+    -> Result<Session, String> {
     let fail = |e: ort::Error<_>| format!("{}: {e}", path.display());
     let mut builder = Session::builder(env)
         .map_err(|e| e.to_string())?
@@ -131,6 +144,9 @@ fn session(env: &Environment, path: &Path, provider: Provider, options: &EngineO
     if provider == Provider::DirectMl {
         // DirectML wants neither memory patterns nor parallel execution.
         builder = builder.with_memory_pattern(false).map_err(fail)?.with_parallel_execution(false).map_err(fail)?;
+        if no_dml_fusion {
+            builder = builder.with_config_entry("ep.dml.disable_graph_fusion", "1").map_err(fail)?;
+        }
     }
     if let Some(ep) = dispatch(provider, options)? {
         builder = builder.with_execution_providers([ep]).map_err(fail)?;

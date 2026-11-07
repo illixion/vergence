@@ -15,8 +15,9 @@
 //! `"<model> <size> onnx"` in track headers, so a title never mixes Core ML
 //! and ONNX Runtime results, unless the config sets `shareCoreMLProfile`.
 //!
-//! It runs at low priority and stands aside (no claims, its lease released)
-//! while the machine is wanted: see `yielding`. `--once` takes one piece and
+//! It runs at low priority and stands aside (no claims, its lease released,
+//! its models unloaded so the GPU's memory goes back too) while the machine
+//! is wanted: see `yielding`. `--once` takes one piece and
 //! exits (for tests); otherwise it polls until stopped, backing off while
 //! there is nothing to do. `bench` times the models alone. Design: Hypnos
 //! `docs/plans/analysis-workers.md`.
@@ -127,10 +128,15 @@ fn profile(engine: &Engine, share_core_ml: bool) -> BTreeMap<String, String> {
     ])
 }
 
+/// Loads the models again after standing aside, on the provider that loaded first.
+type Loader = Arc<dyn Fn() -> Result<Engine, String> + Send + Sync>;
+
 struct Worker {
     config: Config,
     coordinator: Coordinator,
-    engine: Arc<Mutex<Engine>>,
+    /// None while standing aside: the models are unloaded then.
+    engine: Arc<Mutex<Option<Engine>>>,
+    loader: Loader,
     models: BTreeMap<String, String>,
     producer: String,
     yielder: Arc<dyn Yield>,
@@ -151,9 +157,12 @@ async fn run(config_path: &Path, provider: Option<Provider>, once: bool) -> Resu
         let _ = std::fs::create_dir_all(dir);
     }
     let models_dir = expand_tilde(&config.models);
-    let engine = tokio::task::spawn_blocking(move || Engine::load(&models_dir, provider, &options))
-        .await
-        .map_err(|e| e.to_string())??;
+    let engine = {
+        let (models_dir, options) = (models_dir.clone(), options.clone());
+        tokio::task::spawn_blocking(move || Engine::load(&models_dir, provider, &options)).await.map_err(|e| e.to_string())??
+    };
+    let loaded = engine.provider;
+    let loader: Loader = Arc::new(move || Engine::load(&models_dir, loaded, &options));
     let name = config.name.clone().unwrap_or_else(host_name);
     let models = profile(&engine, config.share_core_ml_profile.unwrap_or(false));
     let producer = format!("vergence-worker {} (ONNX Runtime, {})", env!("CARGO_PKG_VERSION"), engine.provider.name());
@@ -162,7 +171,8 @@ async fn run(config_path: &Path, provider: Option<Provider>, once: bool) -> Resu
         coordinator: Coordinator::new(&config.coordinator, config.token()?, name.clone())?,
         yielder: Arc::new(yielding::for_this_machine(&config_dir, config.yield_processes.clone().unwrap_or_default())),
         config,
-        engine: Arc::new(Mutex::new(engine)),
+        engine: Arc::new(Mutex::new(Some(engine))),
+        loader,
         models,
         producer,
     };
@@ -176,6 +186,32 @@ impl Worker {
         tokio::task::spawn_blocking(move || yielder.reason()).await.ok().flatten()
     }
 
+    /// Gives the GPU's memory back while standing aside.
+    async fn unload(&self) {
+        let engine = self.engine.clone();
+        let dropped = tokio::task::spawn_blocking(move || engine.lock().unwrap_or_else(|p| p.into_inner()).take().is_some())
+            .await
+            .unwrap_or(false);
+        if dropped {
+            log("unloaded the models (their GPU memory is free again)");
+        }
+    }
+
+    async fn ensure_loaded(&self) -> Result<(), String> {
+        let (engine, loader) = (self.engine.clone(), self.loader.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut slot = engine.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.is_none() {
+                let started = Instant::now();
+                *slot = Some(loader()?);
+                log(format!("loaded the models again in {:.1} s", started.elapsed().as_secs_f64()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn run(&self, once: bool) -> Result<(), String> {
         let mut idle = 2u64;
         let mut standing_aside: Option<String> = None;
@@ -184,6 +220,7 @@ impl Worker {
                 if standing_aside.as_ref() != Some(&reason) {
                     log(format!("standing aside: {reason}"));
                 }
+                self.unload().await;
                 if once {
                     return Ok(());
                 }
@@ -192,6 +229,14 @@ impl Worker {
                 continue;
             } else if standing_aside.take().is_some() {
                 log("back to work");
+            }
+            if let Err(e) = self.ensure_loaded().await {
+                log(format!("the models didn't load again: {e}"));
+                if once {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                continue;
             }
             let lease = match self.coordinator.claim(self.config.remote.unwrap_or(false), &self.models).await {
                 Ok(lease) => lease,
@@ -301,8 +346,9 @@ impl Worker {
         let ffmpeg = self.config.ffmpeg.as_deref().map(|p| expand_tilde(p).to_string_lossy().into_owned());
         let result = tokio::task::spawn_blocking(move || {
             let piece = Piece { lease: &lease, url: &url, ffmpeg: ffmpeg.as_deref(), models: &models, producer: &producer };
-            let mut engine = engine.lock().unwrap_or_else(|p| p.into_inner());
-            analyze::run(&piece, &mut engine, &stop)
+            let mut slot = engine.lock().unwrap_or_else(|p| p.into_inner());
+            let engine = slot.as_mut().ok_or_else(|| Failure::Error("the models aren't loaded".into()))?;
+            analyze::run(&piece, engine, &stop)
         })
         .await
         .map_err(|e| Failure::Error(format!("the analysis panicked: {e}")))?;

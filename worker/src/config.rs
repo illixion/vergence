@@ -5,7 +5,7 @@
 //! {
 //!   "coordinator": "http://home-server:8420",
 //!   "tokenFile": "~/.config/vergence/worker.token",
-//!   "name": "gaming-pc",
+//!   "name": "gpu-pc",
 //!   "remote": false,
 //!   "models": "~/Models/onnx",
 //!   "computeUnits": "all",

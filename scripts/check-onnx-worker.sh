@@ -12,6 +12,8 @@
 # COREML_DIR holds RIFE*480x288 and NeuFlow*512x288 .mlpackages (for the
 # reference), ONNX_DIR the exports of scripts/export-onnx-models.py. EPs
 # default to "cpu coreml" (what a Mac can run). Half or full side by side only.
+# Builds go to CARGO_TARGET_DIR and SWIFT_SCRATCH_PATH when set. KEEP_COREML=FILE
+# keeps the Core ML reference track there (to compare a PC's chunks with it).
 set -euo pipefail
 if [ "$#" -lt 6 ]; then
     sed -n '2,16p' "$0" >&2
@@ -24,11 +26,13 @@ providers=("$@")
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 work=$(mktemp -d)
 echo "check-onnx-worker: building (work in $work)"
-(cd "$root" && swift build -c release --product vergence >/dev/null \
-    && cargo build -q --release -p vergence-coordinator -p vergence-worker)
-vergence="$root/.build/release/vergence"
-vergenced="$root/target/release/vergenced"
-worker="$root/target/release/vergence-worker"
+swift_build="${SWIFT_SCRATCH_PATH:-$root/.build}"
+cargo_target="${CARGO_TARGET_DIR:-$root/target}"
+(cd "$root" && swift build -c release --product vergence --scratch-path "$swift_build" >/dev/null \
+    && cargo build -q --release -p vergence-coordinator -p vergence-worker --target-dir "$cargo_target")
+vergence="$swift_build/release/vergence"
+vergenced="$cargo_target/release/vergenced"
+worker="$cargo_target/release/vergence-worker"
 
 coordinator=""
 trap '[ -n "$coordinator" ] && kill "$coordinator" 2>/dev/null || true' EXIT
@@ -38,7 +42,7 @@ for ep in "${providers[@]}"; do
     mkdir -p "$dir"
     port=$((20000 + RANDOM % 20000))
     cat > "$dir/vergenced.json" <<JSON
-{"listen": "127.0.0.1:$port", "store": "$dir/store",
+{"listen": "127.0.0.1:$port", "store": "$dir/store", "pairedListen": null,
  "jellyfin": {"url": "$jellyfin", "apiKeyFile": "$key_file"}}
 JSON
     "$vergenced" token add worker --grants work --config "$dir/vergenced.json" > "$dir/work.token"
@@ -79,6 +83,7 @@ ffmpeg -nostdin -v error -i "$file" -filter_complex \
     "[0:v:0]split[a][b];[a]crop=iw/2:ih:0:0[l];[b]crop=iw/2:ih:iw/2:0[r];[l][r]vstack[out]" -map "[out]" \
     -f rawvideo -pix_fmt yuv420p - |
     "$vergence" analyze --raw "$((width / 2))x$height" --rate "$rate" - --models "$coreml" --output "$work/coreml.vgat"
+[ -n "${KEEP_COREML:-}" ] && cp "$work/coreml.vgat" "$KEEP_COREML"
 
 # Differences per kind and channel group, with the record reader of compare-analysis-tracks.py.
 stats() {

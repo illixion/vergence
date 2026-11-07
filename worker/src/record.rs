@@ -158,10 +158,7 @@ impl Record {
     #[cfg(test)]
     pub fn values(&self) -> Vec<f32> {
         assert!(!self.deflated, "inflate the record first");
-        self.payload
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 * self.scale + self.offset)
-            .collect()
+        self.payload.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b) as f32 * self.scale + self.offset).collect()
     }
 
     /// The record with its length prefix.
@@ -312,9 +309,11 @@ mod tests {
             assert_eq!(a, b, "record headers");
             let worst = mine
                 .payload
-                .chunks_exact(2)
-                .zip(swift.payload.chunks_exact(2))
-                .map(|(x, y)| (i16::from_le_bytes([x[0], x[1]]) as i32 - i16::from_le_bytes([y[0], y[1]]) as i32).abs())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(swift.payload.as_chunks::<2>().0)
+                .map(|(&x, &y)| (i16::from_le_bytes(x) as i32 - i16::from_le_bytes(y) as i32).abs())
                 .max()
                 .unwrap();
             assert!(worst <= 1, "kind {} differs by {worst} steps", mine.kind);
