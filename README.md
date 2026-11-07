@@ -274,7 +274,23 @@ target\release\vergence-convert.exe Film.mkv --download-model  # Film.3D.FSBS.mp
   float16, but anchoring and cut decisions sit on thresholds (a fit needs 15 % of the pixels to hold
   still), and a frame that lands on the other side of one gives its shot a different depth scale
   until the next cut, which moves pixels by up to the strength (0.8 % of the width) but never
-  reshapes the depth.
+  reshapes the depth. Built on Windows and run on CUDA, the same clips agree with the Mac's copies
+  at 49.1 dB and SSIM 0.985 (SDR), 52.2 dB and 0.992 (HDR10).
+- **Speed** on an RTX 3080 (CUDA, NVENC; 10 s clips, start-up included):
+
+  | Source | Depth | Picture | Overall | VRAM |
+  | --- | --- | --- | --- | --- |
+  | 1080p24 SDR | 68 fps | 110 fps | 33 fps | 1.0 GB |
+  | 1080p24 HDR10 | 61 fps | 74 fps | 28 fps | 1.2 GB |
+  | 4K24 SDR | 54 fps | 31 fps | 18 fps | 1.8 GB |
+  | 4K24 HDR10 | 41 fps | 20 fps | 12 fps | 2.7 GB |
+
+  On a long film the start-up stops counting: a two-hour 1080p film takes a little over an hour,
+  a 4K HDR one about three and a half. DirectML on the same card runs the depth at 38 fps.
+- **Spatial video:** no Windows encoder makes MV-HEVC that this can use yet. NVIDIA's Video Codec
+  SDK 13 encodes two-view MV-HEVC through its own API, but ffmpeg's `hevc_nvenc` exposes none of it,
+  and x265 4's `--multiview-config` needs its own (GPL) executable and an Apple spatial-metadata
+  muxer on top; either would be new work.
 
 ### Spatial audio
 
@@ -431,6 +447,42 @@ for 1080p 3D on an M2 Max. The ONNX worker agrees on disparity; its RIFE flow di
 ML's float16 run, so its titles use their own profile (`scripts/check-onnx-worker.sh`). The
 desktop app (`desktop/`, `cargo run -p vergence-desktop`; for Windows `desktop/scripts/package-windows.sh`) runs the coordinator, pairs headsets,
 runs a worker and converts files to AI 3D side by side, from one tray icon.
+
+#### The ONNX worker on Windows
+
+Built and run on Windows 10 with an RTX 3080 (rustup's `stable-x86_64-pc-windows-msvc` and the Visual
+Studio 2022 Build Tools):
+
+```powershell
+$env:ORT_CUDA_VERSION = "13"
+cargo build --release -p vergence-worker --features cuda,tensorrt
+target\release\vergence-worker.exe bench --models onnx-models --ep cuda
+target\release\vergence-worker.exe --config worker.json
+```
+
+`ort` downloads ONNX Runtime 1.31 built for CUDA 13 with TensorRT and DirectML, and puts its DLLs
+(DirectML's included) beside the executable. CUDA and TensorRT need NVIDIA's runtime DLLs on `PATH`
+or beside it, nothing installed system-wide; the driver must support CUDA 13. NVIDIA's
+redistributable wheels hold them (a wheel is a zip): `nvidia-cuda-runtime`, `nvidia-cublas` (13.x),
+`nvidia-cudnn-cu13`, `nvidia-cufft`, `nvidia-curand` for CUDA, plus `tensorrt-cu13-libs` 10.x (from
+`pypi.nvidia.com`; `nvinfer_10.dll`, `nvonnxparser_10.dll` and the builder resource for the GPU's
+architecture) for TensorRT. DirectML needs nothing more. `--ep` (or `executionProvider`) picks one;
+`auto` tries CUDA, then DirectML.
+
+1080p 3D Smooth Motion (RIFE 480×288 and NeuFlow 512×288, `bench`, both models at once), on an RTX 3080:
+
+| Provider | fps | GPU memory | First load |
+| --- | --- | --- | --- |
+| TensorRT (fp32) | 103–111 | about 0.9 GB | about 100 s to build its engines, then cached in `model-cache` beside the config |
+| DirectML | 94 | about 0.5 GB | 1.4 s; NeuFlow runs without DirectML's graph fusion, which rejects it |
+| CUDA | 81–83 | about 0.75 GB | 3 s |
+| CPU (Ryzen 5 5600X) | 3.7 | | |
+
+A shared PC stays the owner's: the worker runs at below-normal priority, and stands aside (no
+claims, its piece given back, its models unloaded so the GPU's memory goes back) while a game, a
+stream (Sunshine, Moonlight, Steam Link, Longwave), a recording or another model uses the GPU, or
+while its memory runs short; it goes back to work after 30 s of quiet. What counts is in
+`worker/src/yielding.rs`.
 
 ## Library
 
