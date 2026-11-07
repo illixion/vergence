@@ -1,12 +1,20 @@
 # Vergence release signers, in ssh-keygen allowed_signers format.
 #
-# PLACEHOLDER: Vergence has no releases yet, so no key is pinned and the updater (off by
-# default) can verify nothing. When releases start:
-#   - sign each release's SHA256SUMS with `ssh-keygen -Y sign -n vergence-release`;
-#   - pin the signing key and an offline backup here, both from the first release that ships
-#     this file (a backup added later is worthless: nothing installed would trust it);
-#   - set `updater::SITE` to the site serving release.json.
+# Every Vergence release is one SHA256SUMS file listing its assets, signed with
+# `ssh-keygen -Y sign -n vergence-release` (SSHSIG; `desktop/scripts/bless-release.sh` does it
+# and checks the result). The desktop app's updater verifies a download against these keys,
+# compiled in, before using it, and refuses anything the signature doesn't cover. Download URLs
+# are not trusted at all: an asset can come from any host as long as its hash is in a signed
+# manifest.
 #
-# The structure is Apparition's (MIT, same author): its desktop updater and release manifest
-# verification, adapted. Lines look like:
-# releases@example.invalid ssh-ed25519 AAAA...
+# TWO KEYS, both pinned from the first release that ships this file: the everyday hardware key
+# (needs a PIN and a touch, never on disk or in CI) and an offline backup, for when the
+# hardware key is lost or broken. A backup added later would be worthless: nothing already
+# installed would trust it, and the release introducing it couldn't be verified.
+#
+# They are the same two keys that sign Apparition's and Longwave's releases (Apparition's
+# `release-signers`, MIT, same author), so there is one pair to protect. The namespace differs
+# ("vergence-release"), so a signature made for either of those can't pass as a Vergence
+# release, nor one of Vergence's as theirs.
+releases@vergence ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPDFLEggFzedj9nvz0wl9AoPGXFFbT9XfgEWrAY0l7pa ixion@YubiKey5-gpg
+releases@vergence ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDhKX9Ler/OtQbUlo3ZggDcozle12CS9EFiKHadbXLJ0 ixion@SecureBackup

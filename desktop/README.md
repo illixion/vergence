@@ -59,14 +59,32 @@ token = hex(HKDF-SHA256(ikm: pairing token (UTF-8), salt: "Vergence-HTTP-Token-v
 The coordinator keeps its SHA-256 as `device-<device id>` with the `play` grant; forgetting the
 device removes it.
 
+## Signing a release
+
+The updater trusts a release only through its `SHA256SUMS`, signed with SSHSIG under the
+namespace `vergence-release` by a key in `release-signers`, which is compiled in. Those are the
+same two keys that sign Apparition's releases: the everyday hardware key (PIN and touch, never on
+disk or in CI) and an offline backup, both pinned from the start so the backup is trusted by every
+copy installed. To sign a release's manifest, in the foreground:
+
+```sh
+desktop/scripts/bless-release.sh build/release/0.2.0/SHA256SUMS                 # the hardware key, via ssh-agent or gpg-agent
+desktop/scripts/bless-release.sh build/release/0.2.0/SHA256SUMS --key-file KEY  # the offline backup
+```
+
+It writes `SHA256SUMS.sig` beside the manifest and checks it with `ssh-keygen -Y verify` against
+`release-signers`. A release lists `Vergence-<version>-macos-universal.zip` and
+`Vergence-<version>-windows-x86_64.zip` (`updater::installer_name`); the version is in the
+signed names, so an old release can't be relabelled as new.
+
 ## Not done yet
 
 - **The TLS-PSK channel** for the chunk and worker API (pairing and the derived HTTP token work).
 - **Bonjour**: devices pair from the address link the Headsets tab shows.
 - **Windows:** the worker and conversion arrive with the ONNX Runtime engine; the app shows so.
   The `cfg`s are in place, but no Windows build has been made.
-- **Updates:** `updater::SITE` and `release-signers` are placeholders (no release site or key
-  yet), checking is off by default, and the Windows install step isn't ported.
+- **Updates:** there is no release site yet (`updater::SITE` is `None`), so checking is off by
+  default, and the Windows install step isn't ported. The signing keys are pinned (below).
 - **Titles by name** in the queue (it shows server and id), a preview frame before converting,
   model and GPU choice, yielding to games, and a signed bundle with the CLI as a sidecar.
 - `vergence convert` prints progress only to a terminal, so the app gives its stderr a

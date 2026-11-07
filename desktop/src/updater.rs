@@ -7,10 +7,12 @@
 //! Adapted from Apparition's desktop updater and release verification (`desktop/src/updater.rs`,
 //! `core/src/release.rs`; MIT, same author).
 //!
-//! **Placeholders:** Vergence has no release site and no signing key yet. [`SITE`] is `None`
-//! and `release-signers` pins no key, so a check says updates aren't set up, and checking is off
-//! by default (Settings). The Windows install step (Apparition's `update-windows.ps1` helper,
-//! which swaps a running executable) isn't ported yet.
+//! **Signers:** `release-signers` pins the same two keys as Apparition's releases (a hardware key
+//! and an offline backup) under the namespace [`NAMESPACE`]; `desktop/scripts/bless-release.sh`
+//! signs a release's `SHA256SUMS` with them. **Placeholder:** there is no release site yet, so
+//! [`SITE`] is `None`, a check says updates aren't set up, and checking is off by default
+//! (Settings). The Windows install step (Apparition's `update-windows.ps1` helper, which swaps a
+//! running executable) isn't ported yet.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +28,7 @@ use sha2::{Digest, Sha256, Sha512};
 pub const SITE: Option<&str> = None;
 /// The SSHSIG namespace releases are signed under (`ssh-keygen -Y sign -n vergence-release`).
 pub const NAMESPACE: &str = "vergence-release";
-/// PLACEHOLDER: no keys pinned yet (see the file).
+/// The pinned release keys (ssh-keygen allowed_signers format).
 const SIGNERS: &str = include_str!("../release-signers");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_ASSET_BYTES: u64 = 2 << 30;
@@ -526,7 +528,7 @@ mod tests {
         assert_eq!(verify_sshsig(sums.as_bytes(), &signature, NAMESPACE, &signers).unwrap(), "releases@test");
         assert!(verify_sshsig(b"other", &signature, NAMESPACE, &signers).is_err());
         assert!(verify_sshsig(sums.as_bytes(), &signature, "file", &signers).is_err());
-        // The placeholder pins nothing, so nothing verifies against it.
+        // A key that isn't pinned verifies nothing against the real signers.
         assert!(verify_sshsig(sums.as_bytes(), &signature, NAMESPACE, SIGNERS).is_err());
 
         let good = release("1.2.0", &[("Vergence-1.2.0-macos-universal.zip", &hash)]);
@@ -549,9 +551,12 @@ mod tests {
         let a = "0".repeat(64);
         assert!(parse_sums(&format!("{a}  x\n{a}  x\n")).is_err());
         assert_eq!(parse_sums(&format!("{a} *x\n")).unwrap()["x"], a);
-        // Nothing is set up yet: no site and no pinned key.
+        // The release keys are pinned (the hardware key and the offline backup); no site yet.
         assert!(SITE.is_none());
-        assert!(!signers_pinned());
+        assert!(signers_pinned());
+        let pinned = signer_keys(SIGNERS);
+        assert_eq!(pinned.len(), 2);
+        assert!(pinned.iter().all(|(blob, principal)| blob.len() == 51 && principal == "releases@vergence"));
         let index = Index {
             format: "vergence-releases".into(),
             version: 1,
