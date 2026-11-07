@@ -29,7 +29,10 @@ import Testing
 
 @Test func aSinkReceivesStructuredEvents() {
     let received = VergenceLock<[VergenceLogEvent]>([])
-    VergenceLog.sink = { event in received.withLock { $0.append(event) } }
+    VergenceLog.sink = { event in
+        received.withLock { $0.append(event) }
+        VergenceLog.pipeline.notice("nested sink event")
+    }
     defer { VergenceLog.sink = nil }
     let path = "/private/path"
     VergenceLog.cache.error("evicted \(path)")

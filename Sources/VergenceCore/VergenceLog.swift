@@ -226,9 +226,21 @@ public enum VergenceLog {
     }
 
     private static let state = VergenceLock<(@Sendable (VergenceLogEvent) -> Void)?>(nil)
+    private static let sinkEmissionThreadKey = "VergenceLog.isEmittingToSink"
 
     static func emit(_ event: VergenceLogEvent) {
-        if let sink { return sink(event) }
+        if let sink {
+            // A sink often forwards into another logging system. If that
+            // system feeds a line back into VergenceLog, stop the nested
+            // event here instead of recursively calling the same sink until
+            // the current thread exhausts its stack.
+            let threadDictionary = Thread.current.threadDictionary
+            guard threadDictionary[sinkEmissionThreadKey] == nil else { return }
+            threadDictionary[sinkEmissionThreadKey] = true
+            defer { threadDictionary.removeObject(forKey: sinkEmissionThreadKey) }
+            sink(event)
+            return
+        }
         #if canImport(os)
         let logger = Logger(subsystem: subsystem, category: event.category)
         let type: OSLogType = switch event.level {
