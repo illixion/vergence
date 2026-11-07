@@ -469,20 +469,27 @@ redistributable wheels hold them (a wheel is a zip): `nvidia-cuda-runtime`, `nvi
 architecture) for TensorRT. DirectML needs nothing more. `--ep` (or `executionProvider`) picks one;
 `auto` tries CUDA, then DirectML.
 
-1080p 3D Smooth Motion (RIFE 480×288 and NeuFlow 512×288, `bench`, both models at once), on an RTX 3080:
+1080p 3D Smooth Motion (RIFE 480×288 and NeuFlow 512×288) on an RTX 3080: the models alone
+(`bench`, both at once), and whole pieces from a coordinator, ffmpeg's seek and decode included:
 
-| Provider | fps | GPU memory | First load |
-| --- | --- | --- | --- |
-| TensorRT (fp32) | 103–111 | about 0.9 GB | about 100 s to build its engines, then cached in `model-cache` beside the config |
-| DirectML | 94 | about 0.5 GB | 1.4 s; NeuFlow runs without DirectML's graph fusion, which rejects it |
-| CUDA | 81–83 | about 0.75 GB | 3 s |
-| CPU (Ryzen 5 5600X) | 3.7 | | |
+| Provider | Models | Pieces | GPU memory | First load |
+| --- | --- | --- | --- | --- |
+| TensorRT (fp32) | 103–111 fps | 55 fps | about 0.45–0.9 GB | about 100 s to build its engines, then cached in `model-cache` beside the config |
+| DirectML | 94 fps | 52 fps | about 0.5 GB | 1.4 s; NeuFlow runs without DirectML's graph fusion, which rejects it |
+| CUDA | 81–83 fps | 47 fps | about 0.75 GB | 3 s |
+| CPU (Ryzen 5 5600X) | 3.7 fps | 3.8 fps | | |
+
+All three GPU providers give the same records within one or two storage steps (0.06 px) of each
+other, and the Core ML worker's disparity within one step (0.03 px); RIFE's flow differs from
+Core ML's float16 run by up to 1 px (p99 0.06 px), as the Mac's ONNX CPU run does
+(`scripts/check-onnx-worker.sh` on a Mac, then the PC's chunks against its `KEEP_COREML` track with
+`scripts/compare-analysis-tracks.py`). So PCs share one profile, and Core ML titles keep theirs.
 
 A shared PC stays the owner's: the worker runs at below-normal priority, and stands aside (no
-claims, its piece given back, its models unloaded so the GPU's memory goes back) while a game, a
-stream (Sunshine, Moonlight, Steam Link, Longwave), a recording or another model uses the GPU, or
-while its memory runs short; it goes back to work after 30 s of quiet. What counts is in
-`worker/src/yielding.rs`.
+claims, its piece given back, its models unloaded so the GPU's memory goes back) while a game, an
+app launched through a Sunshine stream, SteamVR or another program keeps the GPU busy, or while its
+memory runs short; it goes back to work after 30 s of quiet. A stream of the desktop alone doesn't
+stop it. What counts is in `worker/src/yielding.rs`.
 
 ## Library
 
