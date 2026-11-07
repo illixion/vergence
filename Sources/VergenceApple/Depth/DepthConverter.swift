@@ -100,6 +100,12 @@ final class DepthConverter: @unchecked Sendable {
         let title: String?
         /// Must be a local file — AVAssetReader can't read remote/streamed assets.
         let localFileURL: URL
+        /// Where the entry goes instead of the cache store (`OfflineDepthConversion`).
+        var directory: URL? = nil
+        /// The model to load instead of the preprocess preference.
+        var modelURL: URL? = nil
+        /// Only this part of the video (nil: all of it).
+        var timeRange: CMTimeRange? = nil
     }
 
     struct Output: Sendable {
@@ -222,7 +228,13 @@ final class DepthConverter: @unchecked Sendable {
         }
         let naturalSize = (try? await track.load(.naturalSize)) ?? .zero
         let nominalFrameRate = (try? await track.load(.nominalFrameRate)) ?? 0
-        let duration = (try? await asset.load(.duration)) ?? .zero
+        var duration = (try? await asset.load(.duration)) ?? .zero
+        if let range = request.timeRange {
+            // Counted from the range's start: totals and progress are the range's.
+            let end = range.duration.isIndefinite || range.duration.isPositiveInfinity
+                ? duration : CMTimeMinimum(duration, range.end)
+            duration = CMTimeMaximum(.zero, end - range.start)
+        }
 
         let plan = Plan(
             request: request,
@@ -345,11 +357,13 @@ final class DepthConverter: @unchecked Sendable {
 
     private func run(_ plan: Plan, progress: @escaping ProgressHandler) throws -> Output {
         guard let gpu = makeGPUContext() else { throw DepthConversionError.gpuSetupFailed }
-        guard let provider = CoreMLDepthProvider(device: gpu.device, role: .preprocess) else {
+        let loaded = plan.request.modelURL.map { CoreMLDepthProvider(device: gpu.device, modelURL: $0) }
+            ?? CoreMLDepthProvider(device: gpu.device, role: .preprocess)
+        guard let provider = loaded else {
             throw DepthConversionError.noDepthModel
         }
 
-        let directory = DepthCacheStore.entryDirectory(
+        let directory = plan.request.directory ?? DepthCacheStore.entryDirectory(
             videoIdentity: plan.request.videoIdentity, modelName: provider.modelName
         )
         let fm = FileManager.default
@@ -432,6 +446,7 @@ final class DepthConverter: @unchecked Sendable {
             throw DepthConversionError.readerInitFailed("Cannot add reader output")
         }
         reader.add(readerOutput)
+        if let range = plan.request.timeRange { reader.timeRange = range }
         guard reader.startReading() else {
             throw DepthConversionError.readerInitFailed(reader.error?.localizedDescription ?? "Unknown error")
         }
@@ -1222,7 +1237,10 @@ extension DepthConverter {
             guard writer.startWriting() else {
                 throw DepthConversionError.writerInitFailed(writer.error?.localizedDescription ?? "startWriting failed")
             }
-            writer.startSession(atSourceTime: firstPTS)
+            // A part of a video keeps its frames' times from zero: a session
+            // started at the first frame would play them back shifted to zero,
+            // and nothing would match its depth up by time.
+            writer.startSession(atSourceTime: plan.request.timeRange == nil ? firstPTS : .zero)
             return (writer, input, adaptor)
         }
 

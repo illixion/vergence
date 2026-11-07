@@ -8,6 +8,9 @@
    vergence sbs SPATIAL-VIDEO|FOLDER... [--output FILE|DIR] [--half] [--max-eye PIXELS] [--no-ambisonics]
    vergence sbs SPATIAL-VIDEO --segments DIR [--segment-seconds S] [--first N] [--last N] [--half] [--max-eye PIXELS]
    vergence sbs SPATIAL-VIDEO --info [--segment-seconds S] [--half] [--max-eye PIXELS]
+   vergence convert VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab|spatial] [--strength S]
+                    [--convergence 0...1] [--sample SECONDS] [--start S] [--frames N] [--model PATH]
+                    [--download-model] [--depth-track FILE.vgat] [--quality ...] [--bitrate MBPS] [--max-eye PIXELS]
    vergence audio VIDEO [--track N] [--bitrate KBPS] --output FILE.opus|.ogg|.mka|.webm|.mp4|.wav
    vergence info DISC
    vergence decode DISC [--playlist NNNNN] [options]
@@ -104,6 +107,11 @@
  BGRA frames in, the in-between frame of each pair out, made from the track
  by the same Metal pass the headset runs (see Interpolate.swift).
 
+ convert turns any 2D video into an AI 3D copy that side-by-side players
+ read: Core ML depth for every frame with the pre-processed refinement, each
+ eye warped from it, HEVC side by side (VIDEO.3D.FSBS.mp4; --layout hsbs,
+ tab, htab, or spatial for MV-HEVC), audio copied (see Convert.swift).
+
  inspect says what a file is and, for spatial video, what a player would
  miss; for a frame-packed file, which layout it looks like.
 
@@ -131,6 +139,10 @@ func usage(_ problem: String? = nil) -> Never {
            vergence inspect VIDEO|DISC
            vergence sbs SPATIAL-VIDEO|FOLDER... [--output FILE|DIR] [--half] [--max-eye PIXELS] [--no-ambisonics]
                         [--quality low|standard|high|max] [--bitrate MBPS] [--dry-run] [--force]
+           vergence convert VIDEO|FOLDER... [--output FILE|DIR] [--layout fsbs|hsbs|tab|htab|spatial]
+                            [--strength S] [--convergence 0...1] [--sample SECONDS] [--start S] [--frames N]
+                            [--model PATH] [--download-model] [--depth-track FILE.vgat]
+                            [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio]
            vergence info DISC
            vergence decode DISC [--playlist NNNNN] [options]
            vergence decode BASE.m2ts [DEPENDENT.m2ts] [options]
@@ -469,6 +481,7 @@ do {
     case "make": try await make(options)
     case "inspect": try await inspect(options)
     case "sbs", "quest": try await sideBySide(options)
+    case "convert": try await convert(options)
     case "analyze": try await analyze(options)
     case "interpolate": try interpolate(options)
     default: usage("unknown command \(options.command)")

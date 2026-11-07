@@ -7,7 +7,8 @@ Stereo 3D video tools in Swift:
   for a Quest, Android or YouTube, with its spatial audio.
 - **3D Blu-ray**: decodes H.264 MVC ("Stereo High") into ordinary left/right pictures, on any
   platform Swift runs on, Apple's included.
-- **2D to 3D** from estimated depth (the library; the command line comes later).
+- **2D to 3D** from estimated depth: `vergence convert` turns any 2D video into an AI 3D
+  side-by-side copy (or spatial video) that 3D players read.
 
 Planned: immersive video (Apple Projected Media Profile: 180°/360°, fisheye), spatial audio, and
 spatial video straight from a disc.
@@ -171,6 +172,59 @@ server can make any stretch on demand (where the viewer seeks) and segments from
 play as one stream; `index.m3u8` lists the whole grid. The stereo AAC is copied; the ambisonic
 track is left out, since an encoder restarted at every seek would click where runs join. The
 Convolution Jellyfin plugin streams spatial video to its Quest app this way.
+
+### 2D to 3D
+
+```sh
+vergence convert Film.mkv                         # writes Film.3D.FSBS.mp4 beside it
+vergence convert Film.mkv --layout hsbs           # Film.3D.HSBS.mp4: half-width eyes, for TVs
+vergence convert Film.mkv --sample 10             # a 10 s piece from the middle: Film.sample.3D.FSBS.mp4
+vergence convert ~/Videos --output ~/Videos/3D    # a whole folder
+```
+
+`convert` runs the offline AI 3D path Convolution's Pre-Process uses, to a file instead of a
+cache, in two passes:
+1. **Depth** for every frame with Depth Anything V2 Small (Core ML), then the pre-processed
+   refinement: a joint-bilateral filter on the frame's own edges, a ±2-frame window that stops at
+   scene cuts, and each shot's depth scale locked by anchoring on the pixels that didn't change
+   (`DepthConverter`).
+2. **Picture:** each frame decoded again with its depth, both eyes drawn by the depth-displaced
+   mesh as cached playback draws them (with the soft-knee depth budget), packed, and encoded as
+   HEVC.
+
+The output:
+- **Layout** by `--layout`: `fsbs` (the default: full side by side, `.3D.FSBS.mp4`), `hsbs`
+  (`.3D.HSBS.mp4`), `tab` (full top and bottom, `.3D.FTAB.mp4`), `htab` (`.3D.HTAB.mp4`), or
+  `spatial`: MV-HEVC spatial video made from a full side-by-side intermediate the way `make`
+  makes it (`.spatial.mov`; `--preset`, `--baseline`, `--hfov`, `--adjust` apply). Google's `st3d`
+  box says the layout to players that read it.
+- **Depth:** Convolution's Subtle settings unless changed: `--strength` (the largest per-eye shift,
+  a share of the frame's width, 0.008) and `--convergence` (the depth on the screen plane, 1: the
+  nearest thing in each shot, so nothing comes out through the frame).
+- **Colour:** 10-bit sources and HDR (PQ, HLG) stay 10-bit HEVC with their colour tags, mastering
+  display and light levels. Depth runs on an 8-bit copy converted to BT.709 for the model, as
+  in Convolution's Pre-Process (not checked on real HDR films yet).
+- **Audio:** AAC, AC-3, E-AC-3, ALAC and MP3 tracks copied as they are. Other files are remuxed
+  with ffmpeg first, as `make` does (TrueHD and DTS-HD MA to ALAC, DTS to AAC). Subtitles are left
+  out; nothing is burned in.
+- **A part of it:** `--start S` (seconds) and `--frames N`, or `--sample SECONDS`.
+- `--quality`, `--bitrate`, `--max-eye`, `--no-audio`, `--dry-run` and `--force` work as for `make`.
+  A finished output is skipped. The depth goes into a hidden folder beside the output while
+  converting, so a run that stops starts again from its finished depth.
+- `--depth-track FILE.vgat` also writes the depth as an analysis track (`depth` records, one per
+  frame, at the model's resolution), so the same depth can serve a live player.
+
+The model is the only one whose licence has been checked (Apache-2.0): `--model PATH` (an
+`.mlpackage` or `.mlmodelc`) or `VERGENCE_DEPTH_MODEL` names it, else the one the apps install in
+`~/Library/Application Support/DepthModels`; `--download-model` fetches it there from
+[Apple's Core ML repository](https://huggingface.co/apple/coreml-depth-anything-v2-small) (about
+50 MB). A tool built with `swift build` compiles the warp's Metal shaders from
+`Sources/VergenceApple/Stereo/StereoShaders.metal` on its first run (SwiftPM builds no Metal
+library); `VERGENCE_SHADERS` points elsewhere.
+
+On an M2 Max a 1080p24 video converts at about 30 frames a second, 1.2× realtime, so a two-hour
+film takes about 100 minutes: depth runs at 30-35 frames a second (the Neural Engine's model is
+nearly all of it) and the picture at about 180.
 
 ### Spatial audio
 

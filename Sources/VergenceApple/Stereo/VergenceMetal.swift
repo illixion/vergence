@@ -38,12 +38,38 @@ public final class VergenceMetal: Sendable {
 
     private init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
-              let bundle = Self.resourceBundle,
-              let library = try? device.makeDefaultLibrary(bundle: bundle) else {
+              let library = Self.resourceBundle.flatMap({ try? device.makeDefaultLibrary(bundle: $0) })
+                ?? Self.compileFallback(device: device) else {
             return nil
         }
         self.device = device
         self.library = library
+    }
+
+    private static let fallbackLock = NSLock()
+    nonisolated(unsafe) private static var fallbackShaders: URL?
+
+    /// Where the shaders are when no compiled library ships beside the code:
+    /// the SwiftPM command line builds none (see `resourceBundle`), so a
+    /// command line tool built that way points here at `StereoShaders.metal`
+    /// (compiled at first use, about a second) or a `.metallib`. Set it before
+    /// anything touches `shared`; the bundle's library still wins when there
+    /// is one. `VERGENCE_SHADERS` in the environment does the same.
+    public static func useShaders(at url: URL) {
+        fallbackLock.withLock { fallbackShaders = url }
+    }
+
+    private static func compileFallback(device: MTLDevice) -> MTLLibrary? {
+        let configured = fallbackLock.withLock { fallbackShaders }
+        guard let url = configured ?? ProcessInfo.processInfo.environment["VERGENCE_SHADERS"].map({ URL(fileURLWithPath: $0) })
+        else { return nil }
+        do {
+            if url.pathExtension == "metallib" { return try device.makeLibrary(URL: url) }
+            return try device.makeLibrary(source: String(contentsOf: url, encoding: .utf8), options: nil)
+        } catch {
+            VergenceLog.pipeline.error("shaders at \(url.path, privacy: .private) didn't build: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
     }
 
     /// The package's resource bundle, found by hand rather than through

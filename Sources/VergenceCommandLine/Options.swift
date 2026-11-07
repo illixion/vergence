@@ -63,8 +63,58 @@ public struct Options: Equatable, Sendable {
     /// `interpolate --scale S` (mono): the share of the frame's size the interpolator works at, as the
     /// governor's smaller step (0.67) runs it.
     public var scale: Double?
+    // convert
+    /// `--strength`: the warp's largest per-eye shift, a share of the frame's
+    /// width (nil: `Pseudo3DSettings`' default).
+    public var strength: Double?
+    /// `--convergence`: the depth on the screen plane, 0…1 (1: the nearest).
+    public var convergence: Double?
+    /// `--sample SECONDS`: convert only that long a piece (from the middle
+    /// unless `--start` says where).
+    public var sample: Double?
+    /// `--model PATH`: the Core ML depth model (.mlpackage or .mlmodelc).
+    public var model: String?
+    /// `--depth-track FILE.vgat`: also write the depth as an analysis track.
+    public var depthTrack: String?
+    /// `--download-model`: fetch Depth Anything V2 Small first if none is installed.
+    public var downloadModel = false
 
     public init() {}
+
+    /// `convert`'s output layout from `--layout` (full side by side unless given).
+    public var convertLayout: ConvertLayout { ConvertLayout(option: layout) ?? .fullSideBySide }
+}
+
+/// What `vergence convert` writes.
+public enum ConvertLayout: String, Sendable, CaseIterable {
+    case fullSideBySide, halfSideBySide, fullTopAndBottom, halfTopAndBottom, spatial
+
+    /// From a `--layout` value; nil for one convert doesn't take.
+    public init?(option: String) {
+        switch option.lowercased() {
+        case "auto", "sbs", "fsbs": self = .fullSideBySide
+        case "hsbs": self = .halfSideBySide
+        case "tab", "ftab", "ou": self = .fullTopAndBottom
+        case "htab", "hou": self = .halfTopAndBottom
+        case "spatial", "mvhevc": self = .spatial
+        default: return nil
+        }
+    }
+
+    public var isSideBySide: Bool { self == .fullSideBySide || self == .halfSideBySide || self == .spatial }
+    /// Each eye squeezed to half the frame's width (side by side) or height.
+    public var isHalf: Bool { self == .halfSideBySide || self == .halfTopAndBottom }
+
+    /// The name's ending, which players and media servers read the layout from.
+    public var nameSuffix: String {
+        switch self {
+        case .fullSideBySide: ".3D.FSBS.mp4"
+        case .halfSideBySide: ".3D.HSBS.mp4"
+        case .fullTopAndBottom: ".3D.FTAB.mp4"
+        case .halfTopAndBottom: ".3D.HTAB.mp4"
+        case .spatial: ".spatial.mov"
+        }
+    }
 }
 
 public struct EyeSize: Equatable, Sendable {
@@ -142,6 +192,8 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
             guard let packing = StereoPacking(rawValue: v) else { throw UsageError("unknown --packing \(v)") }
             o.packing = packing
         case "--seek": o.seek = try number(value())
+        // convert counts in seconds, like --seek; the disc commands in frames.
+        case "--start" where o.command == "convert": o.seek = try number(value())
         case "--start": o.start = try integer(value())
         case "--frames": o.frames = try integer(value())
         case "--threads": o.threads = try integer(value())
@@ -153,7 +205,9 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
         case "--header", "-H": try addHeader(value(), to: &o)
         case "--layout", "-f", "--format":
             let v = try value().lowercased()
-            guard ["auto", "sbs", "hsbs", "ou", "hou", "tab", "htab"].contains(v) else { throw UsageError("unknown --layout \(v)") }
+            guard ["auto", "sbs", "hsbs", "ou", "hou", "tab", "htab", "fsbs", "ftab", "spatial", "mvhevc"].contains(v) else {
+                throw UsageError("unknown --layout \(v)")
+            }
             o.layout = v
         case "--swap-eyes", "--reverse", "-r": try flag(); o.swapEyes = true
         case "--preset":
@@ -212,6 +266,21 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
                 throw UsageError("--scale takes a share of the frame's size, 0...1, not \"\(text)\"")
             }
             o.scale = scale
+        case "--strength":
+            let v = try number(value())
+            guard v >= 0, v <= 0.05 else { throw UsageError("--strength takes a share of the frame's width, 0...0.05, not \(v)") }
+            o.strength = v
+        case "--convergence":
+            let v = try number(value())
+            guard (0 ... 1).contains(v) else { throw UsageError("--convergence takes 0...1, not \(v)") }
+            o.convergence = v
+        case "--sample":
+            let v = try number(value())
+            guard v > 0 else { throw UsageError("--sample takes seconds, more than 0") }
+            o.sample = v
+        case "--model": o.model = try value()
+        case "--depth-track": o.depthTrack = try value()
+        case "--download-model": try flag(); o.downloadModel = true
         default: throw UsageError("unknown option \(name)")
         }
     }
@@ -219,6 +288,13 @@ public func parse(_ args: [String], environment: [String: String] = [:]) throws(
     guard o.firstSegment >= 0 else { throw UsageError("--first must be 0 or more") }
     if let last = o.lastSegment, last < o.firstSegment {
         throw UsageError("--last \(last) comes before --first \(o.firstSegment)")
+    }
+    if o.command != "convert", ["fsbs", "ftab", "spatial", "mvhevc"].contains(o.layout) {
+        throw UsageError("--layout \(o.layout) is for convert")
+    }
+    if o.command == "convert" {
+        if let seek = o.seek, seek < 0 { throw UsageError("--start must be 0 or more") }
+        if o.frames != Int.max, o.frames < 1 { throw UsageError("--frames must be 1 or more") }
     }
     if let header = environment["VERGENCE_HTTP_HEADER"] { try addHeader(header, to: &o) }
     return o
@@ -251,6 +327,14 @@ public enum OutputNames {
     public static func sideBySide(for input: URL, _ o: Options, single: Bool) -> URL {
         placed(input.deletingPathExtension().lastPathComponent + (o.half ? ".3D.HSBS.mp4" : ".3D.FSBS.mp4"),
                beside: input, o, single: single)
+    }
+
+    /// `convert`: VIDEO.ext becomes VIDEO.3D.FSBS.mp4 (.3D.HSBS.mp4, .3D.FTAB.mp4,
+    /// .3D.HTAB.mp4 or .spatial.mov by --layout); a --sample piece is
+    /// VIDEO.sample.3D.FSBS.mp4.
+    public static func converted(for input: URL, _ o: Options, single: Bool) -> URL {
+        placed(input.deletingPathExtension().lastPathComponent + (o.sample != nil ? ".sample" : "")
+                   + o.convertLayout.nameSuffix, beside: input, o, single: single)
     }
 
     /// `sbs --segments DIR`: the folder (the current one for `--info` alone)
