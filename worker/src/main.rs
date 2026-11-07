@@ -145,7 +145,7 @@ fn profiles(engine: &Engine, wanted: &Wanted, share_core_ml: bool) -> BTreeMap<S
     }
     if let Some(gain) = &engine.gain {
         let key = (gain::KEYFRAME_SECONDS * 1000.0).round() as i64;
-        out.insert(workloads::AI_HDR.to_string(), one("gainMap", format!("{} grid16x9x8 key{key}ms{suffix}", gain.name)));
+        out.insert(workloads::AI_HDR.to_string(), one("gainMap", format!("{} grid16x9x8 key{key}ms hl2{suffix}", gain.name)));
     }
     out
 }

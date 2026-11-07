@@ -583,7 +583,8 @@ final class GainGridProducer: PieceProducer {
         model = try MLModel(contentsOf: try await InterpolationModelBenchmark.compiledURL(for: modelURL),
                             configuration: configuration)
         let keyframes = Int((GainGridSchedule.keyframeSeconds * 1000).rounded())
-        models = ["gainMap": "\(modelURL.deletingPathExtension().lastPathComponent) grid16x9x8 key\(keyframes)ms"]
+        // "hl2": highlights expanded from the mid-tones (`GainGrid.expandingHighlights`); older tracks lack it.
+        models = ["gainMap": "\(modelURL.deletingPathExtension().lastPathComponent) grid16x9x8 key\(keyframes)ms hl2"]
     }
 
     /// Set from the title's rate before a run.
@@ -639,7 +640,7 @@ final class GainGridProducer: PieceProducer {
     var timeScaleNum: Int32 = 24
     var timeScaleDen: Int64 = 1
 
-    /// GMNet on one frame, fitted into a grid.
+    /// GMNet on one frame, fitted into a grid, its highlights spread from the mid-tones.
     private func grid(_ p: [AnalysisPlane]) throws -> GainGrid {
         let aspect = Double(p[0].width) / Double(max(p[0].height, 1))
         let (w, h) = Self.inputSizes.min {
@@ -663,7 +664,7 @@ final class GainGridProducer: PieceProducer {
         let rgb = SharedFieldAnalysis.rgbPlanar(y: p[0], cb: p[1], cr: p[2], width: gw, height: gh)
         let n = gw * gh
         let luma = (0 ..< n).map { GainGrid.luma(r: rgb[$0], g: rgb[n + $0], b: rgb[2 * n + $0]) }
-        return GainGrid.fit(gain: values, luma: luma, width: gw, height: gh)
+        return GainGrid.fit(gain: values, luma: luma, width: gw, height: gh).expandingHighlights()
     }
 
     /// Planar RGB 0…1 as a BGRA pixel buffer.

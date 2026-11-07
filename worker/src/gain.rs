@@ -14,6 +14,13 @@ pub const COUNT: usize = WIDTH * HEIGHT * LUMA_BINS;
 pub const KEYFRAME_SECONDS: f64 = 0.5;
 /// `DepthRefinement.cutMeanLumaDelta`.
 const CUT_MEAN_LUMA_DELTA: f32 = 0.12;
+/// `GainGrid.pivotLuma`, `highlightExpansion`, `peakLog2Gain`: a grid keeps
+/// only the gain above each cell's mid-tone gain, doubled, up to GMNet's 5×.
+pub const PIVOT_LUMA: f32 = 0.5;
+pub const HIGHLIGHT_EXPANSION: f32 = 2.0;
+pub fn peak_log2_gain() -> f32 {
+    5f32.log2()
+}
 
 /// log2 of the linear gain, planar: bin by bin, rows top to bottom.
 #[derive(Clone, Debug, PartialEq)]
@@ -137,6 +144,27 @@ impl GainGrid {
         GainGrid(filled)
     }
 
+    /// `GainGrid.expandingHighlights`: the gain measured from each cell's
+    /// mid-tone gain (at `PIVOT_LUMA`) and expanded, within 0 and the peak.
+    pub fn expanding_highlights(&self) -> GainGrid {
+        let f = (PIVOT_LUMA * LUMA_BINS as f32 - 0.5).max(0.0).min((LUMA_BINS - 1) as f32);
+        let l0 = f as usize;
+        let (l1, t) = ((l0 + 1).min(LUMA_BINS - 1), f - l0 as f32);
+        let peak = peak_log2_gain();
+        let mut out = self.0.clone();
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let (a, b) = (self.0[index(x, y, l0)], self.0[index(x, y, l1)]);
+                let mid_tone = a + (b - a) * t;
+                for l in 0..LUMA_BINS {
+                    let i = index(x, y, l);
+                    out[i] = (HIGHLIGHT_EXPANSION * (self.0[i] - mid_tone)).max(0.0).min(peak);
+                }
+            }
+        }
+        GainGrid(out)
+    }
+
     /// Linear in log gain, `t` from self (0) to `next` (1).
     pub fn eased(&self, next: &GainGrid, t: f32) -> GainGrid {
         GainGrid(self.0.iter().zip(&next.0).map(|(a, b)| a + (b - a) * t).collect())
@@ -232,6 +260,25 @@ mod tests {
         assert!(grid.0[index(0, 4, 0)].abs() < 1e-4);
         // Bright luma on the left was never seen there: it takes the nearest bright cell's.
         assert!((grid.0[index(0, 4, 7)] - 2.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn spreads_highlights_from_the_mid_tones() {
+        let mut v = vec![0f32; COUNT];
+        for l in 0..LUMA_BINS {
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    v[index(x, y, l)] = 0.1 * l as f32 + if x == 0 { 1.0 } else { 0.0 };
+                }
+            }
+        }
+        let g = GainGrid(v).expanding_highlights();
+        // Bins 0–3 sit at or below the pivot (luma 0.5, halfway between bins 3 and 4).
+        assert!((0..4).all(|l| g.0[index(5, 4, l)] == 0.0));
+        // Bin 7 was 0.35 over the pivot: now 0.7, in a cell a stop up too.
+        assert!((g.0[index(5, 4, 7)] - 0.7).abs() < 1e-5 && (g.0[index(0, 4, 7)] - 0.7).abs() < 1e-5);
+        let steep = GainGrid((0..COUNT).map(|i| (i / (WIDTH * HEIGHT)) as f32).collect()).expanding_highlights();
+        assert_eq!(steep.0.iter().cloned().fold(0.0, f32::max), peak_log2_gain());
     }
 
     #[test]

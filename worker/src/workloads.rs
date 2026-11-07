@@ -243,7 +243,7 @@ pub fn gain_grids(piece: &Piece, engine: &mut Engine, stop: &AtomicBool) -> Resu
             let rgb = rgb_planar(y, cb, cr, gw, gh, 1.0);
             let n = gw * gh;
             let luma: Vec<f32> = (0..n).map(|i| gain::luma(rgb[i], rgb[n + i], rgb[2 * n + i])).collect();
-            keyframes.push(Keyframe { index, grid: GainGrid::fit(&gain, &luma, gw, gh), cut });
+            keyframes.push(Keyframe { index, grid: GainGrid::fit(&gain, &luma, gw, gh).expanding_highlights(), cut });
         }
         Ok(())
     })();

@@ -42,6 +42,25 @@ struct GainGridTests {
         #expect(grid.lookup(u: 0.1, v: 0.5, luma: 0.9) > 1.9)
     }
 
+    @Test func highlightsSpreadFromTheMidTonesWhichStayAsSDR() {
+        // GMNet's curve on film: log2 gain 0.1 per bin, so mid-tones would be lifted 1.3–1.5×.
+        var values = [Float](repeating: 0, count: GainGrid.count)
+        for l in 0 ..< 8 { for y in 0 ..< 9 { for x in 0 ..< 16 { values[GainGrid.index(x, y, l)] = 0.1 * Float(l) + (x == 0 ? 1 : 0) } } }
+        let grid = GainGrid(log2Gain: values).expandingHighlights()
+        // The pivot, luma 0.5, lies halfway between bins 3 and 4: bins 0–3 get no gain,
+        // bin 4 twice its 0.05 over the pivot.
+        #expect(grid.lookup(u: 0.5, v: 0.5, luma: 3.5 / 8) == 0)
+        #expect(grid.lookup(u: 0.5, v: 0.5, luma: 0.2) == 0)
+        #expect(abs(grid.lookup(u: 0.5, v: 0.5, luma: 4.5 / 8) - 0.1) < 1e-5)
+        // Above it, twice the gain over the pivot: bin 7 had 0.35 over it, now 0.7.
+        #expect(abs(grid.lookup(u: 0.5, v: 0.5, luma: 15.0 / 16) - 0.7) < 1e-5)
+        // A cell's own mid-tone gain is the pivot, wherever it sits (column 0 is a stop up).
+        #expect(abs(grid.lookup(u: 0.5 / 16, v: 0.5, luma: 15.0 / 16) - 0.7) < 1e-5)
+        // Never past GMNet's peak.
+        let steep = GainGrid(log2Gain: (0 ..< GainGrid.count).map { Float($0 / (16 * 9)) }).expandingHighlights()
+        #expect(steep.log2Gain.max() == GainGrid.peakLog2Gain)
+    }
+
     @Test func framesEaseBetweenKeyframesAndHoldBeforeACut() throws {
         let a = GainGrid.identity
         let b = GainGrid(log2Gain: [Float](repeating: 1, count: GainGrid.count))

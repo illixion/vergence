@@ -169,6 +169,43 @@ public struct GainGrid: Sendable, Equatable {
         return GainGrid(log2Gain: filled)
     }
 
+    // MARK: Highlights apart from the diffuse tones
+
+    /// On film, GMNet's gain is close to one smooth curve over luma (the
+    /// grid fits its map within 1 % on average): mid-tones at code 0.4–0.6
+    /// get 1.3–1.8×, the top of the range 2–3×. Trained on phone photos,
+    /// whose highlights clip, it keeps its 4–5× for clipped areas, which a
+    /// graded film seldom has (a 3D film's 20:00–30:00 sat at p99 code
+    /// 0.64–0.98). So the picture got brighter as a whole while a light only
+    /// rose about 1.5× over a lit wall: no highlights to see, as if no HDR.
+    /// A worker's grid therefore keeps only the gain above each cell's
+    /// mid-tone gain (at `pivotLuma`), and doubles it in log2: mid-tones and
+    /// shadows stay as SDR, the top of the range spreads to GMNet's 5× peak.
+    public static let pivotLuma: Float = 0.5
+    public static let highlightExpansion: Float = 2
+    /// GMNet's real-world checkpoint's peak, log2 (what MaxCLL declares).
+    public static let peakLog2Gain: Float = log2(5)
+
+    /// This grid with its gain measured from each cell's mid-tone gain and
+    /// expanded (see `pivotLuma`), never below 0 or above `peakLog2Gain`.
+    public func expandingHighlights(by expansion: Float = highlightExpansion,
+                                    pivot: Float = pivotLuma) -> GainGrid {
+        let f = min(max(pivot * Float(Self.lumaBins) - 0.5, 0), Float(Self.lumaBins - 1))
+        let l0 = Int(f), l1 = min(l0 + 1, Self.lumaBins - 1), t = f - Float(l0)
+        var out = log2Gain
+        for y in 0 ..< Self.height {
+            for x in 0 ..< Self.width {
+                let a = log2Gain[Self.index(x, y, l0)], b = log2Gain[Self.index(x, y, l1)]
+                let midTone = a + (b - a) * t
+                for l in 0 ..< Self.lumaBins {
+                    let i = Self.index(x, y, l)
+                    out[i] = min(max(expansion * (log2Gain[i] - midTone), 0), Self.peakLog2Gain)
+                }
+            }
+        }
+        return GainGrid(log2Gain: out)
+    }
+
     // MARK: Over time
 
     /// Linear in log gain, `t` from self (0) to `next` (1).
