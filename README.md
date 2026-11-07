@@ -374,7 +374,7 @@ A Mac worker gives the same records as `vergence analyze` over the whole file (d
 identical, flow within Core ML's run-to-run noise; `scripts/check-worker.sh`), at about 37 fps
 for 1080p 3D on an M2 Max. The ONNX worker agrees on disparity; its RIFE flow differs from Core
 ML's float16 run, so its titles use their own profile (`scripts/check-onnx-worker.sh`). The
-desktop app (`desktop/`, `cargo run -p vergence-desktop`) runs the coordinator, pairs headsets,
+desktop app (`desktop/`, `cargo run -p vergence-desktop`; for Windows `desktop/scripts/package-windows.sh`) runs the coordinator, pairs headsets,
 runs a worker and converts files to AI 3D side by side, from one tray icon.
 
 ## Library
