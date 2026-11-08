@@ -662,6 +662,18 @@ captions. They keep their bitmaps compressed until `renderRGBA()`.
 own reads, so sound can be ready ahead of the picture. It takes an `AudioFrameDecoder`;
 `VergenceApple` supplies `AC3Decoder` and a convenience initializer that uses it.
 
+For a player, `VergenceApple` has frame sources that sit between a decoder's output
+(`AVPlayerFrameSource`, or any `LookaheadFrameSource`) and the screen, shown by
+`InterpolatedFramePresenter` in a flat player or by `StereoPump` in a stereo one:
+`InterpolatingFrameSource` doubles 24-30 and 50-60 fps (VideoToolbox's low-latency
+interpolator, or the GPU one, `FlowMidFrameInterpolator`), and `UpscalingFrameSource`
+plays a picture of 720p or less sharper through VideoToolbox's low-latency super
+resolution (`VTRealtimeUpscaler`), up to 1080p: 1.5 ms a 540p frame on an M2 Max,
+where `convert --upscale`'s Real-ESRGAN takes tens of milliseconds an eye and adds
+more detail.
+`RealtimeUpscalerBenchmark` times it on a device. Put the upscaler under the
+interpolator, so the in-between frames come from the sharper frames.
+
 ## Stereo boundary experiment
 
 `DepthRefinement.separatesBoundaries` opts into a disconnected mesh and explicit

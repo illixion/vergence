@@ -26,6 +26,11 @@ public struct PumpFrame: @unchecked Sendable {
     /// (`MidFrameMotion`), when its interpolator measured it and the source
     /// was asked for it. AI 3D moves that frame's depth along it.
     public var midFrameMotion: MidFrameMotion?
+    /// The decoded picture's size when an upscaler (`UpscalingFrameSource`)
+    /// made this frame bigger, carried on to the in-between frames made from
+    /// it; nil when the frame is the decoded size. What a player reports as
+    /// the video's size.
+    public var sourceSize: CGSize?
 
     public init(pixelBuffer: CVPixelBuffer, itemTime: CMTime, standsInForMidFrame: Bool = false) {
         self.pixelBuffer = pixelBuffer
@@ -104,6 +109,13 @@ public protocol PumpFrameSource: AnyObject, Sendable {
 public extension PumpFrameSource {
     var isFinished: Bool { false }
     func playbackRate(hostTime: CFTimeInterval) -> Double? { nil }
+}
+
+/// A source that holds frames it worked on ahead (an interpolator, an
+/// upscaler). A seek the clock can't show, such as a loop back to the same
+/// spot, must drop them; `reset` does, and passes it on to its own source.
+public protocol ResettableFrameSource: AnyObject {
+    func reset()
 }
 
 /// A pull source on a host-synchronised clock that can hand out frames before

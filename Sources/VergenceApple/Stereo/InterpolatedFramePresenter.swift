@@ -3,8 +3,9 @@ import CoreMedia
 import Foundation
 import QuartzCore
 
-/// Shows an `InterpolatingFrameSource` in a flat player that draws whatever
-/// frame is due at each display tick (no stereo pump, no depth).
+/// Shows an `InterpolatingFrameSource` (or an `UpscalingFrameSource`, or one
+/// over the other) in a flat player that draws whatever frame is due at each
+/// display tick (no stereo pump, no depth).
 ///
 /// The pump takes frames well ahead and schedules each for its due time; a
 /// flat player instead asks "what is on screen now?". The interpolating
@@ -145,7 +146,7 @@ public final class InterpolatedFramePresenter {
         pending.removeAll()
         lastPulled = nil
         lastShown = nil
-        (source as? InterpolatingFrameSource)?.reset()
+        (source as? ResettableFrameSource)?.reset()
     }
 }
 #endif

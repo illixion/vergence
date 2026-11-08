@@ -86,7 +86,7 @@ extension MidFrameInterpolator {
 /// in-between frames at a smaller size, then pauses them; headroom steps it
 /// back up. It reacts to the slowdown, not to the thermal state, which a
 /// headset reported as serious the moment a 2D video opened (2026-11-01).
-public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Sendable {
+public final class InterpolatingFrameSource: LookaheadFrameSource, ResettableFrameSource, @unchecked Sendable {
     /// VideoToolbox's tier: sources above this rate are too fast for it (an
     /// in-between frame every 16.7 ms at 60 fps, where it takes 5-18) and
     /// pass through unless a faster tier takes them.
@@ -180,8 +180,9 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
     ///   `SharedFieldInterpolator`'s mono pass; the rest the tier's own
     ///   interpolator, so the picture doesn't wait for the track.
     /// - Parameter maxGPUSourceFrameRate: the fastest source the GPU tier
-    ///   takes. AI 3D keeps it at `maxSourceFrameRate`: its warp can't make
-    ///   120 pairs of eyes a second.
+    ///   takes. Every caller keeps the default, `maxFastSourceFrameRate`:
+    ///   AI 3D doubles 50-60 fps to 100-120 as the flat player does (since
+    ///   2026-11-08; it used to stop at `maxSourceFrameRate`).
     /// - Parameter providesMotion: in-between frames carry their motion
     ///   (`PumpFrame.midFrameMotion`), for AI 3D's depth.
     public static func wrappingIfSupported(_ inner: LookaheadFrameSource,
@@ -257,9 +258,11 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
     }
 
     /// Forget the frames held and in flight (a seek the clock can't show,
-    /// such as a loop back to the same spot). The source stays open.
+    /// such as a loop back to the same spot), here and in the source below.
+    /// The source stays open.
     public func reset() {
         lock.withLock { resetLocked() }
+        (inner as? ResettableFrameSource)?.reset()
     }
 
     // MARK: Frames
@@ -355,6 +358,7 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
                     if let mid {
                         var frame = PumpFrame(pixelBuffer: mid, itemTime: midTime)
                         frame.isMidFrame = true
+                        frame.sourceSize = real.sourceSize
                         motion?.previousSeconds = beforeSeconds
                         frame.midFrameMotion = motion
                         self.ready = [frame, real]

@@ -90,7 +90,8 @@ public enum FlowInterpolationBenchmark {
     }
 
     /// Smooth value noise with some fine detail, moved by `shift` pixels.
-    private static func pattern(width: Int, height: Int, shift: (Int, Int)) -> CVPixelBuffer? {
+    /// `RealtimeUpscalerBenchmark` times its upscales on the same frames.
+    static func pattern(width: Int, height: Int, shift: (Int, Int)) -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
         let attributes: [String: Any] = [kCVPixelBufferMetalCompatibilityKey as String: true,
                                          kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()]
