@@ -637,6 +637,11 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
         let fullHeight = height
         let width = max(2, Int((Double(fullWidth) * scale / 2).rounded()) * 2)
         let height = max(2, Int((Double(fullHeight) * scale / 2).rounded()) * 2)
+        // These two limits exist only in the version 27 SDK, so an older toolchain (Xcode 26.x is
+        // Swift 6.3 or earlier, Xcode 27 is Swift 6.4) can't compile them even behind `#available`.
+        // Without them the size is left to `VTLowLatencyFrameInterpolationConfiguration(frameWidth:…)`,
+        // which returns nil for a size it can't do.
+        #if compiler(>=6.4)
         if #available(macOS 27.0, iOS 27.0, tvOS 27.0, visionOS 27.0, *) {
             let maxDimension = VTLowLatencyFrameInterpolationConfiguration.maximumDimension(forSpatialScaleFactor: 1) ?? 0
             let maxPixels = VTLowLatencyFrameInterpolationConfiguration.maximumPixelCount(forSpatialScaleFactor: 1) ?? 0
@@ -647,6 +652,7 @@ public final class VTMidFrameInterpolator: MidFrameInterpolator, @unchecked Send
                 return false
             }
         }
+        #endif
         guard let configuration = VTLowLatencyFrameInterpolationConfiguration(
             frameWidth: width, frameHeight: height, numberOfInterpolatedFrames: 1
         ) else { return false }
