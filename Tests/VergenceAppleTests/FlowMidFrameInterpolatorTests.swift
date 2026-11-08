@@ -129,5 +129,99 @@ struct FlowMidFrameInterpolatorTests {
         print("flow interpolation at 1080p: GPU \(String(format: "%.2f", median)) ms median")
         #expect(median < 8)
     }
+
+    /// A private texture's channels as floats (a blit to a shared copy).
+    static func read(_ texture: MTLTexture, channels: Int) throws -> [Float] {
+        let device = texture.device
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: texture.pixelFormat, width: texture.width, height: texture.height, mipmapped: false)
+        descriptor.storageMode = .shared
+        let shared = try #require(device.makeTexture(descriptor: descriptor))
+        let queue = try #require(device.makeCommandQueue())
+        let commands = try #require(queue.makeCommandBuffer())
+        let blit = try #require(commands.makeBlitCommandEncoder())
+        blit.copy(from: texture, to: shared)
+        blit.endEncoding()
+        commands.commit()
+        commands.waitUntilCompleted()
+        let count = texture.width * texture.height * channels
+        if texture.pixelFormat == .r32Float {
+            var values = [Float](repeating: 0, count: count)
+            shared.getBytes(&values, bytesPerRow: texture.width * 4,
+                            from: MTLRegionMake2D(0, 0, texture.width, texture.height), mipmapLevel: 0)
+            return values
+        }
+        var halves = [Float16](repeating: 0, count: count)
+        shared.getBytes(&halves, bytesPerRow: texture.width * 2 * channels,
+                        from: MTLRegionMake2D(0, 0, texture.width, texture.height), mipmapLevel: 0)
+        return halves.map(Float.init)
+    }
+
+    @Test("the motion it writes is half the pan, at half size")
+    func motionIsHalfThePan() throws {
+        let flow = try Self.interpolator()
+        let previous = Self.frame { x, y in Self.pattern(x, y) }
+        let current = Self.frame { x, y in Self.pattern(x - 12, y - 6) }
+        let done = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var motion: MidFrameMotion?
+        flow.midFrame(between: previous, and: current, wantsMotion: true) { _, found, _ in
+            motion = found
+            done.signal()
+        }
+        done.wait()
+        let found = try #require(motion)
+        #expect(found.texture.width == Self.width / 2 && found.texture.height == Self.height / 2)
+        let values = try Self.read(found.texture, channels: 2)
+        var sum = SIMD2<Float>(0, 0), count: Float = 0
+        for y in 20 ..< found.texture.height - 20 {
+            for x in 20 ..< found.texture.width - 20 {
+                let i = (y * found.texture.width + x) * 2
+                sum += SIMD2(values[i], values[i + 1])
+                count += 1
+            }
+        }
+        let mean = sum / count
+        // mid(x) = previous(x - d): the pan moves content by +(12, 6), so d is +(6, 3).
+        #expect(abs(mean.x - 6) < 0.5 && abs(mean.y - 3) < 0.5, "mean motion \(mean)")
+    }
+
+    @Test("a held map moved along the motion lands with the picture")
+    func depthFollowsMotion() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let mover = try #require(MidFrameDepth(device: device))
+        // A 64×32 map over a 320×192 frame: near (1) left of x = 32, far (0) right of it.
+        let mapWidth = 64, mapHeight = 32
+        var values = [Float](repeating: 0, count: mapWidth * mapHeight)
+        for y in 0 ..< mapHeight { for x in 0 ..< 32 { values[y * mapWidth + x] = 1 } }
+        let mapDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r32Float, width: mapWidth, height: mapHeight, mipmapped: false)
+        mapDescriptor.storageMode = .shared
+        let map = try #require(device.makeTexture(descriptor: mapDescriptor))
+        map.replace(region: MTLRegionMake2D(0, 0, mapWidth, mapHeight), mipmapLevel: 0,
+                    withBytes: values, bytesPerRow: mapWidth * 4)
+        // Everything moved right 50 frame pixels (10 map texels) by the in-between frame.
+        let motionDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rg16Float, width: Self.width / 2, height: Self.height / 2, mipmapped: false)
+        motionDescriptor.storageMode = .shared
+        let motionTexture = try #require(device.makeTexture(descriptor: motionDescriptor))
+        let shift = [Float16](repeating: 0, count: Self.width / 2 * Self.height / 2 * 2).enumerated()
+            .map { $0.offset % 2 == 0 ? Float16(50) : 0 }
+        motionTexture.replace(region: MTLRegionMake2D(0, 0, Self.width / 2, Self.height / 2), mipmapLevel: 0,
+                              withBytes: shift, bytesPerRow: Self.width / 2 * 4)
+        let motion = MidFrameMotion(texture: motionTexture, frameWidth: Self.width, frameHeight: Self.height,
+                                    pool: nil)
+        let depth = PumpFrameDepth(texture: map, uvScale: SIMD2(1, 1), uvOffset: .zero, valueScale: 1, valueBias: 0)
+        let queue = try #require(device.makeCommandQueue())
+        let commands = try #require(queue.makeCommandBuffer())
+        let moved = try #require(mover.encode(depth, along: motion, into: commands))
+        commands.commit()
+        commands.waitUntilCompleted()
+        let out = try Self.read(moved.texture, channels: 1)
+        let row = Array(out[(mapHeight / 2) * mapWidth ..< (mapHeight / 2 + 1) * mapWidth])
+        // The edge moved from texel 32 to 42.
+        #expect(row[38] > 0.9 && row[40] > 0.9, "near side: \(row[36 ..< 46])")
+        #expect(row[44] < 0.1 && row[50] < 0.1, "far side: \(row[36 ..< 46])")
+        #expect(row[10] > 0.9 && row[60] < 0.1)
+    }
 }
 #endif

@@ -20,6 +20,10 @@ public struct PumpFrame: @unchecked Sendable {
     /// counts it as both frames when it reports how many it showed, so
     /// passing frames through doesn't read as the pump falling behind.
     public var standsInForMidFrame = false
+    /// An in-between frame's motion from the real frame before
+    /// (`MidFrameMotion`), when its interpolator measured it and the source
+    /// was asked for it. AI 3D moves that frame's depth along it.
+    public var midFrameMotion: MidFrameMotion?
 
     public init(pixelBuffer: CVPixelBuffer, itemTime: CMTime, standsInForMidFrame: Bool = false) {
         self.pixelBuffer = pixelBuffer

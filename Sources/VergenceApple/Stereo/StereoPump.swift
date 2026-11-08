@@ -237,6 +237,10 @@ public final class StereoPump: @unchecked Sendable {
     /// Pump-queue only: the request of the last frame drawn, to count maps
     /// reused against maps worked out.
     private var lastDrawnRequest: ObjectIdentifier?
+    /// Pump-queue only: the presentation time of the last frame drawn, in seconds.
+    private var lastDrawnSeconds = Double.nan
+    /// Moves the previous real frame's map to an in-between frame (`MidFrameDepth`).
+    private lazy var midFrameDepth = MidFrameDepth(device: device)
     /// Flushes the renderer when visionOS took its decoding away; see
     /// `DecoderRecovery`. Made in `start()`, as it captures self.
     private var decoderRecovery: DecoderRecovery?
@@ -338,6 +342,8 @@ public final class StereoPump: @unchecked Sendable {
         var maps = 0
         var mapSeconds = 0.0
         var reused = 0
+        /// Of those, in-between frames whose map was moved along their motion.
+        var moved = 0
         var warp = 0.0
         var transfer = 0.0
         var drawn = 0
@@ -944,6 +950,7 @@ public final class StereoPump: @unchecked Sendable {
         for entry in schedule { entry.request?.cancel() }
         schedule = []
         lastDrawnRequest = nil
+        lastDrawnSeconds = .nan
     }
 
     /// Every frame taken from the source, shown or left out by the cap,
@@ -1005,6 +1012,10 @@ public final class StereoPump: @unchecked Sendable {
                 let id = ObjectIdentifier(request)
                 if id == lastDrawnRequest {
                     stageTiming.reused += 1
+                    if let moved = depthMovedToMidFrame(entry) {
+                        entry.depth = moved
+                        stageTiming.moved += 1
+                    }
                 } else {
                     stageTiming.maps += 1
                     stageTiming.mapSeconds += request.computeSeconds
@@ -1019,7 +1030,22 @@ public final class StereoPump: @unchecked Sendable {
                 stageTiming.lookup += CACurrentMediaTime() - start
             }
         }
+        lastDrawnSeconds = entry.frame.itemTime.seconds
         return drawEyes(from: entry.frame.pixelBuffer, itemTime: entry.frame.itemTime, depth: entry.depth, cache: cache)
+    }
+
+    /// An in-between frame drawn with the map of the real frame just before
+    /// it: that map moved along the frame's motion, so the depth edge sits
+    /// on the picture's. Nil (the map as it is) for a frame without motion,
+    /// or when the map isn't that frame's.
+    private func depthMovedToMidFrame(_ entry: ScheduledFrame) -> PumpFrameDepth? {
+        guard let motion = entry.frame.midFrameMotion, let depth = entry.depth,
+              abs(motion.previousSeconds - lastDrawnSeconds) < 0.001,
+              let midFrameDepth, let commands = commandQueue.makeCommandBuffer(),
+              let moved = midFrameDepth.encode(depth, along: motion, into: commands) else { return nil }
+        // The warp's command buffer goes on this queue after it, so reads the map once written.
+        commands.commit()
+        return moved
     }
 
     /// Warp the mono frame into two BGRA eye render targets and convert each
@@ -1209,6 +1235,7 @@ public final class StereoPump: @unchecked Sendable {
             let reusedShare = Double(timing.reused) / Double(max(timing.maps + timing.reused, 1)) * 100
             depth = String(format: "depth %.1f ms a map, %.1f maps/s, %.0f%% of frames reuse the one before",
                            mapMs, Double(timing.maps) / window, reusedShare)
+                + (timing.moved > 0 ? String(format: " (%d moved along motion)", timing.moved) : "")
         } else if depthSource != nil {
             depth = String(format: "depth %.1f ms", timing.lookup / drawn * 1000)
         } else {

@@ -140,20 +140,29 @@ public final class SharedFieldInterpolator: MidFrameInterpolator, @unchecked Sen
     public func midFrame(between previous: CVPixelBuffer, at previousTime: Double, and current: CVPixelBuffer,
                          at currentTime: Double,
                          completion: @escaping @Sendable (CVPixelBuffer?, Double) -> Void) {
+        midFrameAndMotion(between: previous, at: previousTime, and: current, at: currentTime,
+                          wantsMotion: false) { frame, _, ms in completion(frame, ms) }
+    }
+
+    /// Frames made from fields carry no motion; the fallback's own may.
+    public func midFrameAndMotion(between previous: CVPixelBuffer, at previousTime: Double,
+                                  and current: CVPixelBuffer, at currentTime: Double, wantsMotion: Bool,
+                                  completion: @escaping @Sendable (CVPixelBuffer?, MidFrameMotion?, Double) -> Void) {
         let started = CACurrentMediaTime()
         guard let fields = provider.fields(from: previousTime, to: currentTime),
               packing != .mono || !fields.hasDisparity else {
             noteSource(fallback != nil && fallbackReady ? "on-device" : "none")
-            guard let fallback, fallbackReady else { completion(nil, .nan); return }
-            fallback.midFrame(between: previous, at: previousTime, and: current, at: currentTime, completion: completion)
+            guard let fallback, fallbackReady else { completion(nil, nil, .nan); return }
+            fallback.midFrameAndMotion(between: previous, at: previousTime, and: current, at: currentTime,
+                                       wantsMotion: wantsMotion, completion: completion)
             return
         }
         noteSource("fields")
-        guard packing == .mono || fields.hasDisparity else { completion(nil, .nan); return }
+        guard packing == .mono || fields.hasDisparity else { completion(nil, nil, .nan); return }
         if encode(previous: previous, current: current, fields: fields, completion: { out in
-            completion(out, (CACurrentMediaTime() - started) * 1000)
+            completion(out, nil, (CACurrentMediaTime() - started) * 1000)
         }) == nil {
-            completion(nil, (CACurrentMediaTime() - started) * 1000)
+            completion(nil, nil, (CACurrentMediaTime() - started) * 1000)
         }
     }
 

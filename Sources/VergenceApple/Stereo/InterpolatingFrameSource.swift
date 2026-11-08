@@ -25,6 +25,13 @@ public protocol MidFrameInterpolator: AnyObject, Sendable {
     func midFrame(between previous: CVPixelBuffer, at previousTime: Double, and current: CVPixelBuffer,
                   at currentTime: Double,
                   completion: @escaping @Sendable (_ frame: CVPixelBuffer?, _ processMs: Double) -> Void)
+    /// The same, with the motion the frame was made along when `wantsMotion`
+    /// and the interpolator measures any (`MidFrameMotion`). Defaults to the
+    /// timed call, with none.
+    func midFrameAndMotion(between previous: CVPixelBuffer, at previousTime: Double, and current: CVPixelBuffer,
+                           at currentTime: Double, wantsMotion: Bool,
+                           completion: @escaping @Sendable (_ frame: CVPixelBuffer?, _ motion: MidFrameMotion?,
+                                                            _ processMs: Double) -> Void)
 }
 
 extension MidFrameInterpolator {
@@ -32,6 +39,14 @@ extension MidFrameInterpolator {
                          at currentTime: Double,
                          completion: @escaping @Sendable (_ frame: CVPixelBuffer?, _ processMs: Double) -> Void) {
         midFrame(between: previous, and: current, completion: completion)
+    }
+
+    public func midFrameAndMotion(between previous: CVPixelBuffer, at previousTime: Double,
+                                  and current: CVPixelBuffer, at currentTime: Double, wantsMotion: Bool,
+                                  completion: @escaping @Sendable (CVPixelBuffer?, MidFrameMotion?, Double) -> Void) {
+        midFrame(between: previous, at: previousTime, and: current, at: currentTime) { frame, ms in
+            completion(frame, nil, ms)
+        }
     }
 }
 
@@ -128,10 +143,14 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
     private var preparing = false
     private var stats = Stats()
     private var governor: InterpolationGovernor
+    /// In-between frames carry the motion they were made along
+    /// (`PumpFrame.midFrameMotion`) where the interpolator measures it.
+    public let providesMotion: Bool
 
     public init(wrapping inner: LookaheadFrameSource, tiers: [Tier],
-                thresholds: InterpolationGovernor.Thresholds = .depthPump) {
+                thresholds: InterpolationGovernor.Thresholds = .depthPump, providesMotion: Bool = false) {
         precondition(!tiers.isEmpty, "an interpolating source needs an interpolator")
+        self.providesMotion = providesMotion
         self.inner = inner
         self.tiers = tiers.sorted { $0.maxSourceFrameRate < $1.maxSourceFrameRate }
         self.lastSequence = inner.sequence
@@ -160,9 +179,16 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
     ///   coordinator's `smooth-motion-2d` track). Pairs that have them get
     ///   `SharedFieldInterpolator`'s mono pass; the rest the tier's own
     ///   interpolator, so the picture doesn't wait for the track.
+    /// - Parameter maxGPUSourceFrameRate: the fastest source the GPU tier
+    ///   takes. AI 3D keeps it at `maxSourceFrameRate`: its warp can't make
+    ///   120 pairs of eyes a second.
+    /// - Parameter providesMotion: in-between frames carry their motion
+    ///   (`PumpFrame.midFrameMotion`), for AI 3D's depth.
     public static func wrappingIfSupported(_ inner: LookaheadFrameSource,
                                            thresholds: InterpolationGovernor.Thresholds = .depthPump,
                                            engine: Engine = .videoToolbox,
+                                           maxGPUSourceFrameRate: Double = maxFastSourceFrameRate,
+                                           providesMotion: Bool = false,
                                            sharedFields: SharedFieldProvider? = nil) -> LookaheadFrameSource {
         var tiers: [Tier] = []
         if engine != .gpu, let vt = makeVideoToolboxInterpolator() {
@@ -170,7 +196,7 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
         }
         if engine != .videoToolbox {
             if let flow = FlowMidFrameInterpolator() {
-                tiers.append(Tier(flow, upTo: maxFastSourceFrameRate))
+                tiers.append(Tier(flow, upTo: maxGPUSourceFrameRate))
             } else {
                 VergenceLog.pipeline.error("frame interpolation: GPU interpolator unavailable (no Metal, or its kernels failed)")
             }
@@ -194,7 +220,8 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
             VergenceLog.pipeline.notice("frame interpolation: not supported here, playing source frames")
             return inner
         }
-        return InterpolatingFrameSource(wrapping: inner, tiers: tiers, thresholds: thresholds)
+        return InterpolatingFrameSource(wrapping: inner, tiers: tiers, thresholds: thresholds,
+                                        providesMotion: providesMotion)
     }
 
     private static func makeVideoToolboxInterpolator() -> MidFrameInterpolator? {
@@ -316,16 +343,20 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
         let midTime = CMTime(seconds: midSeconds, preferredTimescale: 600_000)
         let submitted = CACurrentMediaTime()
         let beforeSeconds = before.itemTime.seconds
+        let wantsMotion = providesMotion
         work.async { [weak self] in
-            interpolator.midFrame(between: before.pixelBuffer, at: beforeSeconds, and: real.pixelBuffer,
-                                  at: seconds) { [weak self] mid, processMs in
+            interpolator.midFrameAndMotion(between: before.pixelBuffer, at: beforeSeconds, and: real.pixelBuffer,
+                                           at: seconds, wantsMotion: wantsMotion) { [weak self] mid, motion, processMs in
                 guard let self else { return }
                 let totalMs = (CACurrentMediaTime() - submitted) * 1000
                 self.lock.withLock {
                     guard requestGeneration == self.generation else { return }
                     self.inFlight = false
                     if let mid {
-                        self.ready = [PumpFrame(pixelBuffer: mid, itemTime: midTime), real]
+                        var frame = PumpFrame(pixelBuffer: mid, itemTime: midTime)
+                        motion?.previousSeconds = beforeSeconds
+                        frame.midFrameMotion = motion
+                        self.ready = [frame, real]
                         self.stats.noteInterpolated(processMs: processMs, totalMs: totalMs)
                         self.recentMs.append(totalMs)
                         if self.recentMs.count > Self.timingWindow { self.recentMs.removeFirst() }

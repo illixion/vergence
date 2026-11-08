@@ -41,6 +41,15 @@ import VergenceCore
 /// It has one size: about 1.1 ms of GPU at 1080p on an M2 Max, less than
 /// anything a smaller one would save, so the governor's `scale` changes
 /// nothing (and a governor that finds it too slow pauses it). BGRA, or half-float RGBA for HDR (`FramePixelFormat`).
+/// About 5 ms of GPU at 1080p and 2 ms at 720p on a Vision Pro (M5,
+/// `FlowInterpolationBenchmark`, 2026-11-08).
+///
+/// Asked to (`midFrameAndMotion`), it also hands out the motion each pixel
+/// was made along (`MidFrameMotion`), which AI 3D moves the previous frame's
+/// depth by. Weighing the candidates by both frames' depth too (nearer wins,
+/// one-sided across an occluding edge) was tried and moved held-out PSNR by
+/// under 0.05 dB on every Bumblebee clip: what it loses to VideoToolbox on
+/// fast motion is in the vectors, not at occluding edges (2026-11-08).
 public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Sendable {
     /// Largest symmetric shift searched at quarter size, in quarter pixels
     /// (×4 for the frame's): 8 × 5 → 32 × 20 px, motion 64 × 40 px a frame.
@@ -70,6 +79,8 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
     private let refinePipeline: MTLComputePipelineState
     private let smoothPipeline: MTLComputePipelineState
     private let composePipeline: MTLComputePipelineState
+    /// The compose pass that also writes the motion it settled on (`MidFrameMotion`).
+    private let composeMotionPipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
     /// One per frame format (BGRA, half-float HDR); made as first needed.
     private var outputPools: [OSType: CVPixelBufferPool] = [:]
@@ -80,6 +91,7 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
     private var fieldQuarter: MTLTexture?
     private var fieldHalf: MTLTexture?
     private var fieldSmooth: MTLTexture?
+    private var motionPool: MotionTexturePool?
     /// GPU time of the last frame, for measuring (set on a completion thread).
     public private(set) var lastGPUMilliseconds: Double = 0
 
@@ -88,8 +100,11 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
         guard let device, let queue = device.makeCommandQueue() else { return nil }
         do {
             let library = try device.makeLibrary(source: Self.source, options: nil)
-            func pipeline(_ name: String) throws -> MTLComputePipelineState {
-                guard let function = library.makeFunction(name: name) else { throw FlowError.missingKernel }
+            func pipeline(_ name: String, writesMotion: Bool = false) throws -> MTLComputePipelineState {
+                let constants = MTLFunctionConstantValues()
+                var motion = writesMotion
+                constants.setConstantValue(&motion, type: .bool, index: 0)
+                let function = try library.makeFunction(name: name, constantValues: constants)
                 return try device.makeComputePipelineState(function: function)
             }
             lumaPipeline = try pipeline("flowLuma")
@@ -98,6 +113,7 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
             refinePipeline = try pipeline("flowRefine")
             smoothPipeline = try pipeline("flowSmooth")
             composePipeline = try pipeline("flowCompose")
+            composeMotionPipeline = try pipeline("flowCompose", writesMotion: true)
         } catch {
             VergenceLog.pipeline.error("flow interpolation: kernels failed: \(error, privacy: .public)")
             return nil
@@ -109,8 +125,6 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
         self.device = device
         self.queue = queue
     }
-
-    private enum FlowError: Error { case missingKernel }
 
     /// One thread per shift in the quarter-size search.
     private static let searchThreads = MTLSize(width: 256, height: 1, depth: 1)
@@ -140,6 +154,7 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
         else { return false }
         textureCache = cache
         outputPools = [:]
+        motionPool = MotionTexturePool(device: device, width: (width + 1) / 2, height: (height + 1) / 2)
         self.lumaHalf = lumaHalf
         self.lumaQuarter = lumaQuarter
         self.fieldQuarter = fieldQuarter
@@ -165,11 +180,27 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
 
     public func midFrame(between previous: CVPixelBuffer, and current: CVPixelBuffer,
                          completion: @escaping @Sendable (CVPixelBuffer?, Double) -> Void) {
+        midFrame(between: previous, and: current, wantsMotion: false) { out, _, ms in completion(out, ms) }
+    }
+
+    public func midFrameAndMotion(between previous: CVPixelBuffer, at previousTime: Double,
+                                  and current: CVPixelBuffer, at currentTime: Double, wantsMotion: Bool,
+                                  completion: @escaping @Sendable (CVPixelBuffer?, MidFrameMotion?, Double) -> Void) {
+        midFrame(between: previous, and: current, wantsMotion: wantsMotion, completion: completion)
+    }
+
+    /// The in-between frame and, with `wantsMotion`, the motion each of its
+    /// pixels was made along (`MidFrameMotion`), for moving a real frame's
+    /// depth to it. Writing the motion costs one more half-size write.
+    public func midFrame(between previous: CVPixelBuffer, and current: CVPixelBuffer, wantsMotion: Bool,
+                         completion: @escaping @Sendable (CVPixelBuffer?, MidFrameMotion?, Double) -> Void) {
         let started = CACurrentMediaTime()
-        guard let commands = encode(previous: previous, current: current, completion: { out in
-            completion(out, (CACurrentMediaTime() - started) * 1000)
+        let motion = wantsMotion ? motionPool?.take(frameWidth: width, frameHeight: height) : nil
+        guard let commands = encode(previous: previous, current: current, motion: motion?.texture,
+                                    completion: { out in
+            completion(out, out == nil ? nil : motion, (CACurrentMediaTime() - started) * 1000)
         }) else {
-            completion(nil, .nan)
+            completion(nil, nil, .nan)
             return
         }
         commands.commit()
@@ -190,7 +221,7 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
     private final class ResultBox: @unchecked Sendable { var buffer: CVPixelBuffer? }
     private struct Box: @unchecked Sendable { let buffer: CVPixelBuffer }
 
-    private func encode(previous: CVPixelBuffer, current: CVPixelBuffer,
+    private func encode(previous: CVPixelBuffer, current: CVPixelBuffer, motion: MTLTexture?,
                         completion: @escaping @Sendable (CVPixelBuffer?) -> Void) -> MTLCommandBuffer? {
         let format = CVPixelBufferGetPixelFormatType(previous)
         guard width > 0, FramePixelFormat.isSupported(format),
@@ -256,12 +287,13 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
         perPixel(fieldSmooth)
 
         p = params(levelScale: 2)
-        encoder.setComputePipelineState(composePipeline)
+        encoder.setComputePipelineState(motion == nil ? composePipeline : composeMotionPipeline)
         encoder.setBytes(&p, length: MemoryLayout<Params>.stride, index: 0)
         encoder.setTexture(a.texture, index: 0)
         encoder.setTexture(b.texture, index: 1)
         encoder.setTexture(fieldSmooth, index: 2)
         encoder.setTexture(out.texture, index: 3)
+        if let motion { encoder.setTexture(motion, index: 4) }
         perPixel(out.texture)
         encoder.endEncoding()
 
@@ -313,6 +345,7 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
     };
 
     constant float3 lumaWeights = float3(0.2126, 0.7152, 0.0722);
+    constant bool writesMotion [[function_constant(0)]];
 
     // Half-size luma of both frames, previous in r and current in g.
     kernel void flowLuma(texture2d<float> previous [[texture(0)]],
@@ -471,6 +504,7 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
                             texture2d<float> current [[texture(1)]],
                             texture2d<float> field [[texture(2)]],
                             texture2d<float, access::write> out [[texture(3)]],
+                            texture2d<float, access::write> motion [[texture(4), function_constant(writesMotion)]],
                             constant Params &p [[buffer(0)]],
                             uint2 gid [[thread_position_in_grid]]) {
         if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
@@ -482,6 +516,7 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
         float2 f = at - float2(base);
         int2 last = int2(field.get_width() - 1, field.get_height() - 1);
         float3 sum = 0;
+        float2 motionSum = 0;
         float total = 0;
         float bestError = INFINITY;
         // The 2x2 nearest blocks carry their bilinear share; the ring
@@ -500,12 +535,18 @@ public final class FlowMidFrameInterpolator: MidFrameInterpolator, @unchecked Se
                 float r = e / p.sigma;
                 float w = share * (1.0 / (1.0 + r * r) + 1e-3);
                 sum += (a + b) * 0.5 * w;
+                motionSum += d * w;
                 total += w;
             }
         float3 warped = sum / max(total, 1e-6);
         float3 plain = (previous.read(gid).rgb + current.read(gid).rgb) * 0.5;
         float fallback = smoothstep(p.fallbackLow, p.fallbackHigh, bestError);
         out.write(float4(mix(warped, plain, fallback), 1.0), gid);
+        // Half size: the motion the pixel was made along; where it fell back
+        // to the plain blend, toward none.
+        if (writesMotion && (gid.x & 1) == 0 && (gid.y & 1) == 0 && gid.x / 2 < motion.get_width()
+            && gid.y / 2 < motion.get_height())
+            motion.write(float4(motionSum / max(total, 1e-6) * (1.0 - fallback), 0, 0), gid / 2);
     }
     """
 }
