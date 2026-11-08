@@ -354,6 +354,7 @@ public final class InterpolatingFrameSource: LookaheadFrameSource, @unchecked Se
                     self.inFlight = false
                     if let mid {
                         var frame = PumpFrame(pixelBuffer: mid, itemTime: midTime)
+                        frame.isMidFrame = true
                         motion?.previousSeconds = beforeSeconds
                         frame.midFrameMotion = motion
                         self.ready = [frame, real]

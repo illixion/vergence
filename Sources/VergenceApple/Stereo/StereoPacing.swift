@@ -34,22 +34,44 @@ import VergenceCore
 /// two shown frames' presentation times, once it has been seen twice. One
 /// short gap alone (a timestamp glitch at a segment boundary) can't set it,
 /// and later frames lost to an overload can't widen it.
+///
+/// Once set it is the mean of the gaps within `tolerance` of that one:
+/// timestamps in whole milliseconds (YouTube's) give a 60 fps video gaps of
+/// 16 and 17 ms, and the shortest alone read it as 62.5 fps, above the GPU
+/// interpolator's 61 fps, so it was never doubled (device, 2026-11-08).
 struct SourceFrameSpacing {
     /// Seconds between frames; infinite until known.
     private(set) var seconds = Double.infinity
+    /// The shortest gap seen twice; `seconds` averages the gaps near it.
+    private var anchor = Double.infinity
+    private var sum = 0.0
+    private var count = 0
     /// Gaps seen once, in `binWidth` bins, until one repeats.
     private var seen: Set<Int> = []
     private static let binWidth = 0.0005
+    /// Gaps this close to the anchor are the same frame spacing, rounded
+    /// differently: a millisecond either way, and a little more.
+    static let tolerance = 0.0011
     /// Gaps outside this range are a seek, a pause or a loop, not a frame.
     static let range = (1.0 / 240.0) ..< 0.25
 
     mutating func note(gap: Double) {
-        guard Self.range.contains(gap), gap < seconds else { return }
+        guard Self.range.contains(gap) else { return }
+        if anchor.isFinite, abs(gap - anchor) <= Self.tolerance {
+            sum += gap
+            count += 1
+            seconds = sum / Double(count)
+            return
+        }
+        guard gap < anchor else { return }
         let bin = Int((gap / Self.binWidth).rounded())
         // A neighbouring bin is the same gap rounded the other way.
         if seen.contains(bin) || seen.contains(bin - 1) || seen.contains(bin + 1) {
+            anchor = gap
+            sum = 2 * gap
+            count = 2
             seconds = gap
-            seen = seen.filter { Double($0) * Self.binWidth < gap }
+            seen = seen.filter { Double($0) * Self.binWidth < gap - Self.tolerance }
         } else {
             seen.insert(bin)
         }
@@ -207,14 +229,21 @@ struct HeldDepthPolicy {
     /// Whether the frame at `seconds` (item time), shown at host time
     /// `shownAt`, reuses the last inferred map. On `.infer` it becomes the
     /// frame later ones are judged against.
-    mutating func decide(seconds: Double, shownAt: Double, signature: [Float]?) -> Decision {
+    ///
+    /// An interpolated in-between frame (`isMidFrame`) doesn't count toward
+    /// `maxHeldFrames`: the bound is in the video's own frames, and its depth
+    /// is moved along its motion from the real frame before
+    /// (`MidFrameDepth`). So 60 fps doubled to 120 still infers about every
+    /// other real frame (30 maps a second), not every one.
+    mutating func decide(seconds: Double, shownAt: Double, signature: [Float]?,
+                         isMidFrame: Bool = false) -> Decision {
         if var key, seconds.isFinite,
            seconds >= key.seconds, seconds - key.seconds < Self.maxHeldStep,
            shownAt >= key.shownAt, shownAt - key.shownAt < Self.maxHeldAge,
-           key.held < Self.maxHeldFrames,
+           isMidFrame || key.held < Self.maxHeldFrames,
            let signature, let reference = key.signature,
            LumaSignature.meanDelta(signature, reference).map({ $0 < Self.maxLumaDelta }) == true {
-            key.held += 1
+            if !isMidFrame { key.held += 1 }
             self.key = key
             return .hold
         }

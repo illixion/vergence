@@ -291,7 +291,8 @@ public final class RealtimeDepthSource: PumpDepthSource, @unchecked Sendable {
             policy.forget()
         }
         let signature = LumaSignature.sample(frame.pixelBuffer)
-        if policy.decide(seconds: seconds, shownAt: shownAt, signature: signature) == .hold {
+        if policy.decide(seconds: seconds, shownAt: shownAt, signature: signature,
+                         isMidFrame: frame.isMidFrame) == .hold {
             if let keyRequest { return keyRequest }
             // The policy outlived its map; start over from this frame.
             policy.forget()

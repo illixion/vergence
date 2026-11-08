@@ -143,6 +143,20 @@ struct StereoPacingTests {
         #expect(abs(spacing.seconds - 1.0 / 24) < 1e-9)
     }
 
+    @Test("millisecond timestamps of a 60 fps video read as 60, not 62.5")
+    func millisecondTimestampsReadAsTheirRate() {
+        for fps in [60.0, 60000.0 / 1001, 50, 30, 24000.0 / 1001] {
+            var spacing = SourceFrameSpacing()
+            var last = 0.0
+            for k in 1 ... 300 {
+                let pts = (Double(k) / fps * 1000).rounded(.down) / 1000
+                spacing.note(gap: pts - last)
+                last = pts
+            }
+            #expect(abs(1 / spacing.seconds - fps) < 0.15, "\(fps) fps read as \(1 / spacing.seconds)")
+        }
+    }
+
     @Test func aDroppedRunDoesNotWidenIt() {
         var spacing = SourceFrameSpacing()
         for _ in 0 ..< 3 { spacing.note(gap: 1.0 / 30) }
@@ -253,6 +267,24 @@ struct StereoPacingTests {
         #expect(d == Array(repeating: [HeldDepthPolicy.Decision.infer, .hold], count: 6).flatMap { $0 })
         // 48 and 50 too.
         #expect(Self.decisions(fps: 48, frames: 4) == [.infer, .hold, .infer, .hold])
+    }
+
+    @Test("doubled by interpolation, in-between frames don't count toward the held frame")
+    func inBetweenFramesDoNotCountTowardTheBound() {
+        // 60 fps doubled to 120: real, mid, real, mid… Every other real frame infers (30 maps a second).
+        var policy = HeldDepthPolicy()
+        let sixty = (0 ..< 12).map { i in
+            policy.decide(seconds: Double(i) / 120, shownAt: Double(i) / 120, signature: Self.picture,
+                          isMidFrame: i % 2 == 1)
+        }
+        #expect(sixty == [.infer, .hold, .hold, .hold, .infer, .hold, .hold, .hold, .infer, .hold, .hold, .hold])
+        // 24 doubled to 48: each real frame infers, each in-between frame holds, as before.
+        policy = HeldDepthPolicy()
+        let twentyFour = (0 ..< 6).map { i in
+            policy.decide(seconds: Double(i) / 48, shownAt: Double(i) / 48, signature: Self.picture,
+                          isMidFrame: i % 2 == 1)
+        }
+        #expect(twentyFour == [.infer, .hold, .infer, .hold, .infer, .hold])
     }
 
     @Test func thirtyFramesASecondInferEveryFrame() {
