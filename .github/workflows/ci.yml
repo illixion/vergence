@@ -34,8 +34,17 @@ jobs:
           - { name: Windows, runner: windows-2025 }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: vergence
     steps:
+      # The desktop app builds against signed-update by path (desktop/Cargo.toml), so it is
+      # checked out beside the repository, the way the two sit on a developer's machine.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: vergence
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { repository: illixion/signed-update, path: signed-update }
       - name: Rust
         shell: bash
         run: |
@@ -52,6 +61,7 @@ jobs:
           Add-Content $env:GITHUB_PATH $nasm
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          workspaces: vergence
           key: desktop-${{ matrix.runner }}
           cache-on-failure: true
           # Only main saves, so pull requests restore a cache without each filling the repository's 10 GB.

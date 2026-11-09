@@ -4345,6 +4345,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "signed-update"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "libc",
+ "reqwest 0.12.28",
+ "sha2",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5610,13 +5623,12 @@ name = "vergence-desktop"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
- "ed25519-dalek",
  "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
+ "signed-update",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",

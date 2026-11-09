@@ -8,12 +8,14 @@
 #   Vergence-<version>-windows-x86_64.zip     Vergence.exe, WebView2Loader.dll, and the ONNX
 #                                             Runtime worker and converter built on Windows
 #
-# Nothing here signs a release. The files land as a workflow artifact with a SHA256SUMS; the
-# updater trusts a release only through that manifest signed by the release key (PIN and touch,
-# never on CI), so the owner downloads the artifact and runs, in the foreground,
+# Nothing here signs or publishes a release. The files land on a draft GitHub release (and as a
+# workflow artifact); the updater trusts a release only through a SHA256SUMS signed by the release
+# key (PIN and touch, never on CI), so the owner then runs, in the foreground,
 #
-#   desktop/scripts/bless-release.sh SHA256SUMS
+#   desktop/scripts/bless-release.sh --tag v<version> --publish
 #
+# which signs the draft's files, uploads the signature and publishes: apps find it through
+# apps.illixion.com's redirect to GitHub's releases/latest, which names only published releases.
 # An attestation says "GitHub built this from that commit"; the signature says "and its owner
 # vouches for it". Neither macOS nor Windows files are notarized or code-signed.
 #
@@ -102,8 +104,17 @@ jobs:
     if: needs.plan.outputs.macos == 'true'
     runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: vergence
     steps:
+      # signed-update is a path dependency of the workspace (desktop/Cargo.toml), so every job that
+      # builds it has the repository beside this one.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: vergence
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { repository: illixion/signed-update, path: signed-update }
       - name: Choose Xcode
         run: |
           # The newest one on the image (27 where there is one); the command line needs Swift 6.2.
@@ -120,6 +131,7 @@ jobs:
         run: desktop/scripts/install-tauri-cli.sh
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          workspaces: vergence
           key: macos-release
           cache-on-failure: true
           save-if: ${{ env.SAVE_CACHE == 'true' }}
@@ -128,7 +140,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: macos
-          path: target/package/Vergence-*-macos-universal.zip
+          path: vergence/target/package/Vergence-*-macos-universal.zip
           if-no-files-found: error
 
   # The converter and the worker are ONNX Runtime programs (DirectML), whose Windows binaries
@@ -140,8 +152,17 @@ jobs:
     if: needs.plan.outputs.windows == 'true'
     runs-on: windows-2025
     timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: vergence
     steps:
+      # signed-update is a path dependency of the workspace (desktop/Cargo.toml), so every job that
+      # builds it has the repository beside this one.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: vergence
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { repository: illixion/signed-update, path: signed-update }
       - name: Rust
         shell: bash
         run: |
@@ -149,6 +170,7 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          workspaces: vergence
           key: windows-tools-release
           cache-on-failure: true
           save-if: ${{ env.SAVE_CACHE == 'true' }}
@@ -168,7 +190,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: windows-tools
-          path: tools/*
+          path: vergence/tools/*
           if-no-files-found: error
 
   windows:
@@ -178,8 +200,17 @@ jobs:
     # A Mac, as for the local build: Homebrew's mingw-w64 is the toolchain the script was made for.
     runs-on: macos-26
     timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: vergence
     steps:
+      # signed-update is a path dependency of the workspace (desktop/Cargo.toml), so every job that
+      # builds it has the repository beside this one.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: vergence
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { repository: illixion/signed-update, path: signed-update }
       - name: Tools
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target x86_64-pc-windows-gnu
@@ -188,9 +219,10 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: windows-tools
-          path: windows-tools
+          path: vergence/windows-tools
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          workspaces: vergence
           key: windows-app-release
           cache-on-failure: true
           save-if: ${{ env.SAVE_CACHE == 'true' }}
@@ -199,17 +231,18 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: windows
-          path: target/package/Vergence-*-windows-x86_64.zip
+          path: vergence/target/package/Vergence-*-windows-x86_64.zip
           if-no-files-found: error
 
   attest:
-    name: Attest
+    name: Attest and draft the release
     # Parts that weren't asked for are skipped, which would skip this too without the condition.
     needs: [plan, macos, windows]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && needs.plan.outputs.publish == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      # contents: write only to create the draft release; nothing here publishes it.
+      contents: write
       id-token: write
       attestations: write
     steps:
@@ -221,16 +254,31 @@ jobs:
           merge-multiple: true
       - name: List
         run: |
-          set -o pipefail
-          cd files && ls -l && sha256sum Vergence-* | tee SHA256SUMS
-          { echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cd files && ls -l
+          { echo '```'; sha256sum Vergence-*; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: files/Vergence-*
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-${{ needs.plan.outputs.version }}
-          # The files and the manifest the owner signs (desktop/scripts/bless-release.sh).
-          path: |
-            files/Vergence-*
-            files/SHA256SUMS
+          path: files/Vergence-*
+      # The files go on a DRAFT release, which apps can't see: GitHub's releases/latest, which
+      # apps.illixion.com redirects to, names only published ones. The owner then runs
+      # desktop/scripts/bless-release.sh --publish, which signs the files with the release key and
+      # publishes. A rerun replaces the draft's files; a published release is never touched.
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null | grep -qx true; then
+            gh release upload "$tag" files/Vergence-* -R "$GITHUB_REPOSITORY" --clobber
+          elif gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$tag is already published; bump the version instead"; exit 1
+          else
+            gh release create "$tag" files/Vergence-* -R "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+              --title "Vergence $VERSION" --notes "Draft: signed and published by desktop/scripts/bless-release.sh."
+          fi
+          echo "Draft release $tag. Next: desktop/scripts/bless-release.sh --tag $tag --publish" >> "$GITHUB_STEP_SUMMARY"

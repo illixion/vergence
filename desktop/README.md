@@ -123,29 +123,43 @@ id>` with the `play` grant; forgetting the device removes both.
 `.github/workflows/ci.yml` runs the desktop, coordinator and companion tests and clippy on macOS and
 Windows for every push to `main` and pull request. `.github/workflows/release.yml` (run by hand, or
 by pushing a `v<version>` tag) builds both release zips with the scripts above, the Windows worker
-and converter natively on Windows, and attests them (`gh attestation verify FILE -R
-illixion/vergence`). It signs nothing: download the `release-<version>` artifact and run
-`bless-release.sh SHA256SUMS` below. A manual run with no version builds without publishing, which
-also warms the caches (only runs on `main` save them). The repository variable `MACOS_RUNNER` picks a
-runner with Xcode 27 for the Swift command line.
+and converter natively on Windows, attests them (`gh attestation verify FILE -R
+illixion/vergence`) and puts them on a **draft** GitHub release. It signs and publishes nothing: see
+"Releasing" below. A manual run with no version builds without a release, which also warms the caches
+(only runs on `main` save them). The repository variable `MACOS_RUNNER` picks a runner with Xcode 27
+for the Swift command line. The workspace depends on `../signed-update` by path (below), so both
+workflows check that repository out beside this one.
+
+## Releasing
+
+1. Bump the version in `Cargo.toml`, commit, push a `v<version>` tag (or run the workflow by hand).
+   CI builds the files into a draft release.
+2. `desktop/scripts/bless-release.sh --tag v<version> --publish`, in the foreground: it hashes the
+   draft's files, signs them with the release key (PIN and touch), checks the signature against
+   `release-signers`, uploads `SHA256SUMS` and `SHA256SUMS.sig` and publishes. `--key-file KEY` signs
+   with the offline backup instead.
+3. Installed copies find it at their next check.
+
+## Updates
+
+The updater is the [`signed-update`](../../signed-update) crate (`docs/PROTOCOL.md` there), shared
+with Apparition; `src/updater.rs` is only the status the window shows and when to install. A copy
+asks `https://apps.illixion.com/vergence/latest/SHA256SUMS` (and `.sig`) first, then GitHub's
+`releases/latest/download/` directly, and believes the first signed manifest that verifies against
+the pinned keys. apps.illixion.com holds no files: its `_redirects` point at GitHub Releases, and at
+a self-hosted copy while GitHub is down, so moving every copy is a two-line edit there and needs no
+app update. Checking is off until the person turns it on (Settings). macOS installs the update in
+place (unzip beside the app, check its code-signing seal, swap); Windows says where to download it.
 
 ## Signing a release
 
-The updater trusts a release only through its `SHA256SUMS`, signed with SSHSIG under the
-namespace `vergence-release` by a key in `release-signers`, which is compiled in. Those are the
-same two keys that sign Apparition's releases: the everyday hardware key (PIN and touch, never on
-disk or in CI) and an offline backup, both pinned from the start so the backup is trusted by every
-copy installed. To sign a release's manifest, in the foreground:
-
-```sh
-desktop/scripts/bless-release.sh build/release/0.2.0/SHA256SUMS                 # the hardware key, via ssh-agent or gpg-agent
-desktop/scripts/bless-release.sh build/release/0.2.0/SHA256SUMS --key-file KEY  # the offline backup
-```
-
-It writes `SHA256SUMS.sig` beside the manifest and checks it with `ssh-keygen -Y verify` against
-`release-signers`. A release lists `Vergence-<version>-macos-universal.zip` and
-`Vergence-<version>-windows-x86_64.zip` (`updater::installer_name`); the version is in the
-signed names, so an old release can't be relabelled as new.
+`desktop/scripts/bless-release.sh` (a wrapper over the shared script in `signed-update`) signs a
+release with SSHSIG under the namespace `vergence-release`, with a key in `release-signers`, which is
+compiled in. Those are the same two keys that sign Apparition's releases: the everyday hardware key
+(PIN and touch, never on disk or in CI) and an offline backup, both pinned from the start so the
+backup is trusted by every copy installed. A release lists `Vergence-<version>-macos-universal.zip`
+and `Vergence-<version>-windows-x86_64.zip`; the version is in the signed names, so an old release
+can't be relabelled as new.
 
 ## Not done yet
 
@@ -154,8 +168,8 @@ signed names, so an old release can't be relabelled as new.
 - **Windows:** no installer that writes Start menu entries or registers "Open with" (the zip is
   unpacked anywhere, as Apparition's is), no code signing (SmartScreen warns once), and the
   firewall asks on first start; the tray and a conversion haven't been tried there yet.
-- **Updates:** there is no release site yet (`updater::SITE` is `None`), so checking is off by
-  default, and the Windows install step isn't ported. The signing keys are pinned (below).
+- **Updates:** the Windows install step isn't ported (Apparition's `update-windows.ps1` swaps a
+  running executable); the macOS one is in `signed-update`. The first signed release is yet to be made.
 - **Titles by name** in the queue (it shows server and id), a preview frame before converting,
   model and GPU choice, yielding to games, and a signed bundle with the CLI as a sidecar.
 - `vergence convert` prints progress only to a terminal, so the app gives its stderr a
