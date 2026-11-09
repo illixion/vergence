@@ -17,6 +17,10 @@ use std::time::Duration;
 use serde::Serialize;
 use signed_update::{Config, Privacy, Source, Update, is_newer, signer_keys};
 
+fn privacy(private: bool) -> Privacy {
+    if private { Privacy::Ech } else { Privacy::Off }
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The SSHSIG namespace releases are signed under (`ssh-keygen -Y sign -n vergence-release`).
 pub const NAMESPACE: &str = "vergence-release";
@@ -60,12 +64,15 @@ pub fn config() -> Config {
 }
 
 /// This platform's installer, as a signed file name with the version left open (the signed name
-/// binds the version, so a host can't relabel an old release as new).
+/// binds the version, so a host can't relabel an old release as new). Windows has one per
+/// architecture: an x86_64 build running emulated on an ARM PC keeps updating to x86_64.
 pub fn installer_pattern() -> Option<&'static str> {
     if cfg!(target_os = "macos") {
         Some("Vergence-{version}-macos-universal.zip")
-    } else if cfg!(windows) {
+    } else if cfg!(all(windows, target_arch = "x86_64")) {
         Some("Vergence-{version}-windows-x86_64.zip")
+    } else if cfg!(all(windows, target_arch = "aarch64")) {
+        Some("Vergence-{version}-windows-arm64.zip")
     } else {
         None
     }
@@ -105,7 +112,7 @@ impl Updates {
                 message: "There is no Vergence release for this platform.".into(),
                 ..Status::default()
             },
-            (true, Some(pattern)) => match signed_update::check(&self.config.clone().privacy(if private { Privacy::Ech } else { Privacy::Off }), VERSION, pattern).await {
+            (true, Some(pattern)) => match signed_update::check(&self.config.clone().privacy(privacy(private)), VERSION, pattern).await {
                 Ok(Some(update)) => {
                     let version = update.version.clone();
                     let can_install = cfg!(target_os = "macos") && !cfg!(debug_assertions);
@@ -123,19 +130,24 @@ impl Updates {
                     *self.candidate.lock().unwrap() = None;
                     Status::default()
                 }
-                Err(e) => Status { phase: "error", message: format!("Couldn't check for updates: {e}"), ..Status::default() },
+                Err(e) => {
+                    // What an earlier check found isn't offered on the strength of a failed one.
+                    *self.candidate.lock().unwrap() = None;
+                    Status { phase: "error", message: format!("Couldn't check for updates: {e}"), ..Status::default() }
+                }
             },
         };
         *self.status.lock().unwrap() = status.clone();
         Ok(status)
     }
 
-    /// Downloads, verifies and installs the announced update; true means restart now.
-    pub async fn install(&self) -> Result<bool, String> {
+    /// Downloads, verifies and installs the announced update; true means restart now. `private` is
+    /// the setting now, which the download follows even if it changed since the check.
+    pub async fn install(&self, private: bool) -> Result<bool, String> {
         if self.installing.swap(true, Ordering::SeqCst) {
             return Err("The update is already being installed.".into());
         }
-        let result = self.install_inner().await;
+        let result = self.install_inner(private).await;
         self.installing.store(false, Ordering::SeqCst);
         if let Err(e) = &result {
             let mut status = self.status.lock().unwrap();
@@ -145,12 +157,12 @@ impl Updates {
         result
     }
 
-    async fn install_inner(&self) -> Result<bool, String> {
+    async fn install_inner(&self, private: bool) -> Result<bool, String> {
         let _guard = self.operation.lock().await;
         if cfg!(debug_assertions) {
             return Err("Development builds are not replaced.".into());
         }
-        let update = self.candidate.lock().unwrap().clone().ok_or("Check for updates first.")?;
+        let update = self.candidate.lock().unwrap().clone().ok_or("Check for updates first.")?.with_privacy(privacy(private));
         if !is_newer(&update.version, VERSION) {
             return Err("Refusing to install an older version.".into());
         }
@@ -210,6 +222,6 @@ mod tests {
             assert_eq!(status.phase, "error");
             assert!(status.message.contains("Couldn't check for updates"), "{}", status.message);
         }
-        assert!(down.install().await.is_err());
+        assert!(down.install(true).await.is_err());
     }
 }

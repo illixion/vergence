@@ -7,6 +7,8 @@
 #                                             command line in Contents/Resources
 #   Vergence-<version>-windows-x86_64.zip     Vergence.exe, WebView2Loader.dll, and the ONNX
 #                                             Runtime worker and converter built on Windows
+#   Vergence-<version>-windows-arm64.zip      the same for Windows on ARM, all built natively
+#                                             on windows-11-arm
 #
 # Nothing here signs or publishes a release. The files land on a draft GitHub release (and as a
 # workflow artifact); the updater trusts a release only through a SHA256SUMS signed by the release
@@ -234,10 +236,61 @@ jobs:
           path: vergence/target/package/Vergence-*-windows-x86_64.zip
           if-no-files-found: error
 
+  # Windows on ARM, built natively: mingw has no ARM64 toolchain, and ONNX Runtime's ARM64
+  # binaries are for MSVC. ring and aws-lc (the update check's TLS) compile their C and assembly
+  # with clang on this target, and OpenSSL (the paired channel) builds with a Windows Perl.
+  windows-arm64:
+    name: Windows on ARM app
+    needs: plan
+    if: needs.plan.outputs.windows == 'true'
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+        working-directory: vergence
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: vergence
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { repository: illixion/signed-update, path: signed-update }
+      - name: Tools
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target aarch64-pc-windows-msvc
+          rustup default "$RUST_TOOLCHAIN"
+          printf '%s\n' 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+          # Git Bash's own perl comes first on PATH and can't configure OpenSSL for MSVC.
+          win_perl="$(where.exe perl 2>/dev/null | tr -d '\r' | grep -viE '[\\/]Git[\\/]' | head -1 || true)"
+          [[ -n "$win_perl" ]] || { echo "::error::no Windows Perl on this image"; exit 1; }
+          echo "OPENSSL_SRC_PERL=$win_perl" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: vergence
+          key: windows-arm64-release
+          cache-on-failure: true
+          save-if: ${{ env.SAVE_CACHE == 'true' }}
+      - name: Worker and converter
+        run: |
+          cargo build --release --locked --target aarch64-pc-windows-msvc -p vergence-worker -p vergence-convert
+          mkdir tools
+          built=target/aarch64-pc-windows-msvc/release
+          cp "$built/vergence-worker.exe" "$built/vergence-convert.exe" tools/
+          shopt -s nullglob
+          for f in "$built"/*.dll; do cp "$f" tools/; done
+          ls -l tools
+      - name: Build
+        run: desktop/scripts/package-windows.sh --arch arm64 --tools tools
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: windows-arm64
+          path: vergence/target/package/Vergence-*-windows-arm64.zip
+          if-no-files-found: error
+
   attest:
     name: Attest and draft the release
     # Parts that weren't asked for are skipped, which would skip this too without the condition.
-    needs: [plan, macos, windows]
+    needs: [plan, macos, windows, windows-arm64]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && needs.plan.outputs.publish == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
@@ -250,7 +303,7 @@ jobs:
         with:
           path: files
           # The build jobs' own artifacts, not the Windows tools (which are inside the zip).
-          pattern: "{macos,windows}"
+          pattern: "{macos,windows,windows-arm64}"
           merge-multiple: true
       - name: List
         run: |

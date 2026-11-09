@@ -389,7 +389,8 @@ pub async fn check_update(state: Shared<'_>) -> Reply {
 
 #[tauri::command]
 pub async fn install_update(app: AppHandle, state: Shared<'_>) -> Reply {
-    if state.updates.install().await? {
+    let private = state.settings().private_updates;
+    if state.updates.install(private).await? {
         app.request_restart();
     }
     Ok(json!(true))

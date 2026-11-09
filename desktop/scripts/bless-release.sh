@@ -20,4 +20,4 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHARED="${SIGNED_UPDATE:-$HERE/../../../signed-update}/scripts/bless-release.sh"
 [[ -x "$SHARED" ]] || { echo "error: signed-update isn't beside this repository (set SIGNED_UPDATE to its folder): $SHARED" >&2; exit 1; }
-exec "$SHARED" --repo illixion/vergence --namespace vergence-release --signers "$HERE/../release-signers" "$@"
+exec "$SHARED" --repo illixion/vergence --namespace vergence-release --signers "$HERE/../release-signers" --product Vergence "$@"

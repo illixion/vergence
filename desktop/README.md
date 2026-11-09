@@ -56,13 +56,24 @@ pool", shown as "can't find crate"). The 14.0 floor is the bundle's (`minimumSys
 
 ## Windows
 
-The same app, cross-compiled from a Mac and packed the way Apparition packs its Windows
-installer: one zip, `Vergence-<version>-windows-x86_64.zip` (the name the updater looks for).
+The same app, packed the way Apparition packs its Windows installer: one zip per architecture,
+`Vergence-<version>-windows-x86_64.zip` and `Vergence-<version>-windows-arm64.zip` (the names the
+updater looks for; an x86_64 copy running emulated on an ARM PC keeps updating to x86_64). The
+x86_64 one is cross-compiled from a Mac:
 
 ```sh
 brew install mingw-w64 && rustup target add x86_64-pc-windows-gnu    # once
 desktop/scripts/package-windows.sh                                    # -> target/package/
 desktop/scripts/package-windows.sh --tools DIR    # also packs every .exe and .dll in DIR
+```
+
+The ARM64 one is built natively, in Git Bash on a Windows ARM PC (`aarch64-pc-windows-msvc`; mingw
+has no ARM64 toolchain), with the Visual Studio C++ tools, LLVM's `clang` on `PATH` (ring and aws-lc
+compile their C and assembly with it there) and a Windows Perl for OpenSSL (Strawberry Perl; Git
+Bash's own can't configure it, so point `OPENSSL_SRC_PERL` at it):
+
+```sh
+desktop/scripts/package-windows.sh --arch arm64 --tools DIR
 ```
 
 It holds `Vergence.exe`, `WebView2Loader.dll` (keep it beside the app) and a README. OpenSSL is
@@ -120,10 +131,11 @@ id>` with the `play` grant; forgetting the device removes both.
 
 ## CI and release builds
 
-`.github/workflows/ci.yml` runs the desktop, coordinator and companion tests and clippy on macOS and
-Windows for every push to `main` and pull request. `.github/workflows/release.yml` (run by hand, or
-by pushing a `v<version>` tag) builds both release zips with the scripts above, the Windows worker
-and converter natively on Windows, attests them (`gh attestation verify FILE -R
+`.github/workflows/ci.yml` runs the desktop, coordinator and companion tests and clippy on macOS,
+Windows and Windows on ARM (`windows-11-arm`) for every push to `main` and pull request. `.github/workflows/release.yml` (run by hand, or
+by pushing a `v<version>` tag) builds the three release zips with the scripts above (the Windows
+worker and converter natively on Windows, and all of the ARM64 zip natively on `windows-11-arm`),
+attests them (`gh attestation verify FILE -R
 illixion/vergence`) and puts them on a **draft** GitHub release. It signs and publishes nothing: see
 "Releasing" below. A manual run with no version builds without a release, which also warms the caches
 (only runs on `main` save them). The repository variable `MACOS_RUNNER` picks a runner with Xcode 27
@@ -134,7 +146,8 @@ workflows check that repository out beside this one.
 
 1. Bump the version in `Cargo.toml`, commit, push a `v<version>` tag (or run the workflow by hand).
    CI builds the files into a draft release.
-2. `desktop/scripts/bless-release.sh --tag v<version> --publish`, in the foreground: it hashes the
+2. `desktop/scripts/bless-release.sh --tag v<version> --publish`, in the foreground: it checks each
+   file's build attestation and that every file is a `Vergence-<version>-…` one, hashes the
    draft's files, signs them with the release key (PIN and touch), checks the signature against
    `release-signers`, uploads `SHA256SUMS` and `SHA256SUMS.sig` and publishes. `--key-file KEY` signs
    with the offline backup instead.
@@ -165,7 +178,7 @@ release with SSHSIG under the namespace `vergence-release`, with a key in `relea
 compiled in. Those are the same two keys that sign Apparition's releases: the everyday hardware key
 (PIN and touch, never on disk or in CI) and an offline backup, both pinned from the start so the
 backup is trusted by every copy installed. A release lists `Vergence-<version>-macos-universal.zip`
-and `Vergence-<version>-windows-x86_64.zip`; the version is in the signed names, so an old release
+and `Vergence-<version>-windows-{x86_64,arm64}.zip`; the version is in the signed names, so an old release
 can't be relabelled as new.
 
 ## Not done yet

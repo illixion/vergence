@@ -32,6 +32,7 @@ jobs:
         include:
           - { name: macOS, runner: macos-26 }
           - { name: Windows, runner: windows-2025 }
+          - { name: Windows on ARM, runner: windows-11-arm }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     defaults:
@@ -53,12 +54,22 @@ jobs:
       # The Windows build compiles OpenSSL from source for the paired channel (vendored-openssl),
       # which needs NASM; the image has it but not on PATH.
       - name: NASM on PATH
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && runner.arch == 'X64'
         shell: pwsh
         run: |
           $nasm = 'C:\Program Files\NASM'
           if (-not (Test-Path "$nasm\nasm.exe")) { choco install nasm --no-progress -y; }
           Add-Content $env:GITHUB_PATH $nasm
+      # On ARM64, ring and aws-lc (the update check's TLS) compile with clang, and OpenSSL needs a
+      # Windows Perl rather than Git Bash's.
+      - name: LLVM and Perl
+        if: runner.os == 'Windows' && runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          Add-Content $env:GITHUB_PATH 'C:\Program Files\LLVM\bin'
+          $perl = Get-Command perl -All -ErrorAction SilentlyContinue | Where-Object Source -notmatch '\\Git\\' | Select-Object -First 1
+          if (-not $perl) { throw 'no Windows Perl on this image' }
+          Add-Content $env:GITHUB_ENV "OPENSSL_SRC_PERL=$($perl.Source)"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: vergence

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Builds the Vergence desktop app for Windows (x86_64) on a Mac and packs it the way Apparition
-# packs its Windows installer: one zip, Vergence-<version>-windows-x86_64.zip (the name the
-# updater looks for, `updater::installer_name`), holding
+# Builds the Vergence desktop app for Windows and packs it the way Apparition packs its Windows
+# installer: one zip per architecture, Vergence-<version>-windows-<arch>.zip (the name the
+# updater looks for, `updater::installer_pattern`), holding
 #
 #   Vergence.exe          the app (tray, coordinator, pairing, worker and convert sidecars)
 #   WebView2Loader.dll    keep it beside Vergence.exe (the window is Microsoft Edge WebView2,
@@ -12,11 +12,14 @@
 #                         vergence-convert.exe, onnxruntime*.dll, ffmpeg.exe (built on Windows;
 #                         see worker/ and convert/). The app finds them beside itself.
 #
-#   desktop/scripts/package-windows.sh [--tools DIR] [--out DIR]
+#   desktop/scripts/package-windows.sh [--arch x86_64|arm64] [--tools DIR] [--out DIR]
 #
-# Cross-compiles with the x86_64-pc-windows-gnu target and mingw-w64 (Homebrew:
-# `brew install mingw-w64`; `rustup target add x86_64-pc-windows-gnu`), as Apparition's
-# release script does. OpenSSL (the paired channel's TLS-PSK) is built from source into the
+# x86_64 (the default) cross-compiles on a Mac with the x86_64-pc-windows-gnu target and mingw-w64
+# (Homebrew: `brew install mingw-w64`; `rustup target add x86_64-pc-windows-gnu`), as Apparition's
+# release script does. arm64 builds aarch64-pc-windows-msvc natively, in Git Bash on a Windows ARM
+# PC (or the windows-11-arm runner) with the Visual Studio C++ tools, LLVM's clang on PATH (ring
+# and aws-lc, the update check's TLS, compile C and assembly with it there) and a Windows Perl for
+# OpenSSL; mingw has no ARM64 toolchain, and the worker and converter need MSVC anyway. OpenSSL (the paired channel's TLS-PSK) is built from source into the
 # executable (`vendored-openssl` on Windows), so nothing else needs installing there. Unsigned:
 # Windows SmartScreen warns on first open until releases are code-signed.
 #
@@ -26,10 +29,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ARCH=x86_64
 TOOLS=""
 OUT="$ROOT/target/package"
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --arch)  ARCH="${2:?--arch needs x86_64 or arm64}"; shift ;;
     --tools) TOOLS="${2:?--tools needs a folder}"; shift ;;
     --out)   OUT="${2:?--out needs a folder}"; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -37,8 +42,17 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-TARGET=x86_64-pc-windows-gnu
-command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "error: mingw-w64 isn't installed (brew install mingw-w64)" >&2; exit 1; }
+case "$ARCH" in
+  x86_64)
+    TARGET=x86_64-pc-windows-gnu
+    command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "error: mingw-w64 isn't installed (brew install mingw-w64)" >&2; exit 1; }
+    ;;
+  arm64)
+    TARGET=aarch64-pc-windows-msvc
+    command -v clang >/dev/null || { echo "error: clang isn't on PATH (LLVM, e.g. C:\\Program Files\\LLVM\\bin)" >&2; exit 1; }
+    ;;
+  *) echo "error: --arch is x86_64 or arm64, not $ARCH" >&2; exit 2 ;;
+esac
 rustup target list --installed | grep -qx "$TARGET" || { echo "error: rustup target add $TARGET" >&2; exit 1; }
 
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
@@ -53,8 +67,12 @@ built="$TARGET_DIR/$TARGET/release"
 stage="$(mktemp -d)"
 trap 'rm -rf -- "$stage"' EXIT
 cp "$built/vergence-app.exe" "$stage/Vergence.exe"
-cp "$built/WebView2Loader.dll" "$stage/"
-files=(Vergence.exe WebView2Loader.dll README.txt)
+files=(Vergence.exe README.txt)
+# The gnu build loads WebView2 through this DLL; the MSVC build links the loader in.
+if [[ -f "$built/WebView2Loader.dll" ]]; then
+  cp "$built/WebView2Loader.dll" "$stage/"
+  files+=(WebView2Loader.dll)
+fi
 if [[ -n "$TOOLS" ]]; then
   shopt -s nullglob
   for f in "$TOOLS"/*.exe "$TOOLS"/*.dll; do
@@ -65,12 +83,12 @@ if [[ -n "$TOOLS" ]]; then
 fi
 
 cat >"$stage/README.txt" <<EOF
-Vergence $VERSION for Windows (x86_64)
+Vergence $VERSION for Windows ($ARCH)
 
 Open Vergence.exe. It stays in the tray (closing the window keeps it running): the analysis
 coordinator for Jellyfin and Stash, headset pairing, this computer's worker and AI 3D
-conversion of video files. Keep WebView2Loader.dll beside it; the window uses Microsoft Edge
-WebView2, which Windows 10 and 11 normally have.
+conversion of video files. Keep the DLLs beside it; the window uses Microsoft Edge WebView2,
+which Windows 10 and 11 normally have.
 
 The worker and the converter are vergence-worker.exe and vergence-convert.exe (ONNX Runtime):
 put them, with their onnxruntime DLLs and ffmpeg.exe, beside Vergence.exe, or give their folder
@@ -81,8 +99,16 @@ MIT licensed. https://github.com/illixion/vergence
 EOF
 
 mkdir -p "$OUT"
-zip_path="$OUT/Vergence-$VERSION-windows-x86_64.zip"
+zip_path="$OUT/Vergence-$VERSION-windows-$ARCH.zip"
 rm -f -- "$zip_path"
-(cd "$stage" && TZ=UTC zip -qX "$zip_path" "${files[@]}")
+if command -v zip >/dev/null; then
+  (cd "$stage" && TZ=UTC zip -qX "$zip_path" "${files[@]}")
+elif command -v 7z >/dev/null; then
+  # Git Bash on Windows has no zip; 7-Zip is on the GitHub images. Flat files, so the same layout.
+  (cd "$stage" && 7z a -tzip -bso0 -bsp0 "$(cygpath -w "$zip_path")" "${files[@]}")
+else
+  # Windows' own, for a PC with neither.
+  (cd "$stage" && powershell.exe -NoProfile -Command "Compress-Archive -Path $(printf "'%s'," "${files[@]}" | sed 's/,$//') -DestinationPath '$(cygpath -w "$zip_path")'")
+fi
 echo "==> $zip_path"
-(cd "$OUT" && shasum -a 256 "$(basename "$zip_path")")
+(cd "$OUT" && { command -v shasum >/dev/null && shasum -a 256 "$(basename "$zip_path")" || sha256sum "$(basename "$zip_path")"; })

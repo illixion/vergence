@@ -4407,6 +4407,7 @@ dependencies = [
  "rustls",
  "sha2",
  "tempfile",
+ "tokio",
  "tracing",
  "webpki-roots",
 ]
