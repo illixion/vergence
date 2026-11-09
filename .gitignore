@@ -12,3 +12,5 @@ DerivedData/
 # ONNX exports of third-party weights (scripts/export-onnx-models.py); never committed
 /onnx-models/
 /.venv/
+# desktop/scripts/install-desktop.sh: its log and staging folder
+/build/

@@ -41,6 +41,20 @@ The `vergence` executable is looked for in Settings, `VERGENCE_CLI`, beside the 
 `VERGENCE_APP_DATA=DIR` moves the app's data (for a second copy, or a test run). In a debug build
 `VERGENCE_APP_CONVERT=a.mp4:b.mkv` queues files to convert at launch.
 
+## Installing on this Mac
+
+```sh
+desktop/scripts/install-desktop.sh      # build, sign, install to /Applications, start
+```
+
+Builds for this Mac's architecture with the `vergence` command line in `Contents/Resources/`,
+signs both with your Apple Development identity (the first in the login keychain; `SIGN_IDENTITY`
+pins another, `-` is ad-hoc), quits the running copy by bundle id, swaps the new one in and opens
+it. The stable identity is what keeps the Keychain item holding paired headsets readable without a
+prompt, and the Local Network grant, across rebuilds: both follow the signature's designated
+requirement, which an ad-hoc build doesn't keep. `LAUNCH=0` installs without opening it,
+`VERBOSE=1` streams the build (otherwise `build/install-desktop.log`).
+
 ## macOS bundle
 
 ```sh
