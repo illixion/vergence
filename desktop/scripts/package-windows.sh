@@ -56,7 +56,8 @@ case "$ARCH" in
     # overrides it. In CPPFLAGS because OpenSSL's makefile puts those after its own cflags, and
     # no other build reads them (cc-rs adds a plain CFLAGS to every crate, ring's clang included).
     # openssl/openssl#26239; MeshInspector/MeshLib#7121 has the analysis.
-    export CPPFLAGS="${CPPFLAGS:-/Gs}"
+    # Written -Gs, not /Gs: Git Bash rewrites a value starting with / into a Windows path.
+    export CPPFLAGS="${CPPFLAGS:--Gs}"
     ;;
   *) echo "error: --arch is x86_64 or arm64, not $ARCH" >&2; exit 2 ;;
 esac

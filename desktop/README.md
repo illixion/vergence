@@ -71,7 +71,7 @@ The ARM64 one is built natively, in Git Bash on a Windows ARM PC (`aarch64-pc-wi
 has no ARM64 toolchain), with the Visual Studio C++ tools, LLVM's `clang` on `PATH` (ring and aws-lc
 compile their C and assembly with it there) and a Windows Perl for OpenSSL (Strawberry Perl; Git
 Bash's own can't configure it, so point `OPENSSL_SRC_PERL` at it). The script also sets
-`CPPFLAGS=/Gs` for OpenSSL: MSVC's ARM64 compiler miscompiles it under the `/Gs0` its config passes,
+`CPPFLAGS=-Gs` for OpenSSL: MSVC's ARM64 compiler miscompiles it under the `/Gs0` its config passes,
 and the paired channel then crashes on every connection (any other build of OpenSSL for
 `aarch64-pc-windows-msvc` needs the same, `cargo test` included):
 
