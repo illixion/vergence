@@ -50,6 +50,13 @@ case "$ARCH" in
   arm64)
     TARGET=aarch64-pc-windows-msvc
     command -v clang >/dev/null || { echo "error: clang isn't on PATH (LLVM, e.g. C:\\Program Files\\LLVM\\bin)" >&2; exit 1; }
+    # MSVC's ARM64 compiler, with the /Gs0 OpenSSL's VC-WIN64-ARM config passes, puts a __chkstk
+    # call before the link register is saved in tls_parse_all_extensions: the server crashes on
+    # the first ClientHello (the paired channel, every connection). /Gs (the default threshold)
+    # overrides it. In CPPFLAGS because OpenSSL's makefile puts those after its own cflags, and
+    # no other build reads them (cc-rs adds a plain CFLAGS to every crate, ring's clang included).
+    # openssl/openssl#26239; MeshInspector/MeshLib#7121 has the analysis.
+    export CPPFLAGS="${CPPFLAGS:-/Gs}"
     ;;
   *) echo "error: --arch is x86_64 or arm64, not $ARCH" >&2; exit 2 ;;
 esac

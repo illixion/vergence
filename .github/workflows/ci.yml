@@ -61,7 +61,8 @@ jobs:
           if (-not (Test-Path "$nasm\nasm.exe")) { choco install nasm --no-progress -y; }
           Add-Content $env:GITHUB_PATH $nasm
       # On ARM64, ring and aws-lc (the update check's TLS) compile with clang, and OpenSSL needs a
-      # Windows Perl rather than Git Bash's.
+      # Windows Perl rather than Git Bash's, and /Gs over its /Gs0, which MSVC miscompiles there
+      # (desktop/scripts/package-windows.sh says why; the companion's tls tests crash without it).
       - name: LLVM and Perl
         if: runner.os == 'Windows' && runner.arch == 'ARM64'
         shell: pwsh
@@ -70,6 +71,7 @@ jobs:
           $perl = Get-Command perl -All -ErrorAction SilentlyContinue | Where-Object Source -notmatch '\\Git\\' | Select-Object -First 1
           if (-not $perl) { throw 'no Windows Perl on this image' }
           Add-Content $env:GITHUB_ENV "OPENSSL_SRC_PERL=$($perl.Source)"
+          Add-Content $env:GITHUB_ENV "CPPFLAGS=/Gs"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: vergence

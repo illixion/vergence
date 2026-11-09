@@ -238,13 +238,16 @@ jobs:
 
   # Windows on ARM, built natively: mingw has no ARM64 toolchain, and ONNX Runtime's ARM64
   # binaries are for MSVC. ring and aws-lc (the update check's TLS) compile their C and assembly
-  # with clang on this target, and OpenSSL (the paired channel) builds with a Windows Perl.
+  # with clang on this target, and OpenSSL (the paired channel) builds with a Windows Perl and
+  # CPPFLAGS=/Gs (desktop/scripts/package-windows.sh says why; without it the channel crashes).
   windows-arm64:
     name: Windows on ARM app
     needs: plan
     if: needs.plan.outputs.windows == 'true'
     runs-on: windows-11-arm
     timeout-minutes: 90
+    env:
+      CPPFLAGS: /Gs
     defaults:
       run:
         shell: bash
