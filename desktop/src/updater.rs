@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
-use signed_update::{Config, Source, Update, is_newer, signer_keys};
+use signed_update::{Config, Privacy, Source, Update, is_newer, signer_keys};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The SSHSIG namespace releases are signed under (`ssh-keygen -Y sign -n vergence-release`).
@@ -86,8 +86,9 @@ impl Updates {
         }
     }
 
-    /// Looks for a newer verified release. `enabled` is the person's setting.
-    pub async fn check(&self, enabled: bool) -> Result<Status, String> {
+    /// Looks for a newer verified release. `enabled` is the person's setting, and `private` the
+    /// one that keeps apps.illixion.com's name off the network (DNS-over-HTTPS and ECH).
+    pub async fn check(&self, enabled: bool, private: bool) -> Result<Status, String> {
         if self.installing.load(Ordering::SeqCst) {
             return Err("An update is being installed.".into());
         }
@@ -104,7 +105,7 @@ impl Updates {
                 message: "There is no Vergence release for this platform.".into(),
                 ..Status::default()
             },
-            (true, Some(pattern)) => match signed_update::check(&self.config, VERSION, pattern).await {
+            (true, Some(pattern)) => match signed_update::check(&self.config.clone().privacy(if private { Privacy::Ech } else { Privacy::Off }), VERSION, pattern).await {
                 Ok(Some(update)) => {
                     let version = update.version.clone();
                     let can_install = cfg!(target_os = "macos") && !cfg!(debug_assertions);
@@ -201,11 +202,11 @@ mod tests {
     #[tokio::test]
     async fn checking_is_off_by_default_and_reports_a_source_that_is_down() {
         let updates = Updates::default();
-        assert_eq!(updates.check(false).await.unwrap().phase, "off");
+        assert_eq!(updates.check(false, true).await.unwrap().phase, "off");
         // Nothing listens on port 1: both sources fail, and the window is told why.
         let down = Updates::with_config(Config::new("Vergence", NAMESPACE, SIGNERS).source(Source::mirror("http://127.0.0.1:1", "vergence")));
         if installer_pattern().is_some() {
-            let status = down.check(true).await.unwrap();
+            let status = down.check(true, false).await.unwrap();
             assert_eq!(status.phase, "error");
             assert!(status.message.contains("Couldn't check for updates"), "{}", status.message);
         }

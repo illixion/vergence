@@ -383,8 +383,8 @@ pub fn update_status(state: Shared<'_>) -> Value {
 
 #[tauri::command]
 pub async fn check_update(state: Shared<'_>) -> Reply {
-    let enabled = state.settings().check_updates;
-    Ok(json!(state.updates.check(enabled).await?))
+    let settings = state.settings();
+    Ok(json!(state.updates.check(settings.check_updates, settings.private_updates).await?))
 }
 
 #[tauri::command]

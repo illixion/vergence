@@ -148,7 +148,14 @@ asks `https://apps.illixion.com/vergence/latest/SHA256SUMS` (and `.sig`) first, 
 `releases/latest/download/` directly, and believes the first signed manifest that verifies against
 the pinned keys. apps.illixion.com holds no files: its `_redirects` point at GitHub Releases, and at
 a self-hosted copy while GitHub is down, so moving every copy is a two-line edit there and needs no
-app update. Checking is off until the person turns it on (Settings). macOS installs the update in
+app update. Checking is off until the person turns it on (Settings).
+
+"Hide the update check from the network" (on by default) keeps apps.illixion.com's name off a network
+you travel through: its address and ECH key are read over DNS-over-HTTPS from 1.1.1.1 by IP, and the
+connection uses Encrypted Client Hello, so a log shows a connection to 1.1.1.1 and a handshake naming
+Cloudflare's shared `cloudflare-ech.com`, then github.com (which names no one). Where DoH or ECH is
+blocked the check goes to GitHub directly: never to apps.illixion.com in the clear. Verified on a wire
+capture and on Windows 11 (`signed-update/docs/PROTOCOL.md`, "Privacy"). macOS installs the update in
 place (unzip beside the app, check its code-signing seal, swap); Windows says where to download it.
 
 ## Signing a release

@@ -710,11 +710,14 @@ mod tests {
         assert_eq!(strings(job(ConvertOptions::default()).arguments_with(Some("/m/x.onnx"), "base")).last().unwrap(), "/m/x.onnx");
         let mut j = job(ConvertOptions { layout: Layout::Spatial, strength: Some(0.012), convergence: Some(0.5), sample: true, force: true, upscale: false });
         j.output_dir = Some(PathBuf::from("/out/3D"));
+        // The folder is named with the platform's own trailing separator, which the converter reads
+        // as "a folder" (`\` on Windows, as `options.rs` checks).
+        let folder = format!("/out/3D{}", std::path::MAIN_SEPARATOR);
         assert_eq!(
             strings(j.arguments(Some("/models/depth.mlpackage"))),
             [
                 "/films/Film.mkv", "--layout", "spatial", "--strength", "0.012", "--convergence", "0.5", "--sample", "10",
-                "--output", "/out/3D/", "--model", "/models/depth.mlpackage", "--force",
+                "--output", folder.as_str(), "--model", "/models/depth.mlpackage", "--force",
             ]
         );
         let upscaled = job(ConvertOptions { layout: Layout::Flat, upscale: true, ..Default::default() });

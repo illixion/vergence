@@ -361,6 +361,7 @@ async function loadSettings() {
   await loadDepthVariants();
   $("login").checked = v.launchAtLogin;
   $("updates").checked = s.checkUpdates;
+  $("private-updates").checked = s.privateUpdates;
   $("data-dir").textContent = `Data: ${v.dataDir}`;
   const u = await invoke("update_status");
   $("update-line").textContent = u.message || "";
@@ -415,6 +416,7 @@ function settingsFromForm() {
   s.vergenceCli = $("cli-path").value;
   s.depthModel = $("depth-model").value;
   s.checkUpdates = $("updates").checked;
+  s.privateUpdates = $("private-updates").checked;
   return s;
 }
 

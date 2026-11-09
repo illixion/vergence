@@ -129,12 +129,13 @@ fn main() {
                 });
             }
             {
-                // Updates: checked every few hours, only when turned on (and there is a site).
+                // Updates: checked every few hours, only when turned on.
                 let state = state.clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
-                        if state.settings().check_updates {
-                            let _ = state.updates.check(true).await;
+                        let settings = state.settings();
+                        if settings.check_updates {
+                            let _ = state.updates.check(true, settings.private_updates).await;
                         }
                         tokio::time::sleep(updater::CHECK_INTERVAL).await;
                     }

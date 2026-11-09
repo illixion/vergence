@@ -102,8 +102,12 @@ pub struct Settings {
     pub worker_name: Option<String>,
     /// Start the worker with the app.
     pub worker_at_start: bool,
-    /// Check for updates. Off until Vergence has a release site.
+    /// Check for updates (off until the person turns it on).
     pub check_updates: bool,
+    /// Reach apps.illixion.com for updates only over DNS-over-HTTPS and Encrypted Client Hello, so a
+    /// network doesn't see the name; where that is blocked the check goes to GitHub directly (never
+    /// to apps.illixion.com in the clear). On by default.
+    pub private_updates: bool,
 }
 
 pub const DEFAULT_PORT: u16 = 8420;
@@ -127,6 +131,7 @@ impl Default for Settings {
             worker_name: None,
             worker_at_start: false,
             check_updates: false,
+            private_updates: true,
         }
     }
 }
@@ -296,6 +301,7 @@ mod tests {
         assert!(old.lan);
         assert_eq!(old.port, DEFAULT_PORT);
         assert!(!old.check_updates);
+        assert!(old.private_updates, "a file from before the setting keeps it on");
         assert_eq!(old.listen(), "0.0.0.0:8420");
     }
 
