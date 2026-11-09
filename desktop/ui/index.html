@@ -165,18 +165,18 @@
         <div class="row">
           <div class="card grow">
             <h2>Media servers</h2>
-            <p class="muted small">Keys stay in this app (in files only you can read) and are never shown again.</p>
+            <p class="muted small">No key is kept on disk. A paired headset hands its own sign-in over when it starts playing, and this app holds it in memory only, forgetting it 12 hours after the last stream or when it quits. A key typed here is held the same way, for this computer's own use.</p>
             <fieldset>
               <legend>Jellyfin</legend>
               <label>Address <input id="jf-url" placeholder="http://192.168.1.10:8096"></label>
               <label>API key <input id="jf-key" type="password" autocomplete="off"></label>
-              <div class="actions"><button type="button" id="jf-test">Test</button><button type="button" id="jf-forget">Remove Key</button><span id="jf-result" class="small"></span></div>
+              <div class="actions"><button type="button" id="jf-test">Test</button><button type="button" id="jf-forget">Forget</button><span id="jf-result" class="small"></span></div>
             </fieldset>
             <fieldset>
               <legend>Stash</legend>
               <label>Address <input id="st-url" placeholder="http://192.168.1.10:9999"></label>
               <label>API key <input id="st-key" type="password" autocomplete="off"></label>
-              <div class="actions"><button type="button" id="st-test">Test</button><button type="button" id="st-forget">Remove Key</button><span id="st-result" class="small"></span></div>
+              <div class="actions"><button type="button" id="st-test">Test</button><button type="button" id="st-forget">Forget</button><span id="st-result" class="small"></span></div>
             </fieldset>
             <label class="check"><input id="scan" type="checkbox"> <span>Queue every 3D title the servers list, every <input id="scan-hours" type="number" min="1" max="168" class="tiny"> hours</span></label>
           </div>

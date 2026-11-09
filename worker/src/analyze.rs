@@ -251,6 +251,7 @@ mod tests {
             },
             lease_seconds: 60.0,
             live: false,
+            credential: None,
         }
     }
 

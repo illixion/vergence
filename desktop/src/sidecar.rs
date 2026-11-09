@@ -218,9 +218,16 @@ impl Sidecar {
 
 /// Starts `program args` with stdout piped, and stderr on a pseudo-terminal when `tty` (Unix).
 pub fn spawn(program: &Path, args: &[OsString], tty: bool) -> std::io::Result<Sidecar> {
+    spawn_with_input(program, args, tty, None)
+}
+
+/// As [`spawn`], writing `input` to the child's standard input and then closing it: how a secret
+/// reaches a child without a file or its command line (which other processes can read).
+pub fn spawn_with_input(program: &Path, args: &[OsString], tty: bool, input: Option<Vec<u8>>) -> std::io::Result<Sidecar> {
     let (tx, lines) = mpsc::unbounded_channel();
     let mut command = tokio::process::Command::new(program);
-    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).kill_on_drop(true);
+    let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
+    command.args(args).stdin(stdin).stdout(Stdio::piped()).kill_on_drop(true);
     let path = std::env::join_paths(search_path()).map_err(std::io::Error::other)?;
     command.env("PATH", path);
     if std::env::var_os("VERGENCE_FFMPEG").is_none()
@@ -255,6 +262,15 @@ pub fn spawn(program: &Path, args: &[OsString], tty: bool) -> std::io::Result<Si
     // The command holds the terminal's other end; drop it, so the terminal reads end when the child does.
     drop(command);
     let pid = child.id();
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            if let Err(e) = stdin.write_all(&input).await {
+                tracing::warn!(error = %e, "couldn't give the sidecar its input");
+            }
+            // Dropping it closes the pipe: the child reads to its end.
+        });
+    }
     if let Some(stdout) = child.stdout.take() {
         pump_async(stdout, tx.clone());
     }

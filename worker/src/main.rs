@@ -464,25 +464,35 @@ impl Worker {
         result
     }
 
-    /// The piece's URL on its server and the header that authorises it.
+    /// The piece's URL on its server and the header that authorises it: with the credential the
+    /// lease carries (a player's, held in the coordinator's memory), else the config's own.
     fn media_request(&self, lease: &Lease) -> Result<(String, Vec<(String, String)>), String> {
+        let configured = |server: &Option<crate::config::Server>, name: &str| -> Result<(String, Option<String>), String> {
+            let server = server.as_ref().ok_or_else(|| format!("no {name} in the worker's config, and the lease carries no credential"))?;
+            Ok((server.url.clone(), server.key()?))
+        };
         match lease.source.server.as_str() {
             "jellyfin" => {
-                let server = self.config.jellyfin.as_ref().ok_or("no Jellyfin in the worker's config")?;
-                let mut url = format!("{}/Videos/{}/stream?static=true", server.url.trim_end_matches('/'), lease.source.id);
+                let (base, key) = match &lease.credential {
+                    Some(c) => (c.url.clone(), Some(c.key.clone())),
+                    None => configured(&self.config.jellyfin, "Jellyfin")?,
+                };
+                let mut url = format!("{}/Videos/{}/stream?static=true", base.trim_end_matches('/'), lease.source.id);
                 if let Some(id) = &lease.info.media_source_id {
                     url += &format!("&mediaSourceId={id}");
                 }
-                let headers = server
-                    .key()?
+                let headers = key
                     .map(|k| vec![("Authorization".to_string(), format!("MediaBrowser Client=\"vergence\", Token=\"{k}\""))])
                     .unwrap_or_default();
                 Ok((url, headers))
             }
             "stash" => {
-                let server = self.config.stash.as_ref().ok_or("no Stash in the worker's config")?;
-                let url = format!("{}/scene/{}/stream", server.url.trim_end_matches('/'), lease.source.id);
-                Ok((url, server.key()?.map(|k| vec![("ApiKey".to_string(), k)]).unwrap_or_default()))
+                let (base, key) = match &lease.credential {
+                    Some(c) => (c.url.clone(), Some(c.key.clone())),
+                    None => configured(&self.config.stash, "Stash")?,
+                };
+                let url = format!("{}/scene/{}/stream", base.trim_end_matches('/'), lease.source.id);
+                Ok((url, key.map(|k| vec![("ApiKey".to_string(), k)]).unwrap_or_default()))
             }
             other => Err(format!("unknown server {other}")),
         }

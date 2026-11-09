@@ -2,9 +2,10 @@
 //! the pairing port, open only while the person has asked to pair. The window shows the code
 //! and the device's name, with Pair and Decline.
 //!
-//! A paired device keeps its record (its token and grants) in `devices.json`. From then on it
-//! reaches the coordinator over the paired TLS-PSK channel, keyed from that token
-//! (`vergence_coordinator::paired`, port 8421), which reads `devices.json` itself. It may also
+//! A paired device's record (its token and grants) is kept in the login Keychain on a Mac and in
+//! `devices.json` (0600) on Windows and Linux (`crate::coordinator::device_store`). From then on
+//! it reaches the coordinator over the paired TLS-PSK channel, keyed from that token
+//! (`vergence_coordinator::paired`, port 8421), which reads the same store. It may also
 //! use the plain HTTP port with a bearer token *derived* from its pairing token, never the
 //! pairing token itself (which keys the PSK channel and mustn't cross the network):
 //!
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use vergence_companion::net::{Decision, serve_pairing};
-use vergence_companion::{CredentialStore, DeviceRecord, HostConfig, HostOutcome, HostPairing, JsonFileStore, Namespace, PairLink};
+use vergence_companion::{DeviceRecord, HostConfig, HostOutcome, HostPairing, Namespace, PairLink};
 use vergence_coordinator::auth::Grant;
 
 use crate::coordinator::CoordinatorHost;
@@ -122,8 +123,9 @@ impl Pairing {
         }
     }
 
-    fn store(&self) -> JsonFileStore {
-        JsonFileStore::new(self.paths.devices())
+    /// The coordinator's device store: the login Keychain on a Mac, `devices.json` elsewhere.
+    fn store(&self) -> crate::coordinator::DeviceStore {
+        self.coordinator.devices()
     }
 
     /// Opens the pairing port until a device pairs, the person stops it, or five minutes pass.

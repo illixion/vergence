@@ -92,8 +92,16 @@ fn same(a: &str, b: &str) -> bool {
 /// desktop app's pairing window) or a device forgotten there counts at once. Clones share.
 #[derive(Clone)]
 pub struct PairedDevices {
-    path: PathBuf,
+    backing: Backing,
     loaded: Arc<Mutex<Loaded>>,
+}
+
+/// Where the records are: a `devices.json` another process may rewrite (`vergenced pair`), read
+/// again when it changes; or a store this process shares (the desktop app's Keychain on a Mac).
+#[derive(Clone)]
+enum Backing {
+    File(PathBuf),
+    Store(Arc<dyn vergence_companion::CredentialStore>),
 }
 
 #[derive(Default)]
@@ -104,28 +112,51 @@ struct Loaded {
 
 impl std::fmt::Debug for PairedDevices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PairedDevices").field("path", &self.path).finish_non_exhaustive()
+        match &self.backing {
+            Backing::File(path) => f.debug_struct("PairedDevices").field("path", path).finish_non_exhaustive(),
+            Backing::Store(_) => f.debug_struct("PairedDevices").field("store", &"shared").finish_non_exhaustive(),
+        }
     }
 }
 
 impl PairedDevices {
     pub fn open(path: impl Into<PathBuf>) -> PairedDevices {
-        PairedDevices { path: path.into(), loaded: Default::default() }
+        PairedDevices { backing: Backing::File(path.into()), loaded: Default::default() }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// The devices of a store this process shares with its pairing (the desktop app's Keychain
+    /// store on a Mac). It is asked on every lookup and keeps its own cache.
+    pub fn from_store(store: Arc<dyn vergence_companion::CredentialStore>) -> PairedDevices {
+        PairedDevices { backing: Backing::Store(store), loaded: Default::default() }
     }
 
-    /// The records, read again if the file changed. A missing or unreadable file is no devices.
+    /// The file, for a file-backed list.
+    pub fn path(&self) -> Option<&Path> {
+        match &self.backing {
+            Backing::File(path) => Some(path),
+            Backing::Store(_) => None,
+        }
+    }
+
+    /// The records, read again if the file changed. A missing or unreadable file (or store) is
+    /// no devices.
     pub fn records(&self) -> Vec<DeviceRecord> {
-        let stamp = std::fs::metadata(&self.path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        let path = match &self.backing {
+            Backing::File(path) => path,
+            Backing::Store(store) => {
+                return store.devices().unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "couldn't read the paired devices");
+                    Vec::new()
+                });
+            }
+        };
+        let stamp = std::fs::metadata(path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
         let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
         if loaded.stamp != stamp || stamp.is_none() {
-            loaded.records = match JsonFileStore::new(&self.path).devices() {
+            loaded.records = match JsonFileStore::new(path).devices() {
                 Ok(records) => records,
                 Err(e) => {
-                    tracing::warn!(path = %self.path.display(), error = %e, "couldn't read the paired devices");
+                    tracing::warn!(path = %path.display(), error = %e, "couldn't read the paired devices");
                     Vec::new()
                 }
             };

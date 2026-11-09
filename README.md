@@ -526,6 +526,14 @@ target/release/vergenced pair --config vergenced.json        # pair a headset: c
 target/release/vergence-worker --config worker.json          # a PC (ONNX Runtime), same format
 ```
 
+**Media credentials.** Workers read the media themselves, and nobody but the player needs to hold a
+key: a paired headset hands its own Jellyfin or Stash sign-in to the coordinator when it starts a
+stream (`credentials` on its first report), the coordinator keeps it in memory only for 12 hours
+after the last stream (`coordinator/src/credentials.rs`), and gives it to workers in their leases.
+Both happen only over the paired channel or loopback. A worker elsewhere, or a headless
+`vergenced` configured with `apiKeyFile`s, still uses its own keys. A worker's config can come
+from standard input (`--config -`), so a token needn't be in a file either.
+
 Two ways in, to the same API. **Paired devices** (a headset paired with `vergenced pair` or the
 desktop app's Headsets tab) use TLS 1.2 with an external PSK on port 8421, keyed from their
 pairing, with nothing secret on the wire and no token to copy; the spec is in

@@ -10,7 +10,8 @@
 //! - [`exchange`], [`message`]: the six-digit exchange and its framed JSON.
 //! - [`host`], [`device`]: sans-IO state machines for each side; [`net`]
 //!   drives them over a blocking `TcpStream`.
-//! - [`credential`], [`keyring`], [`store`]: tokens, PSKs, proofs, grants.
+//! - [`credential`], [`keyring`], [`store`]: tokens, PSKs, proofs, grants;
+//!   `keychain` (macOS): the same store in the login Keychain instead of a file.
 //! - [`discovery`]: knock tags; [`link`]: the address link.
 //! - `tls` (feature `tls`, on by default): the TLS 1.2 PSK channel on OpenSSL.
 
@@ -21,6 +22,8 @@ pub mod error;
 pub mod exchange;
 pub mod host;
 pub mod json;
+#[cfg(target_os = "macos")]
+pub mod keychain;
 pub mod keyring;
 pub mod link;
 pub mod message;
@@ -39,4 +42,6 @@ pub use keyring::{Keyring, KeyringEntry};
 pub use link::PairLink;
 pub use message::{PairingGrant, PairingMessage};
 pub use namespace::Namespace;
+#[cfg(target_os = "macos")]
+pub use keychain::KeychainStore;
 pub use store::{CredentialStore, DeviceRecord, JsonFileStore};

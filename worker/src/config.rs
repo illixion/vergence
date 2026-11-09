@@ -115,8 +115,16 @@ pub struct Config {
 }
 
 impl Config {
+    /// Reads the config from `path`, or from standard input when it is `-`: how the desktop app
+    /// starts its worker, with the token inline, so nothing secret is written to a file.
     pub fn load(path: &Path) -> Result<Config, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let bytes = if path == Path::new("-") {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes).map_err(|e| format!("standard input: {e}"))?;
+            bytes
+        } else {
+            std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?
+        };
         serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
     }
 

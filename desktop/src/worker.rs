@@ -1,10 +1,12 @@
-//! The worker sidecar: `vergence worker --config FILE` on a Mac (Core ML), `vergence-worker.exe
-//! --config FILE` on Windows (ONNX Runtime; the same config format), run as a child process
-//! against this app's own coordinator, with a `work` token the app mints for it. Its config holds
-//! paths only (the token's file, the servers' key files), never a secret.
+//! The worker sidecar: `vergence worker --config -` on a Mac (Core ML), `vergence-worker.exe
+//! --config -` on Windows (ONNX Runtime; the same config format), run as a child process
+//! against this app's own coordinator. Its config goes through the child's standard input, with
+//! a `work` token made for this run only (never written, its hash included), so nothing secret
+//! reaches a file. It names no media server: the worker is on loopback, so each lease carries the
+//! credential a headset handed over for that piece's server (`vergence_coordinator::credentials`).
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -12,7 +14,7 @@ use serde_json::{Value, json};
 use vergence_coordinator::auth::Grant;
 
 use crate::coordinator::CoordinatorHost;
-use crate::settings::{Paths, Server, Settings, has_secret, write_atomic};
+use crate::settings::{Paths, Settings};
 use crate::sidecar::{self, ToolKind};
 
 /// Whether this platform has a worker to run (Core ML on a Mac, ONNX Runtime on Windows).
@@ -23,66 +25,59 @@ const LOG_LINES: usize = 400;
 /// The coordinator token the app gives its own worker.
 pub const TOKEN_NAME: &str = "this-computer-worker";
 
-#[derive(Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkerServer {
-    pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key_file: Option<String>,
-}
-
-/// `vergence worker`'s config file (see `Sources/VergenceCLI/Worker.swift`).
-#[derive(Debug, PartialEq, Serialize)]
+/// `vergence worker`'s config (see `Sources/VergenceCLI/Worker.swift`), as its standard input.
+#[derive(PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerConfig {
     pub coordinator: String,
-    pub token_file: String,
+    pub token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub remote: bool,
     pub models: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ffmpeg: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub jellyfin: Option<WorkerServer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stash: Option<WorkerServer>,
+}
+
+impl std::fmt::Debug for WorkerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("coordinator", &self.coordinator)
+            .field("token", &"<redacted>")
+            .field("models", &self.models)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WorkerConfig {
-    pub fn new(paths: &Paths, settings: &Settings, ffmpeg: Option<&Path>) -> Result<WorkerConfig, String> {
+    pub fn new(settings: &Settings, token: String, ffmpeg: Option<&Path>) -> Result<WorkerConfig, String> {
         let models = settings.models_folder.clone().ok_or("Choose the folder of interpolation models first (Settings).")?;
-        let server = |server: Server| {
-            settings.url(server).map(|url| WorkerServer {
-                url: url.to_string(),
-                api_key_file: has_secret(paths, server).then(|| paths.secret(server).to_string_lossy().into_owned()),
-            })
-        };
-        let (jellyfin, stash) = (server(Server::Jellyfin), server(Server::Stash));
-        if jellyfin.is_none() && stash.is_none() {
-            return Err("Add a Jellyfin or Stash server first (Settings): the worker reads the media from it.".into());
-        }
         Ok(WorkerConfig {
             coordinator: settings.local_url(),
-            token_file: token_path(paths).to_string_lossy().into_owned(),
+            token,
             name: settings.worker_name.clone(),
             remote: false,
             models,
             ffmpeg: ffmpeg.map(|p| p.to_string_lossy().into_owned()),
-            jellyfin,
-            stash,
         })
     }
 
-    pub fn write(&self, paths: &Paths) -> std::io::Result<PathBuf> {
-        let path = paths.worker_dir().join("worker.json");
-        write_atomic(&path, &serde_json::to_vec_pretty(self)?, true)?;
-        Ok(path)
+    /// The bytes for the worker's standard input.
+    pub fn to_stdin(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("the config encodes")
     }
 }
 
-fn token_path(paths: &Paths) -> PathBuf {
-    paths.worker_dir().join("worker.token")
+/// What older versions wrote: the worker's config and its token as files. Removed at start.
+pub fn remove_old_files(paths: &Paths) {
+    for name in ["worker.token", "worker.json"] {
+        let path = paths.worker_dir().join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(file = %path.display(), "removed a file older versions kept"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(file = %path.display(), error = %e, "couldn't remove an old file"),
+        }
+    }
 }
 
 struct Running {
@@ -91,7 +86,6 @@ struct Running {
 }
 
 pub struct WorkerHost {
-    paths: Paths,
     coordinator: Arc<CoordinatorHost>,
     running: Mutex<Option<Running>>,
     log: Arc<Mutex<VecDeque<String>>>,
@@ -99,9 +93,8 @@ pub struct WorkerHost {
 }
 
 impl WorkerHost {
-    pub fn new(paths: Paths, coordinator: Arc<CoordinatorHost>) -> WorkerHost {
+    pub fn new(coordinator: Arc<CoordinatorHost>) -> WorkerHost {
         WorkerHost {
-            paths,
             coordinator,
             running: Default::default(),
             log: Default::default(),
@@ -124,12 +117,13 @@ impl WorkerHost {
         if self.coordinator.state().is_none() {
             return Err("The coordinator isn't running.".into());
         }
-        let config = WorkerConfig::new(&self.paths, settings, sidecar::find_ffmpeg().as_deref())?;
-        let token = self.coordinator.add_token(TOKEN_NAME, vec![Grant::Work]).map_err(|e| format!("Couldn't make the worker's token: {e}"))?;
-        write_atomic(&token_path(&self.paths), token.as_bytes(), true).map_err(|e| e.to_string())?;
-        let config_path = config.write(&self.paths).map_err(|e| e.to_string())?;
+        if settings.models_folder.is_none() {
+            return Err("Choose the folder of interpolation models first (Settings).".into());
+        }
+        let token = self.coordinator.add_unsaved_token(TOKEN_NAME, vec![Grant::Work])?;
+        let config = WorkerConfig::new(settings, token, sidecar::find_ffmpeg().as_deref())?;
         let cli = tool.program.clone();
-        let mut child = sidecar::spawn(&cli, &tool.arguments(["--config".into(), config_path.into()]), false)
+        let mut child = sidecar::spawn_with_input(&cli, &tool.arguments(["--config".into(), "-".into()]), false, Some(config.to_stdin()))
             .map_err(|e| format!("Couldn't start {}: {e}", cli.display()))?;
         self.push_log(format!("started {} (pid {})", cli.display(), child.pid.unwrap_or(0)));
         *self.last_exit.lock().unwrap() = None;
@@ -197,38 +191,34 @@ impl WorkerHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::set_secret;
 
     #[test]
-    fn the_config_names_files_not_secrets() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(dir.path());
+    fn the_config_goes_by_standard_input_and_names_no_server() {
         let mut settings = Settings { port: 8421, ..Settings::default() };
-        assert!(WorkerConfig::new(&paths, &settings, None).unwrap_err().contains("models"));
+        assert!(WorkerConfig::new(&settings, "t".into(), None).unwrap_err().contains("models"));
         settings.models_folder = Some("/Models/interp".into());
-        assert!(WorkerConfig::new(&paths, &settings, None).unwrap_err().contains("Jellyfin or Stash"));
         settings.jellyfin_url = Some("http://127.0.0.1:8097".into());
-        settings.stash_url = Some("http://127.0.0.1:9998".into());
-        set_secret(&paths, Server::Jellyfin, "the-jellyfin-key-0123").unwrap();
-
-        let config = WorkerConfig::new(&paths, &settings, Some(Path::new("/opt/homebrew/bin/ffmpeg"))).unwrap();
-        let written = config.write(&paths).unwrap();
-        let text = std::fs::read_to_string(&written).unwrap();
-        assert!(!text.contains("the-jellyfin-key-0123"));
-        let value: Value = serde_json::from_str(&text).unwrap();
+        let config = WorkerConfig::new(&settings, "the-run-token".into(), Some(Path::new("/opt/homebrew/bin/ffmpeg"))).unwrap();
+        let value: Value = serde_json::from_slice(&config.to_stdin()).unwrap();
         assert_eq!(value["coordinator"], "http://127.0.0.1:8421");
+        assert_eq!(value["token"], "the-run-token");
         assert_eq!(value["models"], "/Models/interp");
         assert_eq!(value["remote"], false);
         assert_eq!(value["ffmpeg"], "/opt/homebrew/bin/ffmpeg");
-        assert_eq!(value["jellyfin"]["apiKeyFile"], paths.secret(Server::Jellyfin).to_string_lossy().as_ref());
-        // Stash has no key here: none is named, and no `null` reaches the Swift decoder.
-        assert_eq!(value["stash"], json!({ "url": "http://127.0.0.1:9998" }));
+        assert!(value.get("jellyfin").is_none() && value.get("stash").is_none() && value.get("tokenFile").is_none());
         assert!(value.get("name").is_none());
-        assert_eq!(value["tokenFile"], token_path(&paths).to_string_lossy().as_ref());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&written).unwrap().permissions().mode() & 0o777, 0o600);
-        }
+        assert!(!format!("{config:?}").contains("the-run-token"));
+    }
+
+    #[test]
+    fn older_files_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path());
+        std::fs::create_dir_all(paths.worker_dir()).unwrap();
+        std::fs::write(paths.worker_dir().join("worker.token"), "old").unwrap();
+        std::fs::write(paths.worker_dir().join("worker.json"), "{}").unwrap();
+        remove_old_files(&paths);
+        assert!(!paths.worker_dir().join("worker.token").exists());
+        assert!(!paths.worker_dir().join("worker.json").exists());
     }
 }

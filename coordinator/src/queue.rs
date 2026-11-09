@@ -255,6 +255,11 @@ pub struct Lease {
     pub lease_seconds: f64,
     /// Live work: a player is waiting for it.
     pub live: bool,
+    /// The piece's server credential a player handed over, for a worker on the
+    /// paired channel or loopback ([`crate::credentials`]); a worker without one
+    /// reads with its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<crate::credentials::ServerCredential>,
 }
 
 #[derive(Clone, Debug)]
@@ -553,6 +558,7 @@ impl Queue {
             info: title.info.clone(),
             lease_seconds: length.as_secs_f64(),
             live: rank.class == 0,
+            credential: None,
         })
     }
 

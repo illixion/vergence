@@ -170,7 +170,8 @@ async fn run(config: Config) -> std::io::Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
     tracing::info!(listen = %config.listen, "serving");
-    axum::serve(listener, router)
+    // With each connection's address, so loopback callers can be told apart (`api::Caller::secure`).
+    axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })

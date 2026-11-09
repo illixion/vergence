@@ -76,12 +76,14 @@ pub trait CredentialStore: Send + Sync {
     fn remove(&self, device_id: &str) -> io::Result<bool>;
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct FileContents {
+/// What a store holds: the host's id and its devices. A [`JsonFileStore`]'s file is this as JSON,
+/// and so is the one Keychain item a `KeychainStore` keeps.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct FileContents {
     #[serde(rename = "hostID", default, skip_serializing_if = "Option::is_none")]
-    host_id: Option<String>,
+    pub(crate) host_id: Option<String>,
     #[serde(default)]
-    devices: Vec<DeviceRecord>,
+    pub(crate) devices: Vec<DeviceRecord>,
 }
 
 /// A JSON file readable by its owner only (0600 on Unix), rewritten whole on

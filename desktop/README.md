@@ -6,15 +6,19 @@ The Vergence desktop app (Tauri 2, binary `vergence-app`) for Mac and Windows. O
 - **runs the analysis coordinator** in-process: the same `vergence-coordinator` axum server
   `vergenced` runs headless, on 127.0.0.1:8420 by default (Settings can move the port, or listen on
   the network), with its store under the app-data folder;
-- **signs in to Jellyfin and Stash**: addresses in `settings.json`, API keys in `secrets/*.key`
-  (0600). The page sends a key once and only ever sees "set, ends in …abcd";
+- **keeps no media key on disk** (Compute Assist): a paired headset hands its own Jellyfin or
+  Stash sign-in over when it starts a stream, and the app holds it in memory only, forgetting it
+  12 hours after the last stream or when it quits (see "Media credentials" below). Addresses are
+  in `settings.json`; a key typed into Settings is held the same way;
 - **shows the queue** (titles with progress, leases, workers, playheads) and manages `play` and
   `work` tokens, each shown once;
 - **pairs headsets** with RAVECompanion's six-digit comparison (`vergence-companion`, port 4869,
   open only while pairing). A paired headset then reaches the coordinator over TLS-PSK on port
-  8421 (every interface, `pairedPort` in `settings.json`), keyed from its pairing: see below;
-- **runs this Mac's worker** (`vergence worker --config …`) as a child process, with a `work`
-  token it mints for it, and shows its output;
+  8421 (every interface, `pairedPort` in `settings.json`), keyed from its pairing: see below.
+  Pairings are kept in the login Keychain on a Mac and in `devices.json` (0600) on Windows and
+  Linux;
+- **runs this Mac's worker** (`vergence worker --config -`) as a child process, its config and a
+  `work` token made for this run only given on standard input (never a file), and shows its output;
 - **converts files to AI 3D**: drop videos or folders on the window, pick them, or "Open With"
   from Finder. One `vergence convert` runs at a time, its progress read from its output; the
   queue (`convert-queue.json`) survives a quit and carries on at the next start.
@@ -105,12 +109,35 @@ networks are enough for headsets to pair (4869) and reach the paired channel (84
 
 ## Tests
 
-`cargo test -p vergence-desktop` covers settings and keys, the coordinator host (health, tokens
-across restarts, a taken port), pairing a device over TCP and its token, the worker's config,
+`cargo test -p vergence-desktop` covers settings and old key files, the coordinator host (health,
+tokens across restarts, a held key surviving a restart while no file under the data folder
+contains it, a taken port), pairing a device over TCP and its token, the worker's stdin config,
 the convert command line, progress parsing and queue persistence, the sidecar's terminal and
 stop, and the updater's signature checks. `cargo test -p vergence-desktop -- --ignored
 converts_a_clip` runs a real conversion of a generated clip (needs the release CLI, ffmpeg and a
 depth model).
+
+## Media credentials
+
+The headsets hold the Jellyfin and Stash sign-ins, and share them between each other with Device
+Setup (RAVESDK's `RAVEDeviceSetup`). Compute Assist borrows one only while it works:
+
+1. When a paired headset starts a stream, its first report (`POST /v1/playing`) carries
+   `credentials: {jellyfin: {url, key}}` (or `stash`) beside the title's `media` description.
+2. The coordinator takes it only over the paired TLS-PSK channel or from this computer (a
+   loopback connection); over plain HTTP from the network it answers 403. It keeps the key in this
+   process's memory (`vergence_coordinator::credentials`), refreshed by every stream start and
+   forgotten 12 hours after the last one. The app holds it outside the coordinator, so a restart
+   for a changed setting keeps it; quitting forgets it.
+3. A worker's lease carries the credential for its piece's server, again only to a worker on the
+   paired channel or loopback, so this app's own worker reads the title with the headset's
+   sign-in. Its config names no server.
+
+Nothing secret is written under the app-data folder: no key files (an older version's `secrets/`
+folder is deleted at start), no worker token file (`worker/worker.token` likewise), and only token
+hashes in `coordinator/tokens.json`. The coordinator's plain HTTP port also turns away anything a
+web page sends: a request with an `Origin` or `Sec-Fetch-Mode` header, and every CORS preflight,
+gets 403, and no response carries an `Access-Control-Allow-*` header.
 
 ## How a paired headset reaches the coordinator
 

@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -47,6 +47,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::auth::{Grant, Tokens, token_from_headers};
+use crate::credentials::{HandedOver, HeldSummary, MediaCredentials, ServerCredential};
 use crate::paired::{PairedDevices, PairedPeer, device_name};
 use crate::queue::{AddError, AddOutcome, Claim, Queue, Title, Workload};
 use crate::source::{MediaInfo, Server, SourceRef, Sources};
@@ -65,11 +66,25 @@ pub struct AppState {
     /// Paired devices, when this coordinator has any (set once, by [`AppState::set_paired`]).
     paired: OnceLock<PairedDevices>,
     described: Mutex<HashMap<String, Instant>>,
+    /// Media credentials players handed over, in memory only ([`crate::credentials`]); shared
+    /// with whoever made the state, so a restarted coordinator in the same process keeps them.
+    credentials: SharedCredentials,
 }
 
 impl AppState {
     /// The state, with every stored title read back into the queue.
     pub fn new(store: Store, sources: Sources, workloads: Vec<Workload>, tokens: Tokens) -> std::io::Result<Arc<AppState>> {
+        Self::with_credentials(store, sources, workloads, tokens, SharedCredentials::default())
+    }
+
+    /// As [`AppState::new`], holding handed-over credentials in `credentials`.
+    pub fn with_credentials(
+        store: Store,
+        sources: Sources,
+        workloads: Vec<Workload>,
+        tokens: Tokens,
+        credentials: SharedCredentials,
+    ) -> std::io::Result<Arc<AppState>> {
         let mut queue = Queue::new();
         for (meta, done) in store.load()? {
             queue.restore(meta, &done);
@@ -82,6 +97,7 @@ impl AppState {
             tokens: RwLock::new(tokens),
             paired: OnceLock::new(),
             described: Mutex::new(HashMap::new()),
+            credentials,
         }))
     }
 
@@ -94,9 +110,34 @@ impl AppState {
     pub fn paired(&self) -> Option<&PairedDevices> {
         self.paired.get()
     }
+
+    /// Keeps a media server's credential in memory (what a player's report
+    /// does; the desktop app's window can too, for its own person).
+    pub fn hold_credential(&self, server: Server, credential: ServerCredential, from: &str) -> Result<(), &'static str> {
+        credential.check()?;
+        self.credentials.lock().expect("credentials lock").put(server, credential, from, Instant::now());
+        Ok(())
+    }
+
+    /// Forgets one server's held credential, or all of them.
+    pub fn forget_credentials(&self, server: Option<Server>) {
+        self.credentials.lock().expect("credentials lock").forget(server);
+    }
+
+    /// The held credentials, without their keys.
+    pub fn held_credentials(&self) -> Vec<HeldSummary> {
+        self.credentials.lock().expect("credentials lock").summary(Instant::now())
+    }
+
+    fn held(&self, server: Server) -> Option<ServerCredential> {
+        self.credentials.lock().expect("credentials lock").get(server, Instant::now())
+    }
 }
 
 pub type Shared = Arc<AppState>;
+
+/// The in-memory credential holder, for an app that restarts its coordinator in-process.
+pub type SharedCredentials = Arc<Mutex<MediaCredentials>>;
 
 #[derive(Debug)]
 pub struct ApiError(StatusCode, String);
@@ -116,10 +157,23 @@ type ApiResult<T> = Result<T, ApiError>;
 /// Who a request comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Caller {
-    /// Plain HTTP, with the token it sent (if any).
-    Token(Option<String>),
+    /// Plain HTTP, with the token it sent (if any), and whether it came over
+    /// loopback (from this computer).
+    Token(Option<String>, bool),
     /// A paired device on the TLS-PSK channel.
     Device(String),
+}
+
+impl Caller {
+    /// Whether media credentials may travel to or from this caller: the paired
+    /// TLS-PSK channel, or plain HTTP that never left this computer. Never
+    /// plain HTTP across a network.
+    pub fn secure(&self) -> bool {
+        match self {
+            Caller::Device(_) => true,
+            Caller::Token(_, local) => *local,
+        }
+    }
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for Caller {
@@ -128,7 +182,12 @@ impl<S: Send + Sync> FromRequestParts<S> for Caller {
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         Ok(match parts.extensions.get::<PairedPeer>() {
             Some(peer) => Caller::Device(peer.device_id.clone()),
-            None => Caller::Token(token_from_headers(&parts.headers)),
+            None => {
+                // Only a server started with `into_make_service_with_connect_info` says where a
+                // connection came from; without it, nothing counts as loopback.
+                let local = parts.extensions.get::<ConnectInfo<std::net::SocketAddr>>().is_some_and(|c| c.0.ip().is_loopback());
+                Caller::Token(token_from_headers(&parts.headers), local)
+            }
         })
     }
 }
@@ -145,8 +204,8 @@ fn authorize(state: &AppState, caller: &Caller, grant: Grant) -> ApiResult<Strin
             let grants = state.paired().and_then(|d| d.grants(id)).ok_or_else(|| err(StatusCode::FORBIDDEN, "this device isn't paired"))?;
             holds(&grants, grant).then(|| device_name(id)).ok_or_else(refused)
         }
-        Caller::Token(None) => Err(err(StatusCode::UNAUTHORIZED, "a token is needed")),
-        Caller::Token(Some(token)) => {
+        Caller::Token(None, _) => Err(err(StatusCode::UNAUTHORIZED, "a token is needed")),
+        Caller::Token(Some(token), _) => {
             if let Some(name) = state.tokens.read().expect("tokens lock").check(token, grant) {
                 return Ok(name.to_string());
             }
@@ -174,13 +233,15 @@ impl AppState {
     /// The title's key, describing it first if it is new or its description
     /// is old (a replaced file resets its results).
     ///
-    /// A server the coordinator has a key for describes the title itself,
-    /// and that answer is the one used. With no key for that server, the
-    /// coordinator holds no media credentials at all and takes what the
-    /// player sent (`supplied`): the player is already playing the file, so
-    /// it knows its timing and identity. A player's numbers are checked for
-    /// sense ([`check_supplied`]); a worker still corrects the end of the
-    /// video, and checks every piece it makes.
+    /// What the player sent (`supplied`) comes first: it is already playing
+    /// the file, so it knows the timing and identity without a round trip to
+    /// the server, and a source with no server API to ask (YouTube) can only
+    /// be described this way. Its numbers are checked for sense
+    /// ([`check_supplied`]); a worker still corrects the end of the video and
+    /// checks every piece it makes. Without one, the coordinator asks the
+    /// server itself: with a key its configuration names (headless
+    /// `vergenced`), else with a credential a player handed over
+    /// ([`crate::credentials`]).
     pub async fn ensure_title(&self, source: &SourceRef, workload: &Workload, supplied: Option<MediaInfo>) -> ApiResult<String> {
         let key = Title::key_for(source, &workload.name);
         let fresh = self.described.lock().expect("described lock").get(&key).is_some_and(|t| t.elapsed() < DESCRIBE_EVERY);
@@ -188,14 +249,16 @@ impl AppState {
         if known && fresh {
             return Ok(key);
         }
-        let described = match (self.sources.has(source.server), supplied) {
-            (true, _) => self.sources.describe(source).await.map_err(|e| e.to_string()),
-            (false, Some(info)) => check_supplied(info),
-            (false, None) if known => return Ok(key),
-            (false, None) => {
+        let held = if supplied.is_none() && !self.sources.has(source.server) { self.held(source.server) } else { None };
+        let described = match (supplied, held) {
+            (Some(info), _) => check_supplied(info),
+            (None, _) if self.sources.has(source.server) => self.sources.describe(source).await.map_err(|e| e.to_string()),
+            (None, Some(credential)) => Sources::describe_with(source, &credential).await.map_err(|e| e.to_string()),
+            (None, None) if known => return Ok(key),
+            (None, None) => {
                 return Err(err(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    "this coordinator holds no key for that server: send the title's `media` (duration, frame rate, stereo layout, identity)",
+                    "the coordinator can't describe this title: send its `media`, or `credentials` for its server",
                 ));
             }
         };
@@ -254,6 +317,19 @@ impl AppState {
     }
 }
 
+/// Keeps what a player handed over, if it came over a channel credentials may
+/// travel on. Nothing about them is logged but which servers.
+fn take_credentials(state: &AppState, caller: &Caller, from: &str, handed: HandedOver) -> ApiResult<()> {
+    if !caller.secure() {
+        return Err(err(StatusCode::FORBIDDEN, "credentials are taken only over the paired channel or from this computer"));
+    }
+    for (server, credential) in handed.entries() {
+        state.hold_credential(server, credential, from).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        tracing::info!(server = server.name(), %from, "holding a media credential in memory");
+    }
+    Ok(())
+}
+
 /// A player's description of a title, checked for sense: a wrong number must
 /// not make a grid of millions of pieces, or none.
 fn check_supplied(info: MediaInfo) -> Result<MediaInfo, String> {
@@ -299,7 +375,26 @@ pub fn router(state: Shared) -> Router {
         .route("/SmoothMotion/{item}/Analyze", post(compat_analyze))
         .route("/SmoothMotion/{item}/Chunks/{n}", get(compat_chunk))
         .layer(DefaultBodyLimit::max(track::MAX_RECORD_BYTES))
+        .layer(axum::middleware::from_fn(refuse_browsers))
         .with_state(state)
+}
+
+/// Turns away anything a web page sends. Players, workers and the Jellyfin
+/// plugin are not browsers and send no `Origin`; a browser adds one to every
+/// cross-origin request and to its CORS preflight (`OPTIONS`), and since no
+/// response carries `Access-Control-Allow-Origin` or `-Headers`, a page could
+/// not read an answer or send a bearer token anyway. Refusing them outright
+/// also stops a page's "simple" POSTs, which a browser sends without asking,
+/// and a DNS-rebinding page, which still names its own origin on a POST.
+async fn refuse_browsers(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let headers = request.headers();
+    let from_a_page = headers.contains_key(header::ORIGIN)
+        || headers.contains_key("sec-fetch-mode")
+        || request.method() == axum::http::Method::OPTIONS;
+    if from_a_page {
+        return err(StatusCode::FORBIDDEN, "not for web pages").into_response();
+    }
+    next.run(request).await
 }
 
 #[derive(Deserialize)]
@@ -321,6 +416,11 @@ struct Playing {
     /// this server: see [`AppState::ensure_title`].
     #[serde(default)]
     media: Option<MediaInfo>,
+    /// The player's own sign-in for the title's server, handed over when a
+    /// stream starts and kept in memory only ([`crate::credentials`]).
+    /// Accepted only over the paired channel or loopback.
+    #[serde(default)]
+    credentials: Option<HandedOver>,
 }
 
 fn one() -> f64 {
@@ -336,6 +436,9 @@ async fn playing(State(state): State<Shared>, caller: Caller, Json(body): Json<P
     }
     let source = source_ref(&body.server, &body.id)?;
     let workload = state.workload(body.workload.as_deref().unwrap_or(Workload::SMOOTH_MOTION_3D))?;
+    if let Some(handed) = body.credentials {
+        take_credentials(&state, &caller, &name, handed)?;
+    }
     let key = state.ensure_title(&source, &workload, body.media).await?;
     state.queue.lock().expect("queue lock").report_playhead(&player, &key, body.seconds, body.rate, Instant::now());
     Ok(Json(state.status_json(&key)).into_response())
@@ -359,6 +462,8 @@ async fn title_status(
 struct EnqueueBody {
     #[serde(default)]
     media: Option<MediaInfo>,
+    #[serde(default)]
+    credentials: Option<HandedOver>,
 }
 
 async fn enqueue(
@@ -367,15 +472,17 @@ async fn enqueue(
     Path((server, id, workload)): Path<(String, String, String)>,
     body: Bytes,
 ) -> ApiResult<Response> {
-    authorize(&state, &caller, Grant::Play)?;
+    let name = authorize(&state, &caller, Grant::Play)?;
     let workload = state.workload(&workload)?;
-    let media = if body.iter().all(u8::is_ascii_whitespace) {
+    let body = if body.iter().all(u8::is_ascii_whitespace) {
         None
     } else {
-        serde_json::from_slice::<Option<EnqueueBody>>(&body)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
-            .and_then(|b| b.media)
+        serde_json::from_slice::<Option<EnqueueBody>>(&body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
     };
+    let (media, credentials) = body.map(|b| (b.media, b.credentials)).unwrap_or_default();
+    if let Some(handed) = credentials {
+        take_credentials(&state, &caller, &name, handed)?;
+    }
     let key = state.ensure_title(&source_ref(&server, &id)?, &workload, media).await?;
     Ok((StatusCode::ACCEPTED, Json(state.status_json(&key))).into_response())
 }
@@ -428,7 +535,11 @@ async fn queue_view(State(state): State<Shared>, caller: Caller) -> ApiResult<Re
 pub async fn scan_now(state: &AppState) -> serde_json::Value {
     let mut added = 0;
     let mut problems = Vec::new();
-    for (source, listed) in state.sources.list_3d().await {
+    let sources = match state.sources.or_held(state.held(Server::Jellyfin), state.held(Server::Stash)) {
+        Ok(sources) => sources,
+        Err(e) => return json!({ "titles": 0, "problems": [e.to_string()] }),
+    };
+    for (source, listed) in sources.list_3d().await {
         if let Err(e) = listed {
             problems.push(format!("{}: {e}", source.server.name()));
             continue;
@@ -462,7 +573,12 @@ async fn claim(State(state): State<Shared>, caller: Caller, Json(mut body): Json
     let token = authorize(&state, &caller, Grant::Work)?;
     body.worker = worker_name(&token, Some(&body.worker));
     let lease = state.queue.lock().expect("queue lock").claim(&body, Instant::now());
-    let Some(lease) = lease else { return Ok(StatusCode::NO_CONTENT.into_response()) };
+    let Some(mut lease) = lease else { return Ok(StatusCode::NO_CONTENT.into_response()) };
+    // A handed-over credential goes on to the worker that reads the piece, over the
+    // same kinds of channel it arrived on; a worker elsewhere uses its own.
+    if caller.secure() {
+        lease.credential = state.held(lease.source.server);
+    }
     // The first lease of a title fixes its profile.
     state.save_meta(&lease.title)?;
     tracing::debug!(title = %lease.title, piece = lease.piece, worker = %body.worker, live = lease.live, "leased");

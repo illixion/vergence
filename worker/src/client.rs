@@ -56,6 +56,22 @@ pub struct Lease {
     pub info: Info,
     pub lease_seconds: f64,
     pub live: bool,
+    /// The piece's server credential a player handed to the coordinator, for a worker on
+    /// loopback or the paired channel; read with it instead of the config's own.
+    #[serde(default)]
+    pub credential: Option<Credential>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct Credential {
+    pub url: String,
+    pub key: String,
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential").field("url", &self.url).field("key", &"<redacted>").finish()
+    }
 }
 
 fn default_workload() -> String {
@@ -181,6 +197,10 @@ mod tests {
             },
             lease_seconds: 120.0,
             live: true,
+            credential: Some(vergence_coordinator::credentials::ServerCredential {
+                url: "https://media.example/jellyfin".into(),
+                key: "players-token".into(),
+            }),
         };
         let lease: Lease = serde_json::from_str(&serde_json::to_string(&theirs).unwrap()).unwrap();
         assert_eq!((lease.lease, lease.piece, lease.first_frame, lease.end_frame), (7, 3, 144, 192));
@@ -190,5 +210,8 @@ mod tests {
         assert_eq!(lease.info.stereo, "halfSideBySide");
         assert_eq!(lease.info.media_source_id.as_deref(), Some("abc"));
         assert!(lease.live);
+        let credential = lease.credential.expect("the lease's credential");
+        assert_eq!((credential.url.as_str(), credential.key.as_str()), ("https://media.example/jellyfin", "players-token"));
+        assert!(!format!("{credential:?}").contains("players-token"));
     }
 }

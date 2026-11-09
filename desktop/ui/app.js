@@ -334,8 +334,9 @@ $("devices").addEventListener("click", async (e) => {
 let loaded = null;
 
 function keyPlaceholder(hint) {
-  if (!hint.set) return "Not set";
-  return hint.endsWith ? `Set, ends in …${hint.endsWith} (type to replace)` : "Set (type to replace)";
+  if (!hint.set) return "None held (a headset hands its own over when it plays)";
+  const hours = Math.max(1, Math.round((hint.secondsLeft || 0) / 3600));
+  return `Held in memory from ${hint.from}, for about ${hours} h more (type to replace)`;
 }
 
 async function loadSettings() {
@@ -460,7 +461,7 @@ for (const [prefix, server] of [["jf", "jellyfin"], ["st", "stash"]]) {
     }
   });
   $(`${prefix}-forget`).addEventListener("click", async () => {
-    if (!confirm(`Remove the ${server} key?`)) return;
+    if (!confirm(`Forget the ${server} sign-in this app holds?`)) return;
     await saveSettings({ [server]: "" }).catch(() => {});
   });
 }

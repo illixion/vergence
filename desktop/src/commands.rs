@@ -14,7 +14,7 @@ use vergence_coordinator::auth::Grant;
 use crate::convert::{ConvertOptions, ConvertQueue};
 use crate::coordinator::CoordinatorHost;
 use crate::pairing::Pairing;
-use crate::settings::{Paths, Server, Settings, key_hint, set_secret};
+use crate::settings::{Paths, Server, Settings, key_hint};
 use crate::updater::Updates;
 use crate::worker::WorkerHost;
 use crate::{sidecar, tray};
@@ -35,10 +35,13 @@ type Reply = Result<Value, String>;
 impl App {
     pub fn new(paths: Paths) -> App {
         let settings = Arc::new(Mutex::new(Settings::load(&paths)));
-        let coordinator = Arc::new(CoordinatorHost::new(paths.clone()));
+        // Older versions kept media keys and the worker's token in files: no longer.
+        crate::settings::remove_old_secrets(&paths);
+        crate::worker::remove_old_files(&paths);
+        let coordinator = Arc::new(CoordinatorHost::with_devices(paths.clone(), crate::coordinator::device_store(&paths)));
         App {
             pairing: Arc::new(Pairing::new(paths.clone(), coordinator.clone())),
-            worker: Arc::new(WorkerHost::new(paths.clone(), coordinator.clone())),
+            worker: Arc::new(WorkerHost::new(coordinator.clone())),
             convert: Arc::new(ConvertQueue::new(paths.convert_queue(), settings.clone())),
             settings,
             coordinator,
@@ -66,10 +69,11 @@ impl App {
 
     fn settings_view(&self, app: &AppHandle) -> Value {
         let settings = self.settings();
+        let held = self.coordinator.held_credentials();
         json!({
             "settings": settings,
-            "jellyfinKey": key_hint(&self.paths, Server::Jellyfin),
-            "stashKey": key_hint(&self.paths, Server::Stash),
+            "jellyfinKey": key_hint(&held, Server::Jellyfin),
+            "stashKey": key_hint(&held, Server::Stash),
             "cli": sidecar::find_tool(&settings, sidecar::ToolKind::Convert).map(|t| t.program.to_string_lossy().into_owned()),
             "ffmpeg": sidecar::find_ffmpeg().map(|p| p.to_string_lossy().into_owned()),
             "launchAtLogin": app.autolaunch().is_enabled().unwrap_or(false),
@@ -111,7 +115,8 @@ pub fn get_settings(app: AppHandle, state: Shared<'_>) -> Value {
     state.settings_view(&app)
 }
 
-/// Saves the settings. A key that is `None` stays as it is; an empty one is removed.
+/// Saves the settings. A key that is `None` stays as it is; an empty one is forgotten. A key is
+/// held in memory only, for the server's address in the settings, as a headset's would be.
 #[tauri::command]
 pub async fn save_settings(
     app: AppHandle,
@@ -122,8 +127,13 @@ pub async fn save_settings(
 ) -> Reply {
     let settings = settings.normalized()?;
     for (server, key) in [(Server::Jellyfin, jellyfin_key), (Server::Stash, stash_key)] {
-        if let Some(key) = key {
-            set_secret(&state.paths, server, &key).map_err(|e| format!("Couldn't keep the {} key: {e}", server.name()))?;
+        match key.as_deref().map(str::trim) {
+            None => {}
+            Some("") => state.coordinator.forget_credential(Some(server)),
+            Some(key) => {
+                let url = settings.url(server).ok_or_else(|| format!("Add the {} server's address with its key.", server.name()))?;
+                state.coordinator.hold_credential(server, url, key)?;
+            }
         }
     }
     settings.save(&state.paths).map_err(|e| format!("Couldn't save the settings: {e}"))?;
@@ -141,12 +151,17 @@ pub async fn save_settings(
     Ok(view)
 }
 
-/// Asks a server who it is, with the stored key: the sign-in check.
+/// Asks a server who it is, with the credential held for it: the sign-in check.
 #[tauri::command]
 pub async fn test_server(state: Shared<'_>, server: Server) -> Reply {
+    let held = state.coordinator.held_credential(server);
     let settings = state.settings();
-    let url = settings.url(server).ok_or("Save the server's address first.")?.to_string();
-    let key = std::fs::read_to_string(state.paths.secret(server)).ok().map(|k| k.trim().to_string());
+    let url = match (&held, settings.url(server)) {
+        (Some(held), _) => held.url.clone(),
+        (None, Some(url)) => url.to_string(),
+        (None, None) => return Err("No sign-in is held for this server: play something from a headset, or add its address and key.".into()),
+    };
+    let key = held.map(|h| h.key);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .user_agent(concat!("Vergence/", env!("CARGO_PKG_VERSION")))

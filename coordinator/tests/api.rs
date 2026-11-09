@@ -77,6 +77,52 @@ fn media(identity: &str) -> Value {
 }
 
 #[tokio::test]
+async fn a_handed_over_credential_describes_the_title_and_reaches_only_local_workers() {
+    let h = keyless_harness().await;
+    let url = mock_jellyfin("etag-h").await;
+    let report = json!({"server": "jellyfin", "id": ITEM, "seconds": 1.0,
+                        "credentials": {"jellyfin": {"url": url, "key": "the-players-token"}}});
+    // Over plain HTTP from the network, credentials are refused.
+    let (status, _) = h.json_from("192.168.1.20:50000", "POST", "/v1/playing", &h.play, report.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = h.json("POST", "/v1/playing", &h.play, report.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // From this computer they are kept, and describe the title without `media`.
+    let (status, body) = h.json_from("127.0.0.1:50000", "POST", "/v1/playing", &h.play, report).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pieces"], 3);
+    // A worker on the network gets its lease without the credential; one on loopback gets it.
+    let claim = json!({"worker": "gpu0", "models": {"flowPair": "RIFE 480x288", "disparity": "NeuFlow 512x288"}});
+    let (status, remote) = h.json_from("192.168.1.30:50000", "POST", "/v1/work/claim", &h.work, claim.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(remote.get("credential").is_none(), "{remote}");
+    let (status, local) = h.json_from("127.0.0.1:50001", "POST", "/v1/work/claim", &h.work, claim).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(local["credential"]["key"], "the-players-token");
+    assert_eq!(local["credential"]["url"], url);
+}
+
+#[tokio::test]
+async fn web_pages_are_turned_away() {
+    let h = keyless_harness().await;
+    let request = |method: &str, origin: Option<&str>| {
+        let mut builder = Request::builder().method(method).uri("/v1/health");
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    let call = |r| async { h.app.clone().oneshot(r).await.unwrap() };
+    assert_eq!(call(request("GET", None)).await.status(), StatusCode::OK);
+    let page = call(request("GET", Some("https://evil.example"))).await;
+    assert_eq!(page.status(), StatusCode::FORBIDDEN);
+    assert!(page.headers().keys().all(|k| !k.as_str().starts_with("access-control-")));
+    let preflight = call(request("OPTIONS", Some("https://evil.example"))).await;
+    assert_eq!(preflight.status(), StatusCode::FORBIDDEN);
+    assert!(preflight.headers().keys().all(|k| !k.as_str().starts_with("access-control-")));
+}
+
+#[tokio::test]
 async fn without_a_key_the_player_describes_the_title() {
     let h = keyless_harness().await;
     let report = |media: Option<Value>| {
@@ -113,17 +159,38 @@ async fn without_a_key_the_player_describes_the_title() {
 
 impl Harness {
     async fn send(&self, method: &str, uri: &str, token: &str, body: Body) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
-        let request = Request::builder()
+        self.send_from(None, method, uri, token, body).await
+    }
+
+    /// As a connection from `peer` would arrive (what `into_make_service_with_connect_info` adds).
+    async fn send_from(
+        &self,
+        peer: Option<&str>,
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Body,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut request = Request::builder()
             .method(method)
             .uri(uri)
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
             .body(body)
             .unwrap();
+        if let Some(peer) = peer {
+            let address: std::net::SocketAddr = peer.parse().unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(address));
+        }
         let response = self.app.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();
         (status, headers, to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec())
+    }
+
+    async fn json_from(&self, peer: &str, method: &str, uri: &str, token: &str, body: Value) -> (StatusCode, Value) {
+        let (status, _, bytes) = self.send_from(Some(peer), method, uri, token, Body::from(body.to_string())).await;
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
     async fn json(&self, method: &str, uri: &str, token: &str, body: Value) -> (StatusCode, Value) {

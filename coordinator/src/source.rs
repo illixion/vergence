@@ -388,7 +388,27 @@ pub struct Sources {
     pub stash: Option<Stash>,
 }
 
+/// The HTTP client every source adapter uses.
+pub fn http_client() -> std::io::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(concat!("vergenced/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(std::io::Error::other)
+}
+
 impl Sources {
+    /// Describes a title with a credential a player handed over
+    /// ([`crate::credentials`]), for a server the configuration names no key for.
+    pub async fn describe_with(source: &SourceRef, credential: &crate::credentials::ServerCredential) -> Result<MediaInfo, SourceError> {
+        let config = ServerConfig { url: credential.url.clone(), api_key: Some(credential.key.clone()), api_key_file: None };
+        let http = http_client().map_err(|e| SourceError::Shape(e.to_string()))?;
+        match source.server {
+            Server::Jellyfin => Jellyfin::new(&config, http).map_err(|e| SourceError::Shape(e.to_string()))?.describe(&source.id).await,
+            Server::Stash => Stash::new(&config, http).map_err(|e| SourceError::Shape(e.to_string()))?.describe(&source.id).await,
+        }
+    }
+
     /// Whether the coordinator holds a key for `server` and so describes its titles itself.
     pub fn has(&self, server: Server) -> bool {
         match server {
@@ -402,6 +422,27 @@ impl Sources {
             Server::Jellyfin => self.jellyfin.as_ref().ok_or(SourceError::NotConfigured("Jellyfin"))?.describe(&source.id).await,
             Server::Stash => self.stash.as_ref().ok_or(SourceError::NotConfigured("Stash"))?.describe(&source.id).await,
         }
+    }
+
+    /// These sources, with a handed-over credential standing in for each server the
+    /// configuration names no key for (so a keyless coordinator can still scan while it holds one).
+    pub fn or_held(
+        &self,
+        jellyfin: Option<crate::credentials::ServerCredential>,
+        stash: Option<crate::credentials::ServerCredential>,
+    ) -> std::io::Result<Sources> {
+        let config = |c: crate::credentials::ServerCredential| ServerConfig { url: c.url, api_key: Some(c.key), api_key_file: None };
+        let jellyfin = match (&self.jellyfin, jellyfin) {
+            (Some(j), _) => Some(j.clone()),
+            (None, Some(c)) => Some(Jellyfin::new(&config(c), http_client()?)?),
+            (None, None) => None,
+        };
+        let stash = match (&self.stash, stash) {
+            (Some(s), _) => Some(s.clone()),
+            (None, Some(c)) => Some(Stash::new(&config(c), http_client()?)?),
+            (None, None) => None,
+        };
+        Ok(Sources { jellyfin, stash })
     }
 
     pub async fn list_3d(&self) -> Vec<(SourceRef, Result<(), SourceError>)> {

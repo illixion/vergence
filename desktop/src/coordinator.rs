@@ -7,8 +7,14 @@
 //! state directly, so it needs no admin token of its own.
 //!
 //! Paired headsets reach the same API over TLS-PSK on the paired port (8421 by default, every
-//! interface, `vergence_coordinator::paired`), keyed from the pairings in `devices.json`; plain
-//! HTTP with tokens stays on the coordinator's port.
+//! interface, `vergence_coordinator::paired`), keyed from their pairings: in the login Keychain
+//! on a Mac, `devices.json` (0600) elsewhere ([`DeviceStore`]). Plain HTTP with tokens stays on
+//! the coordinator's port, for scripts and this app's own worker.
+//!
+//! **No media credential is kept on disk.** A headset hands its Jellyfin or Stash sign-in over
+//! when it starts a stream, and the coordinator holds it in this process's memory only
+//! (`vergence_coordinator::credentials`), here outside any one run of the coordinator so a
+//! restart (a changed setting) keeps it; quitting the app forgets it.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,13 +23,40 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use vergence_coordinator::api::{self, AppState};
+use vergence_companion::CredentialStore;
+use vergence_coordinator::api::SharedCredentials;
 use vergence_coordinator::auth::{Grant, TokenEntry, Tokens};
 use vergence_coordinator::config::Config;
+use vergence_coordinator::credentials::{HeldSummary, ServerCredential};
 use vergence_coordinator::paired::{self, PairedDevices};
 use vergence_coordinator::queue::Workload;
 use vergence_coordinator::store::Store;
 
-use crate::settings::{Paths, Server, Settings, server_config, write_atomic};
+use crate::settings::{Paths, Server, Settings, write_atomic};
+
+/// Where paired devices are kept: shared by pairing (which writes) and the coordinator's paired
+/// channel (which reads).
+pub type DeviceStore = Arc<dyn CredentialStore>;
+
+/// The login Keychain on a Mac (moving an older `devices.json` in), `devices.json` elsewhere.
+pub fn device_store(paths: &Paths) -> DeviceStore {
+    #[cfg(target_os = "macos")]
+    {
+        // One item per app-data folder, so a second copy (`VERGENCE_APP_DATA`) pairs on its own.
+        let account = format!("paired-devices {}", paths.root.display());
+        let store = vergence_companion::KeychainStore::new("com.illixion.vergence.desktop", account);
+        match store.import_file(&paths.devices()) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(devices = n, "moved paired devices from devices.json into the Keychain"),
+            Err(e) => tracing::warn!(error = %e, "couldn't move devices.json into the Keychain"),
+        }
+        Arc::new(store)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Arc::new(vergence_companion::JsonFileStore::new(paths.devices()))
+    }
+}
 
 struct Running {
     state: Arc<AppState>,
@@ -39,6 +72,9 @@ struct Running {
 
 pub struct CoordinatorHost {
     paths: Paths,
+    devices: DeviceStore,
+    /// Handed-over media credentials, in memory only, across coordinator restarts.
+    credentials: SharedCredentials,
     running: tokio::sync::Mutex<Option<Running>>,
     /// The state, for synchronous readers (commands, the tray).
     state: Mutex<Option<(Arc<AppState>, String)>>,
@@ -48,9 +84,18 @@ pub struct CoordinatorHost {
 }
 
 impl CoordinatorHost {
+    /// A host keeping paired devices in `devices.json` (tests; see [`CoordinatorHost::with_devices`]).
+    #[cfg(test)]
     pub fn new(paths: Paths) -> CoordinatorHost {
+        let devices: DeviceStore = Arc::new(vergence_companion::JsonFileStore::new(paths.devices()));
+        Self::with_devices(paths, devices)
+    }
+
+    pub fn with_devices(paths: Paths, devices: DeviceStore) -> CoordinatorHost {
         CoordinatorHost {
             paths,
+            devices,
+            credentials: SharedCredentials::default(),
             running: Default::default(),
             state: Default::default(),
             error: Default::default(),
@@ -64,8 +109,9 @@ impl CoordinatorHost {
             listen: settings.listen(),
             store: self.paths.store(),
             tokens_file: Some(self.paths.tokens()),
-            jellyfin: server_config(&self.paths, settings, Server::Jellyfin),
-            stash: server_config(&self.paths, settings, Server::Stash),
+            // No keys: titles are described from what players send, or with what they hand over.
+            jellyfin: None,
+            stash: None,
             workloads: Workload::defaults(),
             scan_every_minutes: settings.scan.then(|| u64::from(settings.scan_every_hours.max(1)) * 60),
             paired_listen: Some(settings.paired_listen()),
@@ -109,8 +155,9 @@ impl CoordinatorHost {
         let store = Store::open(&config.store).map_err(|e| format!("The coordinator's store: {e}"))?;
         let tokens = Tokens::load(&config.tokens_path()).map_err(|e| format!("The coordinator's tokens: {e}"))?;
         let sources = config.sources().map_err(|e| format!("A media server's key couldn't be read: {e}"))?;
-        let state = AppState::new(store, sources, config.workloads.clone(), tokens).map_err(|e| format!("The coordinator's store: {e}"))?;
-        let devices = PairedDevices::open(config.devices_path());
+        let state = AppState::with_credentials(store, sources, config.workloads.clone(), tokens, self.credentials.clone())
+            .map_err(|e| format!("The coordinator's store: {e}"))?;
+        let devices = PairedDevices::from_store(self.devices.clone());
         state.set_paired(devices.clone());
         let mut chores = Vec::new();
         {
@@ -141,7 +188,9 @@ impl CoordinatorHost {
                 let listen = config.listen.clone();
                 let server = tokio::spawn(async move {
                     tracing::info!(%listen, "coordinator serving");
-                    let result = axum::serve(listener, router)
+                    // With each connection's address, so the app's own worker on loopback can be
+                    // given handed-over credentials (`api::Caller::secure`) and the network can't.
+                    let result = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
                         .with_graceful_shutdown(async {
                             let _ = rx.await;
                         })
@@ -262,6 +311,40 @@ impl CoordinatorHost {
         .map_err(|e| e.to_string())
     }
 
+    /// A token for this run of the coordinator only, its hash never written (the app's worker).
+    pub fn add_unsaved_token(&self, name: &str, grants: Vec<Grant>) -> Result<String, String> {
+        let state = self.require()?;
+        let token = state.tokens.write().unwrap().add_unsaved(name, grants);
+        Ok(token)
+    }
+
+    pub fn devices(&self) -> DeviceStore {
+        self.devices.clone()
+    }
+
+    /// Holds a media credential in memory (typed into the window; headsets hand theirs over).
+    pub fn hold_credential(&self, server: Server, url: &str, key: &str) -> Result<(), String> {
+        let credential = ServerCredential { url: url.trim().trim_end_matches('/').to_string(), key: key.trim().to_string() };
+        credential.check()?;
+        let mut held = self.credentials.lock().unwrap();
+        held.put(coordinator_server(server), credential, "this computer", Instant::now());
+        Ok(())
+    }
+
+    pub fn forget_credential(&self, server: Option<Server>) {
+        self.credentials.lock().unwrap().forget(server.map(coordinator_server));
+    }
+
+    /// The held credentials, without keys.
+    pub fn held_credentials(&self) -> Vec<HeldSummary> {
+        self.credentials.lock().unwrap().summary(Instant::now())
+    }
+
+    /// One server's held credential, for the window's sign-in check.
+    pub fn held_credential(&self, server: Server) -> Option<ServerCredential> {
+        self.credentials.lock().unwrap().get(coordinator_server(server), Instant::now())
+    }
+
     pub fn remove_token(&self, name: &str) -> Result<bool, String> {
         match self.state() {
             Some(state) => state.tokens.write().unwrap().remove(name),
@@ -286,6 +369,13 @@ impl CoordinatorHost {
             *tokens = Tokens::load(&path).map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+}
+
+fn coordinator_server(server: Server) -> vergence_coordinator::source::Server {
+    match server {
+        Server::Jellyfin => vergence_coordinator::source::Server::Jellyfin,
+        Server::Stash => vergence_coordinator::source::Server::Stash,
     }
 }
 
@@ -316,6 +406,42 @@ mod tests {
 
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// Every file under `dir`, read whole.
+    fn all_files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(all_files(&path));
+            } else {
+                found.push((path.clone(), std::fs::read(&path).unwrap()));
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn media_keys_stay_in_memory_across_a_restart_and_never_reach_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(CoordinatorHost::new(Paths::new(dir.path())));
+        let settings = Settings { port: free_port(), paired_port: free_port(), ..Settings::default() };
+        host.start(&settings).await.unwrap();
+        let key = "a-jellyfin-token-never-on-disk";
+        host.hold_credential(Server::Jellyfin, "http://127.0.0.1:8097/", key).unwrap();
+        let worker = host.add_unsaved_token("this-computer-worker", vec![Grant::Work]).unwrap();
+        host.start(&settings).await.unwrap();
+        let held = host.held_credential(Server::Jellyfin).expect("still held after a restart");
+        assert_eq!((held.url.as_str(), held.key.as_str()), ("http://127.0.0.1:8097", key));
+        assert_eq!(host.held_credentials()[0].from, "this computer");
+        for (path, bytes) in all_files(dir.path()) {
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(key) && !text.contains(&worker), "{} holds a secret", path.display());
+        }
+        host.forget_credential(None);
+        assert!(host.held_credential(Server::Jellyfin).is_none());
+        assert!(host.hold_credential(Server::Stash, "ftp://nope", "k").is_err());
     }
 
     #[tokio::test]

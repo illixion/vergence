@@ -5620,6 +5620,7 @@ dependencies = [
  "openssl",
  "percent-encoding",
  "rand_core 0.6.4",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",

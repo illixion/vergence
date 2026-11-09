@@ -74,11 +74,7 @@ impl Config {
     }
 
     pub fn sources(&self) -> std::io::Result<Sources> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("vergenced/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(std::io::Error::other)?;
+        let http = crate::source::http_client()?;
         Ok(Sources {
             jellyfin: self.jellyfin.as_ref().map(|c| Jellyfin::new(c, http.clone())).transpose()?,
             stash: self.stash.as_ref().map(|c| Stash::new(c, http.clone())).transpose()?,

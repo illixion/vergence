@@ -130,6 +130,15 @@ struct WorkLease: Decodable {
     var info: Info
     var leaseSeconds: Double
     var live: Bool
+    /// The piece's server credential a player handed to the coordinator, for a worker on
+    /// loopback or the paired channel; read with it instead of the config's own.
+    var credential: Credential?
+
+    struct Credential: Decodable, CustomStringConvertible {
+        var url: String
+        var key: String
+        var description: String { "Credential(url: \(url), key: <redacted>)" }
+    }
 }
 
 struct WorkerFailure: Error, CustomStringConvertible {
@@ -164,7 +173,12 @@ func runWorker(_ args: [String]) async throws {
         i += 1
     }
     guard let configPath else { usage("worker needs --config FILE") }
-    let config = try JSONDecoder().decode(WorkerConfig.self, from: Data(contentsOf: URL(fileURLWithPath: expandTilde(configPath))))
+    // `-` reads it from standard input: how the desktop app starts its worker, with the token
+    // inline, so nothing secret is written to a file.
+    let configData = configPath == "-"
+        ? FileHandle.standardInput.readDataToEndOfFile()
+        : try Data(contentsOf: URL(fileURLWithPath: expandTilde(configPath)))
+    let config = try JSONDecoder().decode(WorkerConfig.self, from: configData)
     if let reference {
         guard let workload, let output else { usage("--reference needs --workload and --output") }
         let producers = try await makeProducers(config)
@@ -356,20 +370,31 @@ final class AnalysisWorker: @unchecked Sendable {
 
     // MARK: Media
 
-    /// The piece's URL on its server and the header that authorizes it.
+    /// The piece's URL on its server and the header that authorizes it: with the credential the
+    /// lease carries (a player's, held in the coordinator's memory), else the config's own.
     func mediaRequest(_ lease: WorkLease) throws -> (URL, [String: String]) {
+        func server(_ configured: WorkerConfig.Server?, _ name: String) throws -> (url: String, key: String?) {
+            if let credential = lease.credential { return (credential.url, credential.key) }
+            guard let configured else { throw WorkerFailure("no \(name) in the worker's config, and the lease carries no credential") }
+            return (configured.url, try configured.key())
+        }
         switch lease.source.server {
         case "jellyfin":
-            guard let server = config.jellyfin else { throw WorkerFailure("no Jellyfin in the worker's config") }
-            var components = URLComponents(string: server.url.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/Videos/\(lease.source.id)/stream")!
+            let (base, key) = try server(config.jellyfin, "Jellyfin")
+            guard var components = URLComponents(string: base.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/Videos/\(lease.source.id)/stream") else {
+                throw WorkerFailure("the Jellyfin address isn't a URL")
+            }
             components.queryItems = [URLQueryItem(name: "static", value: "true")]
             if let id = lease.info.mediaSourceId { components.queryItems?.append(URLQueryItem(name: "mediaSourceId", value: id)) }
-            let headers = try server.key().map { ["Authorization": "MediaBrowser Client=\"vergence\", Token=\"\($0)\""] } ?? [:]
-            return (components.url!, headers)
+            let headers = key.map { ["Authorization": "MediaBrowser Client=\"vergence\", Token=\"\($0)\""] } ?? [:]
+            guard let url = components.url else { throw WorkerFailure("the Jellyfin address isn't a URL") }
+            return (url, headers)
         case "stash":
-            guard let server = config.stash else { throw WorkerFailure("no Stash in the worker's config") }
-            let url = URL(string: server.url.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/scene/\(lease.source.id)/stream")!
-            return (url, try server.key().map { ["ApiKey": $0] } ?? [:])
+            let (base, key) = try server(config.stash, "Stash")
+            guard let url = URL(string: base.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/scene/\(lease.source.id)/stream") else {
+                throw WorkerFailure("the Stash address isn't a URL")
+            }
+            return (url, key.map { ["ApiKey": $0] } ?? [:])
         default:
             throw WorkerFailure("unknown server \(lease.source.server)")
         }

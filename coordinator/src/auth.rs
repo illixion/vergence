@@ -39,6 +39,8 @@ pub struct TokenEntry {
 #[derive(Clone, Debug, Default)]
 pub struct Tokens {
     entries: Vec<TokenEntry>,
+    /// Tokens made for this run only ([`Tokens::add_unsaved`]): never written, gone at a restart.
+    unsaved: Vec<TokenEntry>,
     path: Option<PathBuf>,
 }
 
@@ -58,11 +60,11 @@ impl Tokens {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e),
         };
-        Ok(Tokens { entries, path: Some(path.to_path_buf()) })
+        Ok(Tokens { entries, unsaved: Vec::new(), path: Some(path.to_path_buf()) })
     }
 
     pub fn in_memory(entries: Vec<TokenEntry>) -> Tokens {
-        Tokens { entries, path: None }
+        Tokens { entries, unsaved: Vec::new(), path: None }
     }
 
     pub fn entries(&self) -> &[TokenEntry] {
@@ -80,11 +82,23 @@ impl Tokens {
         Ok(token)
     }
 
+    /// Makes a token kept for this run only, its hash never written: what the desktop app gives
+    /// its own worker, through the worker's standard input, at every start.
+    pub fn add_unsaved(&mut self, name: &str, grants: Vec<Grant>) -> String {
+        let mut bytes = [0u8; 24];
+        rand::rng().fill_bytes(&mut bytes);
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        self.unsaved.retain(|e| e.name != name);
+        self.unsaved.push(TokenEntry { name: name.to_string(), token_sha256: hash(&token), grants });
+        token
+    }
+
     pub fn remove(&mut self, name: &str) -> std::io::Result<bool> {
-        let before = self.entries.len();
+        let before = self.entries.len() + self.unsaved.len();
         self.entries.retain(|e| e.name != name);
+        self.unsaved.retain(|e| e.name != name);
         self.save()?;
-        Ok(self.entries.len() != before)
+        Ok(self.entries.len() + self.unsaved.len() != before)
     }
 
     fn save(&self) -> std::io::Result<()> {
@@ -107,6 +121,7 @@ impl Tokens {
         let digest = hash(token);
         self.entries
             .iter()
+            .chain(&self.unsaved)
             .find(|e| same(&e.token_sha256, &digest))
             .filter(|e| e.grants.contains(&grant) || e.grants.contains(&Grant::Admin))
             .map(|e| e.name.as_str())
@@ -147,6 +162,21 @@ mod tests {
         assert_eq!(reloaded.check(&admin, Grant::Work), Some("desktop"));
         assert_eq!(reloaded.check("nope", Grant::Play), None);
         assert!(!std::fs::read_to_string(dir.path().join("tokens.json")).unwrap().contains(&play));
+    }
+
+    #[test]
+    fn unsaved_tokens_work_and_never_reach_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let mut tokens = Tokens::load(&path).unwrap();
+        tokens.add("script", vec![Grant::Play]).unwrap();
+        let worker = tokens.add_unsaved("worker", vec![Grant::Work]);
+        assert_eq!(tokens.check(&worker, Grant::Work), Some("worker"));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("worker") && !written.contains(&worker));
+        assert_eq!(Tokens::load(&path).unwrap().check(&worker, Grant::Work), None);
+        assert!(tokens.remove("worker").unwrap());
+        assert_eq!(tokens.check(&worker, Grant::Work), None);
     }
 
     #[test]

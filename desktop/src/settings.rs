@@ -1,7 +1,8 @@
-//! Where the app keeps things, its settings (`settings.json`), and the media servers' API keys
-//! (`secrets/<server>.key`, readable by this user only). Everything lives under the platform's
-//! app-data folder. Keys stay in this process: the page is told only whether one is set and its
-//! last four characters, never the key.
+//! Where the app keeps things and its settings (`settings.json`), under the platform's app-data
+//! folder. No media server key is kept here, or anywhere on disk: a headset hands its sign-in
+//! over when it starts a stream, and one typed into the window is held the same way, in this
+//! process's memory only (`crate::coordinator::CoordinatorHost::hold_credential`). The page is
+//! told only that one is held, by whom and for how long, never the key.
 
 use std::path::{Path, PathBuf};
 
@@ -22,9 +23,9 @@ impl Paths {
         self.root.join("settings.json")
     }
 
-    /// A media server's API key (`jellyfin` or `stash`).
-    pub fn secret(&self, server: Server) -> PathBuf {
-        self.root.join("secrets").join(format!("{}.key", server.name()))
+    /// Where older versions kept the media servers' API keys; removed at start.
+    pub fn old_secrets(&self) -> PathBuf {
+        self.root.join("secrets")
     }
 
     /// The coordinator's store: titles, pieces and `tokens.json`.
@@ -221,57 +222,37 @@ pub fn write_atomic(path: &Path, bytes: &[u8], private: bool) -> std::io::Result
     Ok(())
 }
 
-/// Keeps a server's key (or removes it, for an empty one).
-pub fn set_secret(paths: &Paths, server: Server, key: &str) -> std::io::Result<()> {
-    let key = key.trim();
-    let path = paths.secret(server);
-    if key.is_empty() {
-        return match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
+/// Deletes the key files older versions kept (`secrets/<server>.key`).
+pub fn remove_old_secrets(paths: &Paths) {
+    let dir = paths.old_secrets();
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => tracing::info!(dir = %dir.display(), "removed the media keys older versions kept on disk"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "couldn't remove the old media keys"),
     }
-    #[cfg(unix)]
-    if let Some(dir) = path.parent() {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    write_atomic(&path, key.as_bytes(), true)
 }
 
-pub fn has_secret(paths: &Paths, server: Server) -> bool {
-    paths.secret(server).is_file()
-}
-
-/// What the page may know about a key: that it is set, and its last four characters.
+/// What the page may know about a held credential: never the key.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyHint {
     pub set: bool,
-    pub ends_with: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Who handed it over: a headset's name, or "this computer".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Seconds until it is forgotten.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds_left: Option<u64>,
 }
 
-pub fn key_hint(paths: &Paths, server: Server) -> KeyHint {
-    match std::fs::read_to_string(paths.secret(server)) {
-        Ok(key) => {
-            let key = key.trim();
-            let tail: String = key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-            KeyHint { set: true, ends_with: (key.chars().count() >= 12).then_some(tail) }
-        }
-        Err(_) => KeyHint { set: false, ends_with: None },
+pub fn key_hint(held: &[vergence_coordinator::credentials::HeldSummary], server: Server) -> KeyHint {
+    let name = server.name();
+    match held.iter().find(|h| h.server.name() == name) {
+        Some(h) => KeyHint { set: true, url: Some(h.url.clone()), from: Some(h.from.clone()), seconds_left: Some(h.seconds_left) },
+        None => KeyHint { set: false, url: None, from: None, seconds_left: None },
     }
-}
-
-/// The coordinator's (and the worker's) configuration for one server: its address and the
-/// key's file, never the key itself.
-pub fn server_config(paths: &Paths, settings: &Settings, server: Server) -> Option<vergence_coordinator::source::ServerConfig> {
-    let url = settings.url(server)?;
-    Some(vergence_coordinator::source::ServerConfig {
-        url: url.to_string(),
-        api_key: None,
-        api_key_file: has_secret(paths, server).then(|| paths.secret(server).to_string_lossy().into_owned()),
-    })
 }
 
 #[cfg(test)]
@@ -321,32 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_private_and_only_hinted() {
+    fn old_key_files_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(dir.path());
-        assert!(!key_hint(&paths, Server::Jellyfin).set);
-        set_secret(&paths, Server::Jellyfin, " 0123456789abcdef \n").unwrap();
-        assert_eq!(std::fs::read_to_string(paths.secret(Server::Jellyfin)).unwrap(), "0123456789abcdef");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(paths.secret(Server::Jellyfin)).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-        let hint = key_hint(&paths, Server::Jellyfin);
-        assert_eq!(hint, KeyHint { set: true, ends_with: Some("cdef".into()) });
-        // A short key isn't hinted at all: four characters would be too much of it.
-        set_secret(&paths, Server::Stash, "short").unwrap();
-        assert_eq!(key_hint(&paths, Server::Stash).ends_with, None);
-
-        let settings = Settings { jellyfin_url: Some("http://jf".into()), ..Settings::default() };
-        let config = server_config(&paths, &settings, Server::Jellyfin).unwrap();
-        assert_eq!(config.api_key, None);
-        assert_eq!(config.key().unwrap().as_deref(), Some("0123456789abcdef"));
-        assert!(server_config(&paths, &settings, Server::Stash).is_none());
-
-        set_secret(&paths, Server::Jellyfin, "").unwrap();
-        assert!(!key_hint(&paths, Server::Jellyfin).set);
-        set_secret(&paths, Server::Jellyfin, "").unwrap();
+        std::fs::create_dir_all(paths.old_secrets()).unwrap();
+        std::fs::write(paths.old_secrets().join("jellyfin.key"), "0123456789abcdef").unwrap();
+        remove_old_secrets(&paths);
+        assert!(!paths.old_secrets().exists());
+        remove_old_secrets(&paths);
     }
 }
