@@ -11,6 +11,9 @@
 //! }
 //! ```
 //! Keys can be given inline as `apiKey` too; a file keeps them out of the config.
+//! `jellyfin` and `stash` are optional: with neither, the coordinator holds no media credentials
+//! and players send each title's description with their first report (`api.rs`); workers read
+//! the media with their own keys either way. Only a server with a key can be scanned.
 //! Tokens for players and workers live in `<store>/tokens.json` (`vergenced token add`).
 //! Paired devices live in `<store>/devices.json` (`vergenced pair`, or `devicesFile`) and reach
 //! the same API over TLS-PSK on `pairedListen` (default every interface, port 8421; `null` turns

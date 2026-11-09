@@ -2,9 +2,16 @@
 //!
 //! Players (grant `play`):
 //! ```text
-//! POST /v1/playing                                    {server, id, workload?, seconds, rate?, player?, stopped?}
+//! POST /v1/playing                                    {server, id, workload?, seconds, rate?, player?, stopped?, media?}
 //! GET  /v1/titles/{server}/{id}/{workload}            status (404 {"state":"none"} when unknown)
-//! POST /v1/titles/{server}/{id}/{workload}            queue it for backfill (202)
+//! POST /v1/titles/{server}/{id}/{workload}            queue it for backfill (202); body optional: {media?}
+//! ```
+//! `media` is `{durationSeconds, frameRate: {num, den}, stereo, identity, width?, height?, codec?,
+//! mediaSourceId?}` (`source::MediaInfo`): what the player knows of the file. A coordinator with no
+//! key for the title's server (config without `jellyfin`/`stash`) holds no media credentials and
+//! needs it on a title's first report (422 otherwise); one with a key describes the title itself
+//! and ignores it.
+//! ```text
 //! GET  /v1/titles/{server}/{id}/{workload}/chunks/{n} the pieces ready so far, as a track; headers
 //!                                                     Vergence-Chunk-Complete: true|false, Vergence-Pieces: done/total
 //! ```
@@ -42,7 +49,7 @@ use serde_json::json;
 use crate::auth::{Grant, Tokens, token_from_headers};
 use crate::paired::{PairedDevices, PairedPeer, device_name};
 use crate::queue::{AddError, AddOutcome, Claim, Queue, Title, Workload};
-use crate::source::{Server, SourceRef, Sources};
+use crate::source::{MediaInfo, Server, SourceRef, Sources};
 use crate::store::Store;
 use crate::track;
 
@@ -164,23 +171,42 @@ impl AppState {
         self.workloads.iter().find(|w| w.name == name).cloned().ok_or_else(|| err(StatusCode::NOT_FOUND, "unknown workload"))
     }
 
-    /// The title's key, describing it from its server first if it is new or
-    /// its description is old (a replaced file resets its results).
-    pub async fn ensure_title(&self, source: &SourceRef, workload: &Workload) -> ApiResult<String> {
+    /// The title's key, describing it first if it is new or its description
+    /// is old (a replaced file resets its results).
+    ///
+    /// A server the coordinator has a key for describes the title itself,
+    /// and that answer is the one used. With no key for that server, the
+    /// coordinator holds no media credentials at all and takes what the
+    /// player sent (`supplied`): the player is already playing the file, so
+    /// it knows its timing and identity. A player's numbers are checked for
+    /// sense ([`check_supplied`]); a worker still corrects the end of the
+    /// video, and checks every piece it makes.
+    pub async fn ensure_title(&self, source: &SourceRef, workload: &Workload, supplied: Option<MediaInfo>) -> ApiResult<String> {
         let key = Title::key_for(source, &workload.name);
         let fresh = self.described.lock().expect("described lock").get(&key).is_some_and(|t| t.elapsed() < DESCRIBE_EVERY);
         let known = self.queue.lock().expect("queue lock").title(&key).is_some();
         if known && fresh {
             return Ok(key);
         }
-        let info = match self.sources.describe(source).await {
+        let described = match (self.sources.has(source.server), supplied) {
+            (true, _) => self.sources.describe(source).await.map_err(|e| e.to_string()),
+            (false, Some(info)) => check_supplied(info),
+            (false, None) if known => return Ok(key),
+            (false, None) => {
+                return Err(err(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "this coordinator holds no key for that server: send the title's `media` (duration, frame rate, stereo layout, identity)",
+                ));
+            }
+        };
+        let info = match described {
             Ok(info) => info,
             // A server that is away doesn't stop a known title's results being served.
             Err(e) if known => {
                 tracing::warn!(title = %key, error = %e, "couldn't describe a known title again");
                 return Ok(key);
             }
-            Err(e) => return Err(err(StatusCode::BAD_GATEWAY, e.to_string())),
+            Err(e) => return Err(err(StatusCode::BAD_GATEWAY, e)),
         };
         let outcome = self.queue.lock().expect("queue lock").add(source.clone(), workload, info);
         let outcome = outcome.map_err(|e: AddError| err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
@@ -226,6 +252,23 @@ impl AppState {
         let bytes = self.store.chunk(&title, &done).map_err(internal)?;
         Ok(Some(ChunkBytes { bytes, whole, done: done.len(), total }))
     }
+}
+
+/// A player's description of a title, checked for sense: a wrong number must
+/// not make a grid of millions of pieces, or none.
+fn check_supplied(info: MediaInfo) -> Result<MediaInfo, String> {
+    const MAX_SECONDS: f64 = 72.0 * 3600.0;
+    let rate = info.frame_rate;
+    if !(info.duration_seconds.is_finite() && info.duration_seconds > 0.0 && info.duration_seconds <= MAX_SECONDS) {
+        return Err("media: the duration must be between 0 and 72 hours".into());
+    }
+    if rate.num == 0 || rate.den == 0 || rate.num as f64 / rate.den as f64 > 480.0 {
+        return Err("media: the frame rate must be a positive rational of at most 480 fps".into());
+    }
+    if info.identity.is_empty() || info.identity.len() > 256 {
+        return Err("media: `identity` (the file's ETag or hash) is needed, at most 256 bytes".into());
+    }
+    Ok(info)
 }
 
 struct ChunkBytes {
@@ -274,6 +317,10 @@ struct Playing {
     player: Option<String>,
     #[serde(default)]
     stopped: bool,
+    /// What the player knows of the title, for a coordinator with no key for
+    /// this server: see [`AppState::ensure_title`].
+    #[serde(default)]
+    media: Option<MediaInfo>,
 }
 
 fn one() -> f64 {
@@ -289,7 +336,7 @@ async fn playing(State(state): State<Shared>, caller: Caller, Json(body): Json<P
     }
     let source = source_ref(&body.server, &body.id)?;
     let workload = state.workload(body.workload.as_deref().unwrap_or(Workload::SMOOTH_MOTION_3D))?;
-    let key = state.ensure_title(&source, &workload).await?;
+    let key = state.ensure_title(&source, &workload, body.media).await?;
     state.queue.lock().expect("queue lock").report_playhead(&player, &key, body.seconds, body.rate, Instant::now());
     Ok(Json(state.status_json(&key)).into_response())
 }
@@ -307,14 +354,29 @@ async fn title_status(
     })
 }
 
+/// The optional body of `POST /v1/titles/...`: `{"media": {...}}`.
+#[derive(Deserialize)]
+struct EnqueueBody {
+    #[serde(default)]
+    media: Option<MediaInfo>,
+}
+
 async fn enqueue(
     State(state): State<Shared>,
     caller: Caller,
     Path((server, id, workload)): Path<(String, String, String)>,
+    body: Bytes,
 ) -> ApiResult<Response> {
     authorize(&state, &caller, Grant::Play)?;
     let workload = state.workload(&workload)?;
-    let key = state.ensure_title(&source_ref(&server, &id)?, &workload).await?;
+    let media = if body.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        serde_json::from_slice::<Option<EnqueueBody>>(&body)
+            .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?
+            .and_then(|b| b.media)
+    };
+    let key = state.ensure_title(&source_ref(&server, &id)?, &workload, media).await?;
     Ok((StatusCode::ACCEPTED, Json(state.status_json(&key))).into_response())
 }
 
@@ -372,7 +434,7 @@ pub async fn scan_now(state: &AppState) -> serde_json::Value {
             continue;
         }
         for workload in state.workloads.iter().filter(|w| w.needs_stereo) {
-            match state.ensure_title(&source, workload).await {
+            match state.ensure_title(&source, workload, None).await {
                 Ok(_) => added += 1,
                 Err(ApiError(_, reason)) => problems.push(format!("{}: {reason}", Title::key_for(&source, &workload.name))),
             }
@@ -497,7 +559,7 @@ async fn compat_analyze(State(state): State<Shared>, caller: Caller, Path(item):
     authorize(&state, &caller, Grant::Play)?;
     let workload = state.workload(Workload::SMOOTH_MOTION_3D)?;
     let key = state
-        .ensure_title(&SourceRef::jellyfin(&item), &workload)
+        .ensure_title(&SourceRef::jellyfin(&item), &workload, None)
         .await
         .map_err(|ApiError(_, reason)| err(StatusCode::CONFLICT, reason))?;
     let status = state.queue.lock().expect("queue lock").status(&key);

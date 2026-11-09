@@ -60,6 +60,57 @@ async fn harness(etag: &'static str, dir: Option<tempfile::TempDir>) -> Harness 
     Harness { app: router(state), play, work, admin, _dir: dir }
 }
 
+/// A coordinator with no key for any server: the player describes the title.
+async fn keyless_harness() -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let sources = Sources { jellyfin: None, stash: None };
+    let mut tokens = Tokens::load(&dir.path().join("tokens.json")).unwrap();
+    let play = tokens.add("vp", vec![Grant::Play]).unwrap();
+    let work = tokens.add("mac", vec![Grant::Work]).unwrap();
+    let admin = tokens.add("desk", vec![Grant::Admin]).unwrap();
+    let state = AppState::new(Store::open(dir.path()).unwrap(), sources, Workload::defaults(), tokens).unwrap();
+    Harness { app: router(state), play, work, admin, _dir: dir }
+}
+
+fn media(identity: &str) -> Value {
+    json!({"durationSeconds": 6.0, "frameRate": {"num": 24, "den": 1}, "stereo": "halfSideBySide", "identity": identity})
+}
+
+#[tokio::test]
+async fn without_a_key_the_player_describes_the_title() {
+    let h = keyless_harness().await;
+    let report = |media: Option<Value>| {
+        let mut body = json!({"server": "stash", "id": "42", "seconds": 1.0});
+        if let Some(m) = media {
+            body["media"] = m;
+        }
+        body
+    };
+    // Nothing known and nothing sent: asked for the description, not a bad gateway.
+    let (status, _) = h.json("POST", "/v1/playing", &h.play, report(None)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    // Nonsense is refused.
+    let mut bad = media("etag");
+    bad["durationSeconds"] = json!(1.0e9);
+    let (status, _) = h.json("POST", "/v1/playing", &h.play, report(Some(bad))).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (status, _) = h.json("POST", "/v1/playing", &h.play, report(Some(json!({"durationSeconds": 6.0, "frameRate": {"num": 24, "den": 1}, "stereo": "halfSideBySide", "identity": ""})))).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // A sensible description queues the title and a worker can claim it.
+    let (status, body) = h.json("POST", "/v1/playing", &h.play, report(Some(media("etag-1")))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lease = h.claim().await.expect("a piece to claim");
+    assert_eq!(lease["source"]["server"], "stash");
+    // Later reports may leave `media` out, and enqueue takes it in a body.
+    let (status, _) = h.json("POST", "/v1/playing", &h.play, report(None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = h.json("POST", "/v1/titles/stash/43/smooth-motion-3d", &h.play, json!({"media": media("e2")})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _) = h.json("POST", "/v1/titles/stash/44/smooth-motion-3d", &h.play, json!({})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let _ = &h.admin;
+}
+
 impl Harness {
     async fn send(&self, method: &str, uri: &str, token: &str, body: Body) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
         let request = Request::builder()

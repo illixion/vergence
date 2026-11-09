@@ -151,8 +151,11 @@ pub struct MediaInfo {
     pub duration_seconds: f64,
     pub frame_rate: Rate,
     /// The coded picture's size.
+    #[serde(default)]
     pub width: u32,
+    #[serde(default)]
     pub height: u32,
+    #[serde(default)]
     pub codec: String,
     pub stereo: StereoLayout,
     /// Changes when the file behind the title is replaced (Jellyfin's
@@ -386,6 +389,14 @@ pub struct Sources {
 }
 
 impl Sources {
+    /// Whether the coordinator holds a key for `server` and so describes its titles itself.
+    pub fn has(&self, server: Server) -> bool {
+        match server {
+            Server::Jellyfin => self.jellyfin.is_some(),
+            Server::Stash => self.stash.is_some(),
+        }
+    }
+
     pub async fn describe(&self, source: &SourceRef) -> Result<MediaInfo, SourceError> {
         match source.server {
             Server::Jellyfin => self.jellyfin.as_ref().ok_or(SourceError::NotConfigured("Jellyfin"))?.describe(&source.id).await,
