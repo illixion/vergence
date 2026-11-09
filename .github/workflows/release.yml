@@ -1,0 +1,236 @@
+# Builds the Vergence desktop app's release files with the packaging scripts in desktop/scripts
+# (the same ones as a local build) and attests where each came from:
+#
+#   gh attestation verify Vergence-<version>-macos-universal.zip -R illixion/vergence
+#
+#   Vergence-<version>-macos-universal.zip    Vergence.app (arm64 + x86_64) with the `vergence`
+#                                             command line in Contents/Resources
+#   Vergence-<version>-windows-x86_64.zip     Vergence.exe, WebView2Loader.dll, and the ONNX
+#                                             Runtime worker and converter built on Windows
+#
+# Nothing here signs a release. The files land as a workflow artifact with a SHA256SUMS; the
+# updater trusts a release only through that manifest signed by the release key (PIN and touch,
+# never on CI), so the owner downloads the artifact and runs, in the foreground,
+#
+#   desktop/scripts/bless-release.sh SHA256SUMS
+#
+# An attestation says "GitHub built this from that commit"; the signature says "and its owner
+# vouches for it". Neither macOS nor Windows files are notarized or code-signed.
+#
+# Run it by hand (Actions > Release build > Run workflow) or by pushing a v<version> tag. The
+# version must already be committed in the workspace Cargo.toml. A manual run with no version
+# builds at the committed version and publishes nothing (no attestation): use it to try the
+# packaging, and to warm the caches, since only runs on main save them and a tag restores them
+# (a run restores only caches saved on its own ref or on main, so a cold release is the slow one).
+#
+# The Swift command line needs a Mac with a recent Xcode. Set the repository variable
+# MACOS_RUNNER (Settings > Secrets and variables > Actions > Variables) to a runner label with
+# Xcode 27 to build with it; without it the macos-26 image's newest Xcode is used.
+#
+# Actions are pinned to commits, not tags, which can be moved; the comment names the tag each
+# was taken from (the same pins as Apparition's release workflow, 2026-11-04).
+
+name: Release build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (major.minor.patch), as committed in Cargo.toml; empty builds without publishing"
+        required: false
+      parts:
+        description: "What to build: all, or a comma-separated list of macos, windows"
+        default: all
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version || (github.ref_type == 'tag' && github.ref_name) || '' }}
+  # Caches are saved only here, where every release can restore them (see the top).
+  SAVE_CACHE: ${{ github.ref == 'refs/heads/main' }}
+  RUST_TOOLCHAIN: 1.97.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The version to build, checked against the committed one, and which parts to run.
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      macos: ${{ steps.plan.outputs.macos }}
+      windows: ${{ steps.plan.outputs.windows }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - id: plan
+        env:
+          PARTS: ${{ inputs.parts || 'all' }}
+        run: |
+          set -euo pipefail
+          committed="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          version="${VERSION#v}"
+          publish=true
+          if [[ -z "$version" ]]; then
+            version="$committed"; publish=false
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$version isn't major.minor.patch"; exit 1; }
+          [[ "$version" == "$committed" ]] || { echo "::error::Cargo.toml's version is $committed, not $version; commit the bump first"; exit 1; }
+          macos=false; windows=false
+          for part in ${PARTS//,/ }; do
+            case "$part" in
+              all) macos=true; windows=true ;;
+              macos) macos=true ;;
+              windows) windows=true ;;
+              *) echo "::error::no part called $part (all, macos, windows)"; exit 1 ;;
+            esac
+          done
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "macos=$macos"
+            echo "windows=$windows"
+          } | tee -a "$GITHUB_OUTPUT"
+          echo "Vergence $version (publish: $publish, macos: $macos, windows: $windows)" >> "$GITHUB_STEP_SUMMARY"
+
+  macos:
+    name: macOS app
+    needs: plan
+    if: needs.plan.outputs.macos == 'true'
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-26' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Choose Xcode
+        run: |
+          # The newest one on the image (27 where there is one); the command line needs Swift 6.2.
+          newest="$(printf '%s\n' /Applications/Xcode_*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$newest"
+          xcodebuild -version
+          swift --version
+      - name: Tools
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target aarch64-apple-darwin,x86_64-apple-darwin
+          rustup default "$RUST_TOOLCHAIN"
+      # Tauri's prebuilt CLI, checked against pinned hashes; compiling it took about 9 minutes.
+      - name: Tauri CLI
+        run: desktop/scripts/install-tauri-cli.sh
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: macos-release
+          cache-on-failure: true
+          save-if: ${{ env.SAVE_CACHE == 'true' }}
+      - name: Build
+        run: desktop/scripts/package-macos.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: macos
+          path: target/package/Vergence-*-macos-universal.zip
+          if-no-files-found: error
+
+  # The converter and the worker are ONNX Runtime programs (DirectML), whose Windows binaries
+  # ort downloads for the MSVC target, so they are built here, on Windows. The app itself is
+  # cross-compiled by desktop/scripts/package-windows.sh, as on a developer's Mac.
+  windows-tools:
+    name: Windows worker and converter
+    needs: plan
+    if: needs.plan.outputs.windows == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: windows-tools-release
+          cache-on-failure: true
+          save-if: ${{ env.SAVE_CACHE == 'true' }}
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p vergence-worker -p vergence-convert
+      # Every program and DLL the build put beside them (ONNX Runtime's and DirectML's, where
+      # the build copies them), which the app finds next to Vergence.exe.
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir tools
+          cp target/release/vergence-worker.exe target/release/vergence-convert.exe tools/
+          shopt -s nullglob
+          for f in target/release/*.dll; do cp "$f" tools/; done
+          ls -l tools
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: windows-tools
+          path: tools/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows app
+    needs: [plan, windows-tools]
+    if: needs.plan.outputs.windows == 'true'
+    # A Mac, as for the local build: Homebrew's mingw-w64 is the toolchain the script was made for.
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Tools
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target x86_64-pc-windows-gnu
+          rustup default "$RUST_TOOLCHAIN"
+          brew install mingw-w64
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: windows-tools
+          path: windows-tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: windows-app-release
+          cache-on-failure: true
+          save-if: ${{ env.SAVE_CACHE == 'true' }}
+      - name: Build
+        run: desktop/scripts/package-windows.sh --tools windows-tools
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: windows
+          path: target/package/Vergence-*-windows-x86_64.zip
+          if-no-files-found: error
+
+  attest:
+    name: Attest
+    # Parts that weren't asked for are skipped, which would skip this too without the condition.
+    needs: [plan, macos, windows]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && needs.plan.outputs.publish == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: files
+          # The build jobs' own artifacts, not the Windows tools (which are inside the zip).
+          pattern: "{macos,windows}"
+          merge-multiple: true
+      - name: List
+        run: |
+          set -o pipefail
+          cd files && ls -l && sha256sum Vergence-* | tee SHA256SUMS
+          { echo '```'; cat SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: files/Vergence-*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-${{ needs.plan.outputs.version }}
+          # The files and the manifest the owner signs (desktop/scripts/bless-release.sh).
+          path: |
+            files/Vergence-*
+            files/SHA256SUMS

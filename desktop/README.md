@@ -37,6 +37,23 @@ The `vergence` executable is looked for in Settings, `VERGENCE_CLI`, beside the 
 `VERGENCE_APP_DATA=DIR` moves the app's data (for a second copy, or a test run). In a debug build
 `VERGENCE_APP_CONVERT=a.mp4:b.mkv` queues files to convert at launch.
 
+## macOS bundle
+
+```sh
+desktop/scripts/package-macos.sh        # -> target/package/Vergence-<version>-macos-universal.zip
+```
+
+One universal (arm64 + x86_64) `Vergence.app` with the `vergence` command line in
+`Contents/Resources/` (where `find_cli` looks), ad-hoc sealed, zipped with `ditto` so the updater's
+`ditto -x -k` and `codesign --verify --deep --strict` accept it. OpenSSL is built in
+(`vendored-openssl`): linking Homebrew's would leave `/opt/homebrew` paths in the app. Needs the
+Tauri CLI and both Apple Rust targets. Not notarized; a downloaded copy needs its quarantine flag
+cleared (`xattr -dr com.apple.quarantine Vergence.app`) or Open Anyway in System Settings.
+
+Don't set `MACOSX_DEPLOYMENT_TARGET` for the build: it reaches the proc-macro dylibs built for the
+Mac itself, and Xcode 27's linker writes ones `dlopen` refuses ("mis-aligned LINKEDIT string
+pool", shown as "can't find crate"). The 14.0 floor is the bundle's (`minimumSystemVersion`).
+
 ## Windows
 
 The same app, cross-compiled from a Mac and packed the way Apparition packs its Windows
@@ -100,6 +117,17 @@ token = hex(HKDF-SHA256(ikm: pairing token (UTF-8), salt: "Vergence-HTTP-Token-v
 
 The coordinator recognises it from `devices.json`, and also keeps its SHA-256 as `device-<device
 id>` with the `play` grant; forgetting the device removes both.
+
+## CI and release builds
+
+`.github/workflows/ci.yml` runs the desktop, coordinator and companion tests and clippy on macOS and
+Windows for every push to `main` and pull request. `.github/workflows/release.yml` (run by hand, or
+by pushing a `v<version>` tag) builds both release zips with the scripts above, the Windows worker
+and converter natively on Windows, and attests them (`gh attestation verify FILE -R
+illixion/vergence`). It signs nothing: download the `release-<version>` artifact and run
+`bless-release.sh SHA256SUMS` below. A manual run with no version builds without publishing, which
+also warms the caches (only runs on `main` save them). The repository variable `MACOS_RUNNER` picks a
+runner with Xcode 27 for the Swift command line.
 
 ## Signing a release
 

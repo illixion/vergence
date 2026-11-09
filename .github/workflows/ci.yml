@@ -1,0 +1,62 @@
+# Tests the Rust half (the desktop app, the coordinator and the pairing crate) on the two
+# platforms the app ships for, on every push to main and every pull request.
+#
+# The Swift package's tests (decoding, Core ML, Metal) need a Mac with a GPU and the models, so
+# they stay local. The packaging itself is exercised by release.yml, which a manual run with no
+# version runs without publishing anything.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: 1.97.1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: Desktop app (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS, runner: macos-26 }
+          - { name: Windows, runner: windows-2025 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+      # The Windows build compiles OpenSSL from source for the paired channel (vendored-openssl),
+      # which needs NASM; the image has it but not on PATH.
+      - name: NASM on PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $nasm = 'C:\Program Files\NASM'
+          if (-not (Test-Path "$nasm\nasm.exe")) { choco install nasm --no-progress -y; }
+          Add-Content $env:GITHUB_PATH $nasm
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: desktop-${{ matrix.runner }}
+          cache-on-failure: true
+          # Only main saves, so pull requests restore a cache without each filling the repository's 10 GB.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test
+        run: cargo test --locked -p vergence-desktop -p vergence-coordinator -p vergence-companion
+      - name: Clippy
+        run: cargo clippy --locked -p vergence-desktop -p vergence-coordinator -p vergence-companion --all-targets -- -D warnings
