@@ -781,6 +781,14 @@ image test runs only when the script supplies its environment. Passing these tes
 does not establish headset comfort or correct recognition of sub-model-resolution
 hair, transparent steam or low-contrast silhouettes.
 
+## Support
+
+I'm Ixion. I make Vergence, and everything else I publish, as free and open-source software, and I don't expect anything in return. If it's useful to you and you'd like to help me keep building, you can [sponsor me on GitHub](https://github.com/sponsors/illixion). If not, I hope you enjoy it all the same. 💖
+
+<!-- Pose art slot: once https://illixion.com/images/support/synth-wave.png exists, uncomment:
+<p align="center"><img src="https://illixion.com/images/support/synth-wave.png" width="220" alt="Ixion's Synth character waving"></p>
+-->
+
 ## License
 
 MIT, see `LICENSE`. edge264 (vendored under `Sources/CEdge264`) is BSD-3-Clause; see
