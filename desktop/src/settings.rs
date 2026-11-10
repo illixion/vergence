@@ -109,6 +109,9 @@ pub struct Settings {
     /// network doesn't see the name; where that is blocked the check goes to GitHub directly (never
     /// to apps.illixion.com in the clear). On by default.
     pub private_updates: bool,
+    /// Announce this computer to headsets on the network, and answer one asking to pair
+    /// (`presence`). Off, a headset pairs only by this computer's address or link.
+    pub discoverable: bool,
 }
 
 pub const DEFAULT_PORT: u16 = 8420;
@@ -133,6 +136,7 @@ impl Default for Settings {
             worker_at_start: false,
             check_updates: false,
             private_updates: true,
+            discoverable: true,
         }
     }
 }

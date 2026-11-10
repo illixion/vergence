@@ -114,9 +114,9 @@ Both are looked for in Settings (the file, or the folder holding it), `VERGENCE_
 the app, then `PATH`. Build them on Windows (they need ONNX Runtime's Windows binaries) and pack
 them with `--tools`.
 
-While pairing is open the app announces `_vergence-pair._tcp` through Windows' own mDNS responder
-(`DnsServiceRegister`, Windows 10 1809 and later; nothing to install), as it does through
-`dns-sd` on a Mac, so a Quest finds it without typing an address.
+Records go out through Windows' own mDNS responder (`DnsServiceRegister`, Windows 10 1809 and
+later; nothing to install), as through `dns-sd` on a Mac and `avahi-publish-service` on Linux: see
+"How a headset finds this computer".
 
 Windows Defender Firewall asks on first start whether Vergence may use the network: private
 networks are enough for headsets to pair (4869) and reach the paired channel (8421).
@@ -152,6 +152,37 @@ folder is deleted at start), no worker token file (`worker/worker.token` likewis
 hashes in `coordinator/tokens.json`. The coordinator's plain HTTP port also turns away anything a
 web page sends: a request with an `Origin` or `Sec-Fetch-Mode` header, and every CORS preflight,
 gets 403, and no response carries an `Access-Control-Allow-*` header.
+
+## How a headset finds this computer
+
+The whole of RAVECompanion's discovery (`RAVECompanionPresence` and `RAVEPairingServer`), on
+Vergence's own namespace (`_vergence-*._tcp`, so a Longwave Companion never answers), while the app
+runs and "Let headsets on this network find this computer" (Headsets tab, on by default) is ticked:
+
+1. **The host record**, `_vergence-mac._tcp`: this computer's name, with TXT `id` (its host id),
+   `addr` (its LAN address) and `open=1`. Nothing listens behind it. A headset browses for it and
+   lists the computer (Convolution: Settings → Analysis Server → "Pair" beside its name).
+2. **The knock**, `_vergence-knock._tcp`: the headset advertises one naming this computer's `id`,
+   its own `hs` and `pair=1` while it wants to pair. The app browses for it (`presence.rs`).
+3. **The one-off listener**, `_vergence-pair._tcp`: on a request the app opens a listener on a free
+   port, announces it with the headset's `hs`, and only that device's commit is taken. The headset
+   finds the record carrying its own id and dials it. The window comes up with the six-digit code
+   and Pair / Decline, as for the fixed port. The listener ends after one exchange or two minutes,
+   or when the headset withdraws the request; a second headset's request waits behind it. A
+   headset's request closes the fixed-port pairing opened by hand.
+
+A record grants nothing, and a knock may be forged by anything on the network: all it does is open
+a port for two minutes for one device id. A token is only given on Pair, on a matching code. A
+paired headset's tagged knock (which opens ports on a computer that keeps them shut) is not
+watched for, because the paired channel listens whenever the app does (`open=1` says so).
+
+"Pair a Headset" still opens the fixed port 4869 for five minutes, for a headset that has the
+address or link (and the Quest's list, which browses `_vergence-pair._tcp`).
+
+The responders run under a small shell that ends them when the app goes by any means, so a crash
+leaves no record behind. macOS asks once whether Vergence may use the local network (browsing
+needs it; the app is signed with a stable identity so the answer is kept: see "Installing on this
+Mac"); if it is refused the Headsets tab says so.
 
 ## How a paired headset reaches the coordinator
 
@@ -227,8 +258,10 @@ can't be relabelled as new.
 
 ## Not done yet
 
-- **Bonjour** is only the pairing announcement (macOS, Linux, Windows); the coordinator's own ports
-  aren't announced, so a paired device remembers the address it paired over.
+- **The Quest** lists computers by `_vergence-pair._tcp`, which is up only while pairing is open
+  by hand; it doesn't yet browse `_vergence-mac._tcp` and knock as the Apple client does.
+- **A paired headset's address** isn't refreshed from the host record: it remembers the address it
+  paired over (and the others the grant listed).
 - **Windows:** no installer that writes Start menu entries or registers "Open with" (the zip is
   unpacked anywhere, as Apparition's is), no code signing (SmartScreen warns once), and the
   firewall asks on first start; the tray and a conversion haven't been tried there yet.

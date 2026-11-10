@@ -60,6 +60,9 @@ impl App {
         if let Err(e) = self.coordinator.start(&settings).await {
             tracing::warn!(error = %e, "coordinator");
         }
+        if settings.discoverable {
+            self.pairing.start_discovery();
+        }
         if settings.worker_at_start
             && let Err(e) = self.worker.start(&settings)
         {
@@ -142,6 +145,11 @@ pub async fn save_settings(
     let worker_was_running = state.worker.is_running();
     state.worker.stop_and_wait().await;
     let started = state.coordinator.start(&settings).await;
+    if settings.discoverable {
+        state.pairing.start_discovery();
+    } else {
+        state.pairing.stop_discovery();
+    }
     if worker_was_running {
         state.worker.start(&settings)?;
     }
@@ -149,6 +157,21 @@ pub async fn save_settings(
     let mut view = state.settings_view(&app);
     view["coordinatorError"] = json!(started.err());
     Ok(view)
+}
+
+/// Turns discovery on or off alone: nothing else restarts.
+#[tauri::command]
+pub fn set_discoverable(state: Shared<'_>, on: bool) -> Reply {
+    let mut settings = state.settings();
+    settings.discoverable = on;
+    settings.save(&state.paths).map_err(|e| format!("Couldn't save the settings: {e}"))?;
+    state.settings.lock().unwrap().discoverable = on;
+    if on {
+        state.pairing.start_discovery();
+    } else {
+        state.pairing.stop_discovery();
+    }
+    Ok(state.pairing.status())
 }
 
 /// Asks a server who it is, with the credential held for it: the sign-in check.

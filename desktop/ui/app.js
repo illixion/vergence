@@ -307,6 +307,22 @@ function renderPairing(p) {
     $("pair-yes").dataset.id = w.id;
     $("pair-no").dataset.id = w.id;
   }
+  const inc = p.incoming;
+  $("pair-incoming").classList.toggle("hidden", !inc);
+  if (inc) {
+    const more = (p.queued || []).length ? ` (${p.queued.length} more waiting)` : "";
+    $("pair-incoming").textContent = `${inc.deviceName} is asking to pair…${more}`;
+  }
+  const vis = p.visible;
+  const line = $("pair-visible");
+  line.className = "small " + (vis && vis.announced ? "muted" : "bad-text");
+  line.textContent = !$("discoverable").checked
+    ? "Not announced: headsets need this computer's address or link."
+    : !vis
+      ? "Starting discovery…"
+      : vis.announced && vis.watching
+        ? "Visible to headsets on this network."
+        : "Not fully visible: macOS may be blocking Local Network access for Vergence (System Settings → Privacy & Security → Local Network).";
   $("pair-last").textContent = p.last || "";
   const devices = p.devices || [];
   $("devices").querySelector("tbody").innerHTML = devices.map((d) => `<tr>
@@ -322,6 +338,11 @@ $("pair-start").addEventListener("click", async () => renderPairing(await call("
 $("pair-stop").addEventListener("click", async () => renderPairing(await call("pairing_stop")));
 $("pair-yes").addEventListener("click", async (e) => renderPairing(await call("pairing_decide", { id: Number(e.target.dataset.id), pair: true })));
 $("pair-no").addEventListener("click", async (e) => renderPairing(await call("pairing_decide", { id: Number(e.target.dataset.id), pair: false })));
+$("discoverable").addEventListener("change", async (e) => {
+  try { renderPairing(await call("set_discoverable", { on: e.target.checked })); } catch { e.target.checked = !e.target.checked; }
+  // The record takes a moment to be announced.
+  setTimeout(() => refreshPairing().catch(() => {}), 1500);
+});
 $("pair-link-copy").addEventListener("click", (e) => copy($("pair-link").value, e.target));
 $("devices").addEventListener("click", async (e) => {
   const id = e.target.dataset.forget;
@@ -353,6 +374,7 @@ async function loadSettings() {
   $("scan-hours").value = s.scanEveryHours;
   $("port").value = s.port;
   $("lan").checked = s.lan;
+  $("discoverable").checked = s.discoverable;
   $("models-folder").textContent = s.modelsFolder || "Not chosen";
   $("worker-name").value = s.workerName || "";
   $("worker-at-start").checked = s.workerAtStart;
@@ -412,6 +434,7 @@ function settingsFromForm() {
   s.scanEveryHours = Number($("scan-hours").value) || 6;
   s.port = Number($("port").value) || 8420;
   s.lan = $("lan").checked;
+  s.discoverable = $("discoverable").checked;
   s.workerName = $("worker-name").value;
   s.workerAtStart = $("worker-at-start").checked;
   s.vergenceCli = $("cli-path").value;

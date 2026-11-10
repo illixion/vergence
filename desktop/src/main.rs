@@ -18,6 +18,7 @@ mod convert;
 mod coordinator;
 mod models;
 mod pairing;
+mod presence;
 mod settings;
 mod sidecar;
 mod tray;
@@ -84,6 +85,7 @@ fn main() {
             commands::set_launch_at_login,
             commands::depth_variants,
             commands::choose_depth_variant,
+            commands::set_discoverable,
             commands::update_status,
             commands::check_update,
             commands::install_update,
@@ -172,6 +174,7 @@ fn main() {
                 if let Some(state) = app.try_state::<Arc<App>>() {
                     let state = state.inner().clone();
                     state.pairing.stop();
+                    state.pairing.stop_discovery();
                     tauri::async_runtime::block_on(async move {
                         state.convert.shutdown().await;
                         state.worker.stop_and_wait().await;

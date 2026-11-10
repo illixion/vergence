@@ -138,6 +138,9 @@
           </div>
         </div>
         <p class="muted small">Pair once: the headset shows a six-digit code, and this window shows the same one. Paired headsets reach this coordinator over an encrypted channel keyed from their pairing, on port <b id="paired-port">8421</b>, with nothing else to turn on. <span id="paired-error" class="bad-text"></span></p>
+        <p id="pair-visible" class="small"></p>
+        <label class="check"><input id="discoverable" type="checkbox"> <span>Let headsets on this network find this computer, so they can ask to pair from their own Settings (otherwise they need its address or link)</span></label>
+        <p id="pair-incoming" class="hidden"></p>
         <div id="pair-open" class="hidden">
           <p>Waiting for a headset on port <b id="pair-port"></b><span id="pair-addresses"></span>.</p>
           <div class="copyrow"><input id="pair-link" readonly><button id="pair-link-copy">Copy Link</button></div>

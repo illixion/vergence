@@ -1,7 +1,13 @@
-//! Announces the pairing listener on the local network while it is open, as RAVECompanion's
-//! namespace names it: `_vergence-pair._tcp` on the pairing port, TXT `id=<host id>`. A headset
-//! (the Quest's Settings → Analysis computer → Find computers) browses for it and dials the
-//! port, and the six-digit comparison does the rest; the record grants nothing.
+//! Announces this computer to headsets on the local network, as RAVECompanion's namespace names
+//! the services (`_vergence-*._tcp`):
+//!
+//! - the host record, `_vergence-mac._tcp` (TXT `v`, `id`, `open`, `addr`): a bare record with
+//!   nothing listening behind it, up as long as the app is. A headset browses for it to list the
+//!   computers it can pair with;
+//! - a pairing listener, `_vergence-pair._tcp` (TXT `id`, and `hs` for the one device it was
+//!   opened for): up only while a pairing is open. A headset that asked to pair finds the one
+//!   with its own id and dials it, and the six-digit comparison does the rest. Nothing a record
+//!   says grants anything.
 //!
 //! Through the system's own responder: `dns-sd` on macOS (mDNSResponder), `avahi-publish-service`
 //! on Linux, and on Windows the DNS Client service's own mDNS responder through
@@ -9,7 +15,9 @@
 
 use std::process::{Child, Command, Stdio};
 
-/// The record, withdrawn when this is dropped.
+use vergence_companion::discovery::{VERSION, key};
+
+/// A record, withdrawn when this is dropped.
 pub struct Announcement {
     child: Option<Child>,
     #[cfg(windows)]
@@ -17,29 +25,57 @@ pub struct Announcement {
 }
 
 impl Announcement {
+    /// The host record: `name` is how headsets list this computer. No socket stands behind it;
+    /// SRV needs a port, so the discard port stands in (as RAVECompanionPresence does).
+    pub fn host(name: &str, host_id: &str, addresses: &[String]) -> Announcement {
+        let service = vergence_coordinator::paired::namespace().host_service_type();
+        let mut txt = vec![
+            (key::VERSION.to_string(), VERSION.to_string()),
+            (key::HOST_ID.to_string(), host_id.to_string()),
+            // The paired channel listens whenever the app does, so there is nothing to knock open.
+            (key::OPEN.to_string(), "1".to_string()),
+        ];
+        if !addresses.is_empty() {
+            txt.push((key::ADDRESSES.to_string(), addresses.join(",")));
+        }
+        Self::service(name, &service, 9, &txt)
+    }
+
     /// Announces `name`'s pairing listener on `port`. Never fails: without a responder the
-    /// headset pairs by address instead.
-    pub fn pairing(name: &str, port: u16, host_id: &str) -> Announcement {
+    /// headset pairs by address instead. `device_id` is the one device a listener opened for a
+    /// pairing request is for; the one on the fixed port is for any.
+    pub fn pairing(name: &str, port: u16, host_id: &str, device_id: Option<&str>) -> Announcement {
         let service = vergence_coordinator::paired::namespace().pair_service_type();
-        let txt = format!("id={host_id}");
+        let mut txt = vec![(key::HOST_ID.to_string(), host_id.to_string())];
+        if let Some(device_id) = device_id {
+            txt.push((key::DEVICE_ID.to_string(), device_id.to_string()));
+        }
+        Self::service(name, &service, port, &txt)
+    }
+
+    fn service(name: &str, service: &str, port: u16, txt: &[(String, String)]) -> Announcement {
+        let pairs: Vec<String> = txt.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let command = if cfg!(target_os = "macos") {
-            let mut c = Command::new("/usr/bin/dns-sd");
-            c.args(["-R", name, &service, "local", &port.to_string(), &txt]);
-            Some(c)
+            let mut args = vec!["-R".to_string(), name.into(), service.into(), "local".into(), port.to_string()];
+            args.extend(pairs);
+            supervised("/usr/bin/dns-sd", args)
         } else if cfg!(target_os = "linux") {
-            let mut c = Command::new("avahi-publish-service");
-            c.args([name, &service, &port.to_string(), &txt]);
-            Some(c)
+            let mut args = vec![name.to_string(), service.to_string(), port.to_string()];
+            args.extend(pairs);
+            supervised("avahi-publish-service", args)
         } else {
             None
         };
         #[cfg(windows)]
-        let registration = windows_dnssd::Registration::new(name, &service, port, &[("id", host_id)]);
+        let registration = {
+            let borrowed: Vec<(&str, &str)> = txt.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            windows_dnssd::Registration::new(name, service, port, &borrowed)
+        };
         let child = command.and_then(|mut c| {
             match c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
                 Ok(child) => Some(child),
                 Err(e) => {
-                    tracing::info!(error = %e, "no mDNS responder to announce pairing on");
+                    tracing::info!(error = %e, "no mDNS responder to announce on");
                     None
                 }
             }
@@ -51,22 +87,64 @@ impl Announcement {
         }
     }
 
-    pub fn is_announced(&self) -> bool {
+    /// Whether a responder is carrying the record: its process still runs, or the Windows
+    /// registration was confirmed.
+    pub fn is_announced(&mut self) -> bool {
         #[cfg(windows)]
         if self.registration.is_some() {
             return true;
         }
-        self.child.is_some()
+        match self.child.as_mut().map(Child::try_wait) {
+            Some(Ok(None)) => true,
+            // Gone already: the responder isn't installed, or refused the record.
+            _ => false,
+        }
     }
 }
 
 impl Drop for Announcement {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop(&mut child);
         }
     }
+}
+
+/// The responder, run under a small shell that ends it when this app does by any means (a crash,
+/// a kill): a record that stays up after the app is gone would list a computer nobody answers
+/// for, until a restart. The responder's own process is the shell's child, so dropping the
+/// announcement asks the shell to stop (it ends the responder) rather than killing it outright.
+#[cfg(unix)]
+fn supervised(program: &str, args: Vec<String>) -> Option<Command> {
+    const SUPERVISOR: &str = r#"parent=$PPID; "$@" & child=$!; trap 'kill $child 2>/dev/null; exit 0' TERM INT; (while kill -0 $parent 2>/dev/null && kill -0 $child 2>/dev/null; do sleep 2; done; kill $child 2>/dev/null) & wait $child"#;
+    let mut c = Command::new("/bin/sh");
+    c.arg("-c").arg(SUPERVISOR).arg("sh").arg(program).args(args);
+    Some(c)
+}
+
+#[cfg(not(unix))]
+fn supervised(_program: &str, _args: Vec<String>) -> Option<Command> {
+    None
+}
+
+#[cfg(unix)]
+fn stop(child: &mut Child) {
+    // SAFETY: a signal to our own child, which is still ours to wait for.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    for _ in 0..20 {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn stop(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Windows: a DNS-SD service instance registered with the DNS Client service's mDNS responder.
@@ -215,7 +293,7 @@ mod tests {
     #[test]
     fn the_pairing_listener_can_be_browsed_for() {
         let name = format!("Vergence test {}", std::process::id());
-        let announcement = Announcement::pairing(&name, 4869, "TEST-HOST");
+        let mut announcement = Announcement::pairing(&name, 4869, "TEST-HOST", None);
         assert!(announcement.is_announced());
         let mut browse = Command::new("/usr/bin/dns-sd")
             .args(["-B", "_vergence-pair._tcp", "local"])
@@ -230,5 +308,14 @@ mod tests {
         let _ = browse.wait();
         assert!(out.contains(&name), "browse saw: {out}");
         drop(announcement);
+        // Nothing of it is left running: not the responder, nor the shell that watches it.
+        let running = || Command::new("/usr/bin/pgrep").args(["-f", &name]).output().unwrap().status.success();
+        for _ in 0..80 {
+            if !running() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the announcement's processes are still running");
     }
 }

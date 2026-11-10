@@ -28,6 +28,9 @@ sha2 = "0.10"
 # Verified self-updates, shared with Apparition (a sibling package, like DebugTrace).
 signed-update = { path = "../../signed-update", features = ["ech"] }
 tempfile = "3"
+# Reads the knock records headsets advertise (TXT resolved the same on every platform); our own
+# records go out through the system responder (announce.rs).
+mdns-sd = { version = "0.21", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
