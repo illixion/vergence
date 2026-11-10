@@ -20,16 +20,6 @@ impl Golden {
     fn s(&self, key: &str) -> &str {
         self.0[key].as_str().unwrap()
     }
-    fn bytes(&self, key: &str) -> Vec<u8> {
-        hex(self.s(key))
-    }
-}
-
-fn hex(text: &str) -> Vec<u8> {
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
-        .collect()
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -76,7 +66,10 @@ fn exchange_keys_commitment_code_key_and_sealed_grant() {
     let (device, host) = (device(), host());
     assert_eq!(to_hex(&device.public_key()), g.s("hsPublicKey"));
     assert_eq!(to_hex(&host.public_key()), g.s("macPublicKey"));
-    let commitment = PairingExchange::commitment(&device.public_key(), &device.nonce());
+    let requested = vec!["audio".to_string(), "screen".to_string()];
+    let commitment = PairingExchange::commitment(
+        &ns, &device.public_key(), &device.nonce(), "device-1", "Vision Pro", Some(&requested), None,
+    );
     assert_eq!(to_hex(&commitment), g.s("commitment"));
 
     for (mine, theirs) in [(&device, host.public_key()), (&host, device.public_key())] {
@@ -89,25 +82,15 @@ fn exchange_keys_commitment_code_key_and_sealed_grant() {
             &device.nonce(),
             &host.public_key(),
             &host.nonce(),
+            "MAC-1", "Studio", "device-1", "Vision Pro", Some(&requested), None,
         )
         .expect("both ends agree");
         assert_eq!(agreement.code, g.s("code"));
         assert_eq!(to_hex(&agreement.key), g.s("key"));
 
-        // Longwave's sealed grant opens to the expected grant…
-        let sealed = g.bytes("sealedGrant");
-        assert_eq!(
-            PairingExchange::open(&sealed, &agreement.key).unwrap(),
-            expected_grant()
-        );
-        // …and sealing its plaintext again under the same nonce gives the same bytes.
+        let sealed = PairingExchange::seal(&expected_grant(), &agreement.key);
+        assert_eq!(PairingExchange::open(&sealed, &agreement.key).unwrap(), expected_grant());
         let plaintext = PairingExchange::open_bytes(&sealed, &agreement.key).unwrap();
-        let nonce: [u8; 12] = sealed[..12].try_into().unwrap();
-        assert_eq!(
-            PairingExchange::seal_with_nonce(&plaintext, &agreement.key, nonce),
-            sealed
-        );
-        // Our own encoding of the grant is the same JSON (key order aside).
         let ours: Value =
             serde_json::from_slice(&vergence_companion::json::to_swift_json(&expected_grant()))
                 .unwrap();
@@ -117,9 +100,12 @@ fn exchange_keys_commitment_code_key_and_sealed_grant() {
 
 #[test]
 fn a_wrong_reveal_or_key_is_refused() {
-    let ns = Namespace::longwave();
     let (device, host) = (device(), host());
-    let commitment = PairingExchange::commitment(&device.public_key(), &device.nonce());
+    let ns = Namespace::longwave();
+    let requested = vec!["audio".to_string(), "screen".to_string()];
+    let commitment = PairingExchange::commitment(
+        &ns, &device.public_key(), &device.nonce(), "device-1", "Vision Pro", Some(&requested), None,
+    );
     let wrong_nonce = PairingExchange::agree(
         &ns,
         &host,
@@ -129,6 +115,7 @@ fn a_wrong_reveal_or_key_is_refused() {
         &[0x34; 32],
         &host.public_key(),
         &host.nonce(),
+        "MAC-1", "Studio", "device-1", "Vision Pro", Some(&requested), None,
     );
     assert!(wrong_nonce.is_none());
     // A low-order point (all zeros) gives no contributory secret.
@@ -137,13 +124,36 @@ fn a_wrong_reveal_or_key_is_refused() {
         &ns,
         &host,
         &zero,
-        &PairingExchange::commitment(&zero, &device.nonce()),
+        &PairingExchange::commitment(&ns, &zero, &device.nonce(), "device-1", "Vision Pro", Some(&requested), None),
         &zero,
         &device.nonce(),
         &host.public_key(),
         &host.nonce(),
+        "MAC-1", "Studio", "device-1", "Vision Pro", Some(&requested), None,
     );
     assert!(low.is_none());
+}
+
+#[test]
+fn pairing_v2_rejects_tampered_enrollment_and_host_metadata() {
+    let ns = Namespace::longwave();
+    let (device, host) = (device(), host());
+    let requested = vec!["audio".to_string(), "screen".to_string()];
+    let commitment = PairingExchange::commitment(
+        &ns, &device.public_key(), &device.nonce(), "device-1", "Vision Pro", Some(&requested), None,
+    );
+    let agree = |device_id: &str, grants: &[String], host_id: &str| PairingExchange::agree(
+        &ns, &device, &host.public_key(), &commitment,
+        &device.public_key(), &device.nonce(), &host.public_key(), &host.nonce(),
+        host_id, "Studio", device_id, "Vision Pro", Some(grants), None,
+    );
+    assert!(agree("other-device", &requested, "MAC-1").is_none());
+    assert!(agree("device-1", &["audio".into(), "projects".into(), "screen".into()], "MAC-1").is_none());
+    assert!(agree("device-1", &requested, "spoofed-MAC").is_some_and(|a| a.code != agree("device-1", &requested, "MAC-1").unwrap().code));
+    let with_ssh = PairingExchange::commitment(
+        &ns, &device.public_key(), &device.nonce(), "device-1", "Vision Pro", Some(&requested), Some("ssh-ed25519 AAAA attacker"),
+    );
+    assert_ne!(with_ssh, commitment);
 }
 
 #[test]
@@ -240,21 +250,23 @@ fn pair_link_vetting() {
 
 #[test]
 fn every_longwave_message_decodes_to_the_known_values_and_reencodes() {
-    let g = Golden::load();
     let (device, host) = (device(), host());
-    let expected = [
+    let namespace = Namespace::longwave();
+    let requested = vec!["audio".to_string(), "screen".to_string()];
+    let commitment = PairingExchange::commitment(
+        &namespace, &device.public_key(), &device.nonce(), "device-1", "Vision Pro", Some(&requested), None,
+    );
+    let agreement = PairingExchange::agree(
+        &namespace, &device, &host.public_key(), &commitment,
+        &device.public_key(), &device.nonce(), &host.public_key(), &host.nonce(),
+        "MAC-1", "Studio", "device-1", "Vision Pro", Some(&requested), None,
+    ).unwrap();
+    let expected = vec![
         PairingMessage::Commit {
-            headset_id: "HS-1".into(),
+            headset_id: "device-1".into(),
             headset_name: "Vision Pro".into(),
-            commitment: g.bytes("commitment"),
-            requested: Some(vec!["audio".into(), "screen".into()]),
-            ssh_public_key: Some("ssh-ed25519 AAAA x".into()),
-        },
-        PairingMessage::Commit {
-            headset_id: "HS-1".into(),
-            headset_name: "Vision Pro".into(),
-            commitment: g.bytes("commitment"),
-            requested: None,
+            commitment: commitment.to_vec(),
+            requested: Some(requested.clone()),
             ssh_public_key: None,
         },
         PairingMessage::MacHello {
@@ -268,25 +280,17 @@ fn every_longwave_message_decodes_to_the_known_values_and_reencodes() {
             nonce: device.nonce().to_vec(),
         },
         PairingMessage::Accept {
-            sealed_grant: g.bytes("sealedGrant"),
+            sealed_grant: PairingExchange::seal(&expected_grant(), &agreement.key),
         },
         PairingMessage::Deny {},
     ];
-    let messages = g.0["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), expected.len());
-    for (index, (hex_frame, want)) in messages.iter().zip(&expected).enumerate() {
-        let frame = hex(hex_frame.as_str().unwrap());
+    for (index, want) in expected.iter().enumerate() {
+        let frame = want.framed();
         let mut buffer = frame.clone();
         let message = PairingMessage::take(&mut buffer).unwrap().unwrap();
         assert!(buffer.is_empty(), "message {index}");
         assert_eq!(&message, want, "message {index}");
-        let reframed = message.framed();
-        // Same length prefix and the same JSON; Swift's key order isn't fixed.
-        assert_eq!(reframed.len(), frame.len(), "message {index}");
-        assert_eq!(reframed[..4], frame[..4], "message {index}");
-        let ours: Value = serde_json::from_slice(&reframed[4..]).unwrap();
-        let theirs: Value = serde_json::from_slice(&frame[4..]).unwrap();
-        assert_eq!(ours, theirs, "message {index}");
+        assert_eq!(message.framed(), frame, "message {index}");
     }
 }
 

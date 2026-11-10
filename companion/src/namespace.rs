@@ -7,7 +7,7 @@
 pub struct Namespace {
     /// Bonjour service stem: `_<stem>-mac._tcp`, `_<stem>-knock._tcp`, `_<stem>-pair._tcp`.
     pub service_stem: String,
-    /// Prefix of every key-derivation label (`<prefix>-Knock-v1`, `<prefix>-Pair-v1`,
+    /// Prefix of every key-derivation label (`<prefix>-Knock-v1`, `<prefix>-Pair-v2`,
     /// `<prefix>-Device-Proof-v1`).
     pub label_prefix: String,
     /// Scheme of the address link (`<scheme>://pair?…`).
@@ -66,7 +66,7 @@ impl Namespace {
     }
 
     pub(crate) fn pair_info(&self) -> Vec<u8> {
-        format!("{}-Pair-v1", self.label_prefix).into_bytes()
+        format!("{}-Pair-v2", self.label_prefix).into_bytes()
     }
 
     pub(crate) fn proof_salt(&self) -> Vec<u8> {

@@ -8,7 +8,7 @@ use std::fmt;
 
 use crate::error::PairingError;
 use crate::exchange::{Agreement, PairingExchange};
-use crate::message::{PairingGrant, PairingMessage};
+use crate::message::{MAX_INBOX_BYTES, PairingGrant, PairingMessage};
 use crate::namespace::Namespace;
 
 #[derive(Clone, Debug)]
@@ -64,10 +64,13 @@ impl DevicePairing {
     }
 
     pub fn with_exchange(config: DeviceConfig, exchange: PairingExchange) -> Self {
-        let commitment = PairingExchange::commitment(&exchange.public_key(), &exchange.nonce());
         let mut requested = config.requested.clone();
         requested.sort();
         requested.dedup();
+        let commitment = PairingExchange::commitment(
+            &config.namespace, &exchange.public_key(), &exchange.nonce(),
+            &config.device_id, &config.device_name, Some(&requested), config.ssh_public_key.as_deref(),
+        );
         let commit = PairingMessage::Commit {
             headset_id: config.device_id.clone(),
             headset_name: config.device_name.clone(),
@@ -99,6 +102,10 @@ impl DevicePairing {
         if self.is_finished() {
             return Ok(events);
         }
+        if bytes.len() > MAX_INBOX_BYTES.saturating_sub(self.inbox.len()) {
+            self.state = State::Done;
+            return Err(PairingError::Protocol("pairing inbox exceeds its limit"));
+        }
         self.inbox.extend_from_slice(bytes);
         while !self.is_finished() {
             let message = match PairingMessage::take(&mut self.inbox) {
@@ -126,6 +133,7 @@ impl DevicePairing {
                 State::AwaitingHello,
                 PairingMessage::MacHello {
                     mac_id,
+                    mac_name,
                     public_key,
                     nonce,
                     ..
@@ -148,6 +156,12 @@ impl DevicePairing {
                     &self.exchange.nonce(),
                     &public_key,
                     &nonce,
+                    &mac_id,
+                    &mac_name,
+                    &self.config.device_id,
+                    &self.config.device_name,
+                    Some(&self.config.requested),
+                    self.config.ssh_public_key.as_deref(),
                 )
                 .ok_or(PairingError::Protocol("the host's key is unusable"))?;
                 self.outbox.extend(

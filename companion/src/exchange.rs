@@ -92,12 +92,30 @@ impl PairingExchange {
         self.nonce
     }
 
-    /// The device's opening move: a hash binding its key and nonce.
-    pub fn commitment(public_key: &[u8], nonce: &[u8]) -> [u8; 32] {
-        let mut hash = Sha256::new();
-        hash.update(public_key);
-        hash.update(nonce);
-        hash.finalize().into()
+    /// The device's opening move: bind all enrollment metadata the host will
+    /// use before approval, as well as the ephemeral key and nonce.
+    pub fn commitment(
+        namespace: &Namespace,
+        public_key: &[u8], nonce: &[u8],
+        device_id: &str, device_name: &str,
+        requested: Option<&[String]>, ssh_public_key: Option<&str>,
+    ) -> [u8; 32] {
+        let mut transcript = b"RAVECompanionPairCommit-v2".to_vec();
+        append_field(&namespace.pair_info(), &mut transcript);
+        append_field(public_key, &mut transcript);
+        append_field(nonce, &mut transcript);
+        append_field(device_id.as_bytes(), &mut transcript);
+        append_field(device_name.as_bytes(), &mut transcript);
+        let mut grants = requested.unwrap_or_default().to_vec();
+        grants.sort();
+        grants.dedup();
+        append_length(grants.len() as u32, &mut transcript);
+        for grant in grants { append_field(grant.as_bytes(), &mut transcript); }
+        match ssh_public_key {
+            Some(key) => { transcript.push(1); append_field(key.as_bytes(), &mut transcript); }
+            None => transcript.push(0),
+        }
+        Sha256::digest(transcript).into()
     }
 
     /// Runs on both ends once all four values are known. `None` when the
@@ -112,8 +130,12 @@ impl PairingExchange {
         device_nonce: &[u8],
         host_public_key: &[u8],
         host_nonce: &[u8],
+        host_id: &str, host_name: &str,
+        device_id: &str, device_name: &str,
+        requested: Option<&[String]>, ssh_public_key: Option<&str>,
     ) -> Option<Agreement> {
-        if Self::commitment(device_public_key, device_nonce).as_slice() != commitment {
+        if Self::commitment(namespace, device_public_key, device_nonce, device_id, device_name,
+                            requested, ssh_public_key).as_slice() != commitment {
             return None;
         }
         let theirs: [u8; 32] = their_public_key.try_into().ok()?;
@@ -122,13 +144,15 @@ impl PairingExchange {
         if !shared.was_contributory() {
             return None;
         }
-        let mut transcript = Sha256::new();
-        transcript.update(commitment);
-        transcript.update(host_public_key);
-        transcript.update(host_nonce);
-        transcript.update(device_public_key);
-        transcript.update(device_nonce);
-        let transcript: [u8; 32] = transcript.finalize().into();
+        let mut transcript_input = b"RAVECompanionPairTranscript-v2".to_vec();
+        append_field(commitment, &mut transcript_input);
+        append_field(host_public_key, &mut transcript_input);
+        append_field(host_nonce, &mut transcript_input);
+        append_field(device_public_key, &mut transcript_input);
+        append_field(device_nonce, &mut transcript_input);
+        append_field(host_id.as_bytes(), &mut transcript_input);
+        append_field(host_name.as_bytes(), &mut transcript_input);
+        let transcript: [u8; 32] = Sha256::digest(transcript_input).into();
         let mut key = [0u8; 32];
         Hkdf::<Sha256>::new(Some(&transcript), shared.as_bytes())
             .expand(&namespace.pair_info(), &mut key)
@@ -182,6 +206,15 @@ impl PairingExchange {
         let (a, b) = code.split_at(3);
         format!("{a} {b}")
     }
+}
+
+fn append_field(value: &[u8], transcript: &mut Vec<u8>) {
+    append_length(value.len() as u32, transcript);
+    transcript.extend_from_slice(value);
+}
+
+fn append_length(length: u32, transcript: &mut Vec<u8>) {
+    transcript.extend_from_slice(&length.to_be_bytes());
 }
 
 /// 32 random bytes.

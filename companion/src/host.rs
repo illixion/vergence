@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::credential::Credential;
 use crate::error::PairingError;
 use crate::exchange::{Agreement, PairingExchange};
-use crate::message::{PairingGrant, PairingMessage};
+use crate::message::{MAX_INBOX_BYTES, PairingGrant, PairingMessage};
 use crate::namespace::Namespace;
 use crate::store::{DeviceRecord, now_secs};
 
@@ -114,6 +114,9 @@ enum State {
     AwaitingReveal {
         commitment: Vec<u8>,
         device: ExpectedDevice,
+        committed_device_name: String,
+        committed_requested: Option<Vec<String>>,
+        committed_ssh: Option<String>,
         requested: Vec<String>,
         ssh: Option<String>,
     },
@@ -200,6 +203,9 @@ impl HostPairing {
         if self.is_finished() {
             return Ok(None);
         }
+        if bytes.len() > MAX_INBOX_BYTES.saturating_sub(self.inbox.len()) {
+            return Err(self.fail(PairingError::Protocol("pairing inbox exceeds its limit")));
+        }
         self.inbox.extend_from_slice(bytes);
         let mut event = None;
         // While the user decides, anything more just waits (the device has
@@ -259,6 +265,9 @@ impl HostPairing {
                         name: headset_name.chars().take(80).collect(),
                     },
                 };
+                let committed_device_name = headset_name;
+                let committed_requested = requested.clone();
+                let committed_ssh = ssh_public_key.clone();
                 let mut requested = requested.unwrap_or_else(|| self.config.default_grants.clone());
                 requested.sort();
                 requested.dedup();
@@ -280,6 +289,9 @@ impl HostPairing {
                 self.state = State::AwaitingReveal {
                     commitment,
                     device,
+                    committed_device_name,
+                    committed_requested,
+                    committed_ssh,
                     requested,
                     ssh,
                 };
@@ -289,6 +301,9 @@ impl HostPairing {
                 State::AwaitingReveal {
                     commitment,
                     device,
+                    committed_device_name,
+                    committed_requested,
+                    committed_ssh,
                     requested,
                     ssh,
                 },
@@ -303,6 +318,12 @@ impl HostPairing {
                     &nonce,
                     &self.exchange.public_key(),
                     &self.exchange.nonce(),
+                    &self.config.host_id,
+                    &self.config.host_name,
+                    &device.id,
+                    &committed_device_name,
+                    committed_requested.as_deref(),
+                    committed_ssh.as_deref(),
                 )
                 .ok_or(PairingError::Protocol(
                     "the reveal didn't match its commitment",

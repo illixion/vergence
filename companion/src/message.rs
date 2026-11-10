@@ -84,12 +84,16 @@ pub enum PairingMessage {
 pub enum FrameError {
     #[error("a frame of {0} bytes is over the {max} byte limit", max = MAX_FRAME_BYTES)]
     Oversized(usize),
+    #[error("a frame may not be empty")]
+    Empty,
     #[error("a frame isn't a valid message: {0}")]
     Json(#[from] serde_json::Error),
 }
 
 /// The largest body a frame may carry.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024;
+/// Cap buffered bytes before a complete frame is available.
+pub const MAX_INBOX_BYTES: usize = 32 * 1024;
 
 /// A body behind its 4-byte little-endian length.
 pub fn frame(body: &[u8]) -> Vec<u8> {
@@ -107,6 +111,9 @@ pub fn take_frame(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>, FrameError> {
     let length = u32::from_le_bytes(buffer[..4].try_into().unwrap()) as usize;
     if length > MAX_FRAME_BYTES {
         return Err(FrameError::Oversized(length));
+    }
+    if length == 0 {
+        return Err(FrameError::Empty);
     }
     if buffer.len() < 4 + length {
         return Ok(None);
