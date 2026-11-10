@@ -16,7 +16,7 @@ pub enum PairingError {
     Seal(#[from] crate::exchange::SealError),
     #[error("pairing was declined on the host")]
     Denied,
-    #[error("the other side closed the connection")]
+    #[error("the pairing connection closed. Make sure both apps are up to date and try again")]
     Closed,
     #[error("the pairing timed out")]
     TimedOut,

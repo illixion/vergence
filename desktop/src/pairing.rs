@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use vergence_companion::host::ExpectedDevice;
 use vergence_companion::net::{Decision, serve_pairing};
-use vergence_companion::{DeviceRecord, HostConfig, HostOutcome, HostPairing, Namespace, PairLink};
+use vergence_companion::{DeviceRecord, HostConfig, HostOutcome, HostPairing, Namespace, PairLink, PairingError};
 use vergence_coordinator::auth::Grant;
 
 use crate::coordinator::CoordinatorHost;
@@ -357,6 +357,10 @@ impl Pairing {
                 Ok(HostOutcome::Paired(record)) => (format!("Paired with {}.", record.name), true),
                 Ok(HostOutcome::Declined) => ("Declined.".to_string(), false),
                 Ok(HostOutcome::Abandoned) => ("The pairing didn't finish.".to_string(), false),
+                Err(PairingError::Protocol("the reveal didn't match its commitment")) => (
+                    "Pairing could not be completed. Make sure both apps are up to date and try again.".to_string(),
+                    false,
+                ),
                 Err(e) => (format!("The pairing failed: {e}"), false),
             };
             {
