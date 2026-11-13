@@ -542,6 +542,8 @@ private final class ForwardRelay: NSObject, URLSessionDataDelegate, @unchecked S
     }
 }
 #else
+import VergenceDisc
+
 func runWorker(_ args: [String]) async throws {
     throw FormatError("worker needs Core ML (Apple platforms only)")
 }
