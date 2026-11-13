@@ -150,8 +150,9 @@ func usage(_ problem: String? = nil) -> Never {
                             [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio]
                             [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab]
                             [--keep-repeated-frames] [--antialias] [--ai-hdr] [--gain-model PATH]
-           vergence info DISC
+           vergence info DISC|FILM.mkv
            vergence decode DISC [--playlist NNNNN] [options]
+           vergence decode FILM.mkv [options]   (an MVC track: a 3D Blu-ray remuxed to Matroska)
            vergence decode BASE.m2ts [DEPENDENT.m2ts] [options]
            vergence stream DISC [--playlist NNNNN] [--seek SECONDS]
            vergence streams DISC [--playlist NNNNN]
@@ -192,7 +193,30 @@ func openDisc(_ path: String) throws -> BlurayDisc? {
     return BlurayDisc(fileSystem: try UDFFileSystem(image: FileByteSource(url: URL(fileURLWithPath: path))))
 }
 
+/// A local or remote file that is Matroska, read for its MVC track.
+func openMatroska(_ path: String) throws -> ByteSource? {
+    let source: ByteSource
+    if let url = URL(string: path), ["http", "https"].contains(url.scheme?.lowercased()) {
+        source = try HTTPByteSource(url: url, headers: options.headers)
+    } else {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else { return nil }
+        source = try FileByteSource(url: URL(fileURLWithPath: path))
+    }
+    return MatroskaFile.looksLikeMatroska(try source.read(at: 0, count: 4)) ? source : nil
+}
+
 func info(_ o: Options) throws {
+    if o.positional.count == 1, let source = try openMatroska(o.positional[0]) {
+        let file = try MatroskaFile(source: source)
+        guard let video = file.video else { print("no video track"); return }
+        print("\(file.docType), \(file.durationSeconds.map(clockTime) ?? "?"), \(file.cues.count) cues, video track \(video.number) \(video.codecID) \(video.width ?? 0)x\(video.height ?? 0)")
+        print("  stereo mode \(video.stereoMode.map(String.init) ?? "none"), \(video.isMVC ? "MVC 3D" : "no MVC configuration")\(video.baseIsRightEye ? ", base view is the right eye" : "")")
+        if let mvc = video.mvc {
+            print("  mvcC: \(mvc.sequenceParameterSets.map { "SPS type \($0.first.map { $0 & 0x1F } ?? 0)" }.joined(separator: ", ")), \(mvc.pictureParameterSets.count) PPS")
+        }
+        return
+    }
     guard o.positional.count == 1, let disc = try openDisc(o.positional[0]) else { usage() }
     let main = try disc.mainPlaylist()?.name
     for (name, playlist) in try disc.playlists() where playlist.duration >= 60 {
@@ -211,9 +235,21 @@ struct FrameSource {
     /// counts from its first clip's in-time, which players show as time zero
     /// plus that in-time (Convolution's `MVCPictureSource`). 0 for clips.
     var timeOrigin: Int64 = 0
+    /// How far (90 kHz) a timestamp step may stray from the first one before
+    /// it counts as irregular: Matroska rounds every time to a tick.
+    var stepTolerance: Int64 = 2
 }
 
 func frameSource(_ o: Options) throws -> FrameSource {
+    if o.positional.count == 1, let source = try openMatroska(o.positional[0]) {
+        let reader = try MatroskaStereoReader(source: source)
+        log("vergence: Matroska, \(reader.file.durationSeconds.map(clockTime) ?? "?"), \(reader.track.isMVC ? "MVC 3D" : "2D only"), \(reader.file.cues.count) cues")
+        let decoder = try StereoDecoder(reader: reader, threads: o.threads)
+        if let seek = o.seek { try decoder.seek(to: seek) }
+        return FrameSource(run: { try decoder.decode(output: $0) }, summary: {
+            "\(decoder.unpairedBaseCount) AUs without a second view, \(decoder.resyncCount) damaged spots skipped, \(reader.skippedBlockCount) laced blocks skipped, \(decoder.corruptNALCount) corrupt NALs, \(decoder.unsupportedNALCount) unsupported NALs"
+        }, stepTolerance: reader.file.ninetyKHz(ticks: 1) + 1)
+    }
     if o.positional.count == 1, let disc = try openDisc(o.positional[0]) {
         let (name, playlist) = try chosenPlaylist(disc, o)
         log("vergence: playlist \(name), \(clockTime(playlist.duration)), \(playlist.isStereo ? "3D" : "2D only"), clips \(playlist.items.map(\.clip).joined(separator: " "))")
@@ -269,7 +305,7 @@ func decode(_ o: Options) throws {
             if let previousPTS {
                 let step = pts - previousPTS
                 if frameTicks == nil { frameTicks = step }
-                if let frameTicks, abs(step - frameTicks) > 2 { irregular += 1 }
+                if let frameTicks, abs(step - frameTicks) > source.stepTolerance { irregular += 1 }
             }
             previousPTS = pts
         }

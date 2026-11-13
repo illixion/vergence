@@ -21,7 +21,7 @@ It contains no AACS or BD+ code.
 | Module | What | Builds on |
 | --- | --- | --- |
 | `VergenceCore` | Stereo layouts (`PackedStereoLayout`) and telling them from a file name or picture (`StereoLayoutDetector`), spatial-video camera metadata and presets (`SpatialCameraMetadata`, `SpatialPreset`), bitrates (`SpatialBitrate`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Analysis tracks (`AnalysisTrack`: flow, disparity and depth fields keyed by media time, made on one machine for another) and the producer's half of stereo Smooth Motion (`SharedFieldAnalysis`). Reading PyTorch checkpoints without Python (`TorchCheckpoint`) and finding a pulldown's repeated frames (`RepeatedFrames`). Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
-| `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
+| `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, Matroska MVC tracks, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
 | `VergenceApple` | The Apple-framework half: spatial video making and inspection (`SpatialVideoMaker`, `SpatialVideoInspector`), realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox, Smooth Motion (frame interpolation, and `StereoFlowAnalyzer`: the flow and disparity models with Core ML), 2× upscaling with Real-ESRGAN's compact network built from its weights (`FrameUpscaler`, with `StereoDetailFusion` for a stereo pair). Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
 | `vergence` | The command line tool. | macOS, Linux (disc commands only, without PNG or audio output) |
 | `VergenceCommandLine` | The tool's option parsing and output names, apart from the executable so its tests can import them (not a product). Foundation only. | Apple platforms, Linux (tested) |
@@ -434,7 +434,13 @@ swift build -c release
 
 `DISC` is a folder holding `BDMV`, a disc image (`.iso`), or the `http(s)` URL of one
 (`--header "Name: value"` or `VERGENCE_HTTP_HEADER` for authentication). `--playlist NNNNN` picks another title; a clip pair
-(`decode 00007.m2ts 00008.m2ts`) works too. `--packing sbs` for side by side,
+(`decode 00007.m2ts 00008.m2ts`) works too. So does a 3D Blu-ray remuxed to
+Matroska (MakeMKV's "3D MVC" and the remuxes made from it: one AVC track with
+both views in every Block and an `mvcC` record in its CodecPrivate or a
+BlockAdditionMapping), local or over `http(s)`; `vergence info FILM.mkv` says
+whether a file has one. Checked on a 2:06:48 MakeMKV-made remux: stereo in
+every frame from the start, after a seek to an hour and through the end, 160 to
+190 fps on an M1 Mac mini, seeking by the file's Cues. `--packing sbs` for side by side,
 `--seek SECONDS` to start part way in, `--start N --frames N` for a range of frames,
 `--output FILE`.
 
@@ -660,7 +666,9 @@ try decoder.decode { frame in
 
 `StereoPixelBufferMaker(layout: .packed(.topAndBottom)).makeBuffers(frame)` turns a frame into
 `CVPixelBuffer`s inside that closure. Lower down, `PlaylistStereoReader` gives the stereo access units and `MVCDecoder` decodes any
-stream of them.
+stream of them. A Matroska MVC file is the same with `StereoDecoder(reader: MatroskaStereoReader(source:))`,
+`MatroskaFile(source:readCues: false)` being the cheap check for an MVC track (`video?.isMVC`); its
+frames' `pts` are the file's own times in 90 kHz.
 
 The other streams of a clip come from the same reads: set `PlaylistDecoder.sidePIDs`
 and `onSidePackets` hands over their PES, on the playlist timeline, as the video is
