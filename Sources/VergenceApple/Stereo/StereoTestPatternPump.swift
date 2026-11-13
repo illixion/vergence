@@ -21,6 +21,7 @@ import VergenceCore
 /// `CMTaggedBufferGroupFormatDescription`, pull-model enqueue) to validate the
 /// windowed-stereo plumbing without our decode/warp in the loop.
 /// `@unchecked Sendable`: all state is touched only on `queue`.
+@available(visionOS 26.0, *)
 public final class StereoTestPatternPump: @unchecked Sendable {
     private let videoRenderer: AVSampleBufferVideoRenderer
     private let queue = DispatchQueue(label: "com.illixion.vergence.stereo-testpattern", qos: .userInteractive)

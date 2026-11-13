@@ -72,7 +72,9 @@ struct PackedEyeUniforms {
 /// Owns all per-frame GPU work on a dedicated background queue with its own
 /// command queue. `@unchecked Sendable`: the AVFoundation / CoreVideo / Metal
 /// objects it holds are documented thread-safe, config is lock-guarded, and all
-/// mutable state is touched only on `queue`.
+/// mutable state is touched only on `queue`. visionOS 26 for CoreMedia's tagged
+/// buffers and CoreVideo's Swift pixel buffers.
+@available(visionOS 26.0, *)
 public final class StereoPump: @unchecked Sendable {
     /// Called when real-time depth inference briefly holds/releases the media
     /// clock. Set before `start`; invoked on the pump queue.

@@ -22,7 +22,9 @@ testCrypto.append(.product(name: "Crypto", package: "swift-crypto"))
 
 let package = Package(
     name: "Vergence",
-    platforms: [.macOS(.v14), .iOS(.v26), .visionOS(.v26), .tvOS(.v26)],
+    // iOS and tvOS 17 and visionOS 2, as RAVESDK, which depends on this, declares for
+    // Apparition's older devices; what needs newer is marked `@available`.
+    platforms: [.macOS(.v14), .iOS(.v17), .visionOS(.v2), .tvOS(.v17)],
     products: [
         .library(name: "VergenceCore", targets: ["VergenceCore"]),
         .library(name: "VergenceDisc", targets: ["VergenceDisc"]),

@@ -427,9 +427,14 @@ private final class SegmentEncoder: @unchecked Sendable {
 
     init(width: Int, height: Int, tenBit: Bool, color: Color, bitsPerSecond: Int, frameRate: Double, keyFrameSeconds: Double) throws {
         var made: VTCompressionSession?
+        // Asking for the hardware encoder by name needs iOS and tvOS 17.4; before that it's the default.
+        var specification: [CFString: Any] = [:]
+        if #available(iOS 17.4, tvOS 17.4, *) {
+            specification[kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder] = true
+        }
         let status = VTCompressionSessionCreate(
             allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_HEVC,
-            encoderSpecification: [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true] as CFDictionary,
+            encoderSpecification: specification as CFDictionary,
             imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &made)
         guard status == noErr, let made else { throw SpatialVideoError.writer("the encoder refused \(width)×\(height) HEVC (\(status))") }
         session = made

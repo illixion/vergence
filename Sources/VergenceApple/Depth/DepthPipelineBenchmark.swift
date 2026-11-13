@@ -524,7 +524,7 @@ public enum DepthPipelineBenchmark {
             }
         }
 
-        if #available(iOS 17.4, macOS 14.4, visionOS 1.1, *) {
+        if #available(iOS 17.4, macOS 14.4, tvOS 17.4, visionOS 1.1, *) {
             lines += await computePlanSummary(compiled: compiled, config: allConfig)
         }
         return lines
@@ -598,7 +598,7 @@ public enum DepthPipelineBenchmark {
     /// Where Core ML plans to run each op, weighted by its own cost estimate.
     /// Anything not on the Neural Engine is a handoff and a candidate for the
     /// converter script's precision ladder or an op substitution.
-    @available(iOS 17.4, macOS 14.4, visionOS 1.1, *)
+    @available(iOS 17.4, macOS 14.4, tvOS 17.4, visionOS 1.1, *)
     private static func computePlanSummary(compiled: URL, config: MLModelConfiguration) async -> [String] {
         guard let plan = try? await MLComputePlan.load(contentsOf: compiled, configuration: config) else {
             return ["  compute plan: unavailable"]
