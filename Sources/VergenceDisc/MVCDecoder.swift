@@ -40,6 +40,13 @@ public struct StereoFrame {
     public var right: [PlaneView]?
     public var width: Int { left[0].width }
     public var height: Int { left[0].height }
+
+    /// The same pictures with the eyes the other way round, for a stream
+    /// whose base view is the right eye (Matroska StereoMode 14).
+    public func swappingEyes() -> StereoFrame {
+        guard let right else { return self }
+        return StereoFrame(pts: pts, left: right, right: left)
+    }
 }
 
 public final class MVCDecoder {
