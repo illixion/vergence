@@ -55,8 +55,9 @@ its values and their privacy kept apart, to apply its own redaction.
 ## Tests
 
 `swift test` runs on synthetic data only, on macOS and on Linux
-(`docker run --rm -v "$PWD":/src:ro swift:6.2.4-noble bash -c 'cp -r /src /work && cd /work && swift test'`;
-the copy keeps the container's build out of the checkout). `scripts/build-android.sh` cross-compiles
+(`docker run --rm -v "$PWD":/src:ro swift:6.2.4-noble bash -c 'mkdir /work && tar -C /src --exclude=./.build --exclude=./target --exclude="./*/target" -cf - . | tar -C /work -xf - && cd /work && swift test'`;
+the copy keeps the container's build out of the checkout, and leaves out the build folders: the
+Rust workspace's `target/` grows past 15 GB, and copying it into the VM once filled the Mac's disk). `scripts/build-android.sh` cross-compiles
 for Android arm64 with the open-source toolchain and its Android SDK bundle; nothing runs on a device
 yet. `scripts/fetch-conformance.sh` downloads the ITU-T MVC
 conformance bitstreams (36 MB, not redistributed here);
