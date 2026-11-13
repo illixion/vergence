@@ -33,8 +33,16 @@ struct TwoViewStream: Sendable {
     }
 
     private static func stream(_ type: UInt8, _ pid: UInt16, language: String? = nil) -> [UInt8] {
-        let descriptor = language.map { [0x0A, 4] + Array($0.utf8) + [0] } ?? []
-        return [type, 0xE0 | UInt8(pid >> 8), UInt8(pid & 0xFF), 0xF0, UInt8(descriptor.count)] + descriptor
+        // Typed step by step: Linux's type checker gives up on the one-expression form.
+        var descriptor: [UInt8] = []
+        if let language {
+            descriptor = [0x0A, 4]
+            descriptor += Array(language.utf8)
+            descriptor.append(0)
+        }
+        let high: UInt8 = 0xE0 | UInt8(pid >> 8)
+        let entry: [UInt8] = [type, high, UInt8(pid & 0xFF), 0xF0, UInt8(descriptor.count)]
+        return entry + descriptor
     }
 
     private static func programTables(_ builder: inout StreamBuilder, streams: [[UInt8]]) {
