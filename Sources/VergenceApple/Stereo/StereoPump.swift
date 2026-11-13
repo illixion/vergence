@@ -311,6 +311,11 @@ public final class StereoPump: @unchecked Sendable {
     /// with the first source frame's colour signal, and again whenever it
     /// changes (an HLS variant switch, a new item).
     public var onFrameSignal: (@Sendable (FrameColorSignal) -> Void)?
+    /// The source frames' format, with their colour tags and HDR static
+    /// metadata, each time their colour signal changes. What a host states
+    /// as display criteria for a stream whose track describes no format
+    /// (HLS), as the flat player does from its first frame. Pump queue.
+    public var onFrameFormat: (@Sendable (CMVideoFormatDescription) -> Void)?
     /// Any thread may read; set before `start()`. Called once, on the pump
     /// queue, when the first frame is one no warp can show right (Dolby
     /// Vision profile 5, `DolbyVisionFrames`); nothing is rendered from then
@@ -1558,6 +1563,12 @@ public final class StereoPump: @unchecked Sendable {
         if signal != lastReportedSignal {
             lastReportedSignal = signal
             onFrameSignal?(signal)
+            if let onFrameFormat {
+                var format: CMVideoFormatDescription?
+                CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer,
+                                                             formatDescriptionOut: &format)
+                if let format { onFrameFormat(format) }
+            }
         }
         guard size.width > 0, size.height > 0, lastReportedSize != size else { return }
         lastReportedSize = size
