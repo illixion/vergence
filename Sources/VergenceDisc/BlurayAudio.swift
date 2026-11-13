@@ -118,7 +118,7 @@ public final class PlaylistAudioReader {
     public let playlist: BlurayPlaylist
     public let pid: UInt16
     public static let sampleRate = 48_000
-    private let disc: BlurayDisc
+    private let disc: any ClipSource
     private let itemStarts: [Int64]
     private let decoder: any AudioFrameDecoder
     /// Where the last read ended, to continue without seeking: the clip,
@@ -128,7 +128,7 @@ public final class PlaylistAudioReader {
     /// - Parameters:
     ///   - pid: an AC-3, E-AC-3 or TrueHD (its AC-3 core) PID.
     ///   - decoder: decodes the track's AC-3 frames.
-    public init(disc: BlurayDisc, playlist: BlurayPlaylist, pid: UInt16, decoder: any AudioFrameDecoder) {
+    public init(disc: any ClipSource, playlist: BlurayPlaylist, pid: UInt16, decoder: any AudioFrameDecoder) {
         self.decoder = decoder
         self.disc = disc
         self.playlist = playlist
@@ -169,7 +169,7 @@ public final class PlaylistAudioReader {
             pending = resume.pending
         } else {
             let videoPID = item.videoPID ?? TransportStreamDemuxer.blurayBaseVideoPID
-            let entry = disc.clipInfo(item.clip)?.entryPoint(pid: videoPID, atOrBefore: clipFrom - 90_000)
+            let entry = try disc.entryPoint(clip: item.clip, pid: videoPID, atOrBefore: clipFrom - 90_000)
             demuxer = TransportStreamDemuxer(pids: [pid])
             offset = entry?.byteOffset ?? 0
             decoder.reset()

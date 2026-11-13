@@ -139,7 +139,7 @@ public final class AC3Decoder: AudioFrameDecoder {
 
 extension PlaylistAudioReader {
     /// A reader decoding through Apple's AC-3 decoder.
-    public convenience init(disc: BlurayDisc, playlist: BlurayPlaylist, pid: UInt16) {
+    public convenience init(disc: any ClipSource, playlist: BlurayPlaylist, pid: UInt16) {
         self.init(disc: disc, playlist: playlist, pid: pid, decoder: AC3Decoder())
     }
 }

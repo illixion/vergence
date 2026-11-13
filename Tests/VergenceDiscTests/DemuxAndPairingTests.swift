@@ -8,12 +8,28 @@ struct StreamBuilder {
     private var continuity: [UInt16: UInt8] = [:]
 
     /// `declaresLength` fills PES_packet_length the way audio and subtitle
-    /// PES do; video leaves it 0.
-    mutating func pes(pid: UInt16, pts: Int64, payload: Data, declaresLength: Bool = false) {
-        let length = declaresLength ? 3 + 5 + payload.count : 0
-        var pes = Data([0, 0, 1, 0xE0, UInt8(length >> 8), UInt8(length & 0xFF), 0x80, 0x80, 5])
-        pes.append(contentsOf: Self.timestamp(pts, marker: 0x2))
+    /// PES do; video leaves it 0. A `dts` is written after the PTS.
+    mutating func pes(pid: UInt16, pts: Int64, dts: Int64? = nil, payload: Data, declaresLength: Bool = false) {
+        let header = dts == nil ? 5 : 10
+        let length = declaresLength ? 3 + header + payload.count : 0
+        var pes = Data([0, 0, 1, 0xE0, UInt8(length >> 8), UInt8(length & 0xFF), 0x80, dts == nil ? 0x80 : 0xC0, UInt8(header)])
+        pes.append(contentsOf: Self.timestamp(pts, marker: dts == nil ? 0x2 : 0x3))
+        if let dts { pes.append(contentsOf: Self.timestamp(dts, marker: 0x1)) }
         pes.append(payload)
+        packets(pid: pid, pes)
+    }
+
+    /// A PSI section (PAT, PMT) on `pid`, behind a pointer field; the CRC
+    /// is left zero (nothing here checks it).
+    mutating func section(pid: UInt16, tableID: UInt8, body: [UInt8]) {
+        let length = 5 + body.count + 4
+        var section: [UInt8] = [tableID, 0xB0 | UInt8(length >> 8), UInt8(length & 0xFF), 0, 1, 0xC1, 0, 0]
+        section += body + [0, 0, 0, 0]
+        packets(pid: pid, Data([0] + section), pad: 0xFF)
+    }
+
+    /// Splits `pes` into 188-byte packets behind 4-byte BDAV headers.
+    private mutating func packets(pid: UInt16, _ pes: Data, pad: UInt8? = nil) {
         var first = true
         var offset = 0
         while offset < pes.count {
@@ -24,6 +40,14 @@ struct StreamBuilder {
             continuity[pid] = (cc + 1) & 0xF
             packet.append((first ? 0x40 : 0) | UInt8(pid >> 8))
             packet.append(UInt8(pid & 0xFF))
+            if take < room, let pad {
+                // PSI pads its last packet's payload rather than adapting.
+                packet.append(0x10 | cc)
+                packet.append(pes[(pes.startIndex + offset) ..< (pes.startIndex + offset + take)])
+                packet.append(contentsOf: repeatElement(pad, count: room - take))
+                bytes.append(packet)
+                break
+            }
             if take < room {
                 // Adaptation field of stuffing pads the last packet to 188.
                 let stuffing = room - take

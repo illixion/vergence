@@ -114,7 +114,7 @@ public final class PlaylistDecoder {
     public var unsupportedNALCount: Int { decoder.unsupportedNALCount }
 
     /// - Parameter stereo: false decodes the base view alone.
-    public init(disc: BlurayDisc, playlist: BlurayPlaylist, stereo: Bool = true, threads: Int = 0) throws {
+    public init(disc: any ClipSource, playlist: BlurayPlaylist, stereo: Bool = true, threads: Int = 0) throws {
         self.playlist = playlist
         let reader = disc.stereoReader(for: playlist, stereo: stereo)
         self.reader = reader

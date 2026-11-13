@@ -37,7 +37,9 @@
  read in place without mounting, or an http(s) URL of a disc image (read with
  range requests; --header "Name: value" adds a header, as does
  VERGENCE_HTTP_HEADER, which keeps a token out of the process list). Without
- --playlist, decode picks the feature: the longest 3D playlist.
+ --playlist, decode picks the feature: the longest 3D playlist. A transport
+ stream holding both views (.m2ts/.mts/.ts/.ssif with an MVC stream, local
+ or http(s)) is a DISC of one playlist, seeking by searching the file.
 
  decode writes packed I420 frames (rawvideo, yuv420p) for ffmpeg, e.g.
 
@@ -150,9 +152,10 @@ func usage(_ problem: String? = nil) -> Never {
                             [--quality low|standard|high|max] [--bitrate MBPS] [--max-eye PIXELS] [--no-audio]
                             [--upscale 2x] [--upscale-model PATH.pth] [--input-layout auto|2d|sbs|hsbs|tab|htab]
                             [--keep-repeated-frames] [--antialias] [--ai-hdr] [--gain-model PATH]
-           vergence info DISC|FILM.mkv
+           vergence info DISC|FILM.mkv|FILM.m2ts
            vergence decode DISC [--playlist NNNNN] [options]
            vergence decode FILM.mkv [options]   (an MVC track: a 3D Blu-ray remuxed to Matroska)
+           vergence decode FILM.m2ts [options]  (both views in one transport stream: an SSIF, a tsMuxeR remux)
            vergence decode BASE.m2ts [DEPENDENT.m2ts] [options]
            vergence stream DISC [--playlist NNNNN] [--seek SECONDS]
            vergence streams DISC [--playlist NNNNN]
@@ -179,18 +182,36 @@ func clockTime(_ seconds: Double) -> String {
     return String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
 }
 
-/// A folder holding BDMV, or a disc image read in place, local or remote.
-func openDisc(_ path: String) throws -> BlurayDisc? {
+/// A folder holding BDMV, a disc image read in place, local or remote, or
+/// a lone transport stream holding both views (an .m2ts with an MVC
+/// stream: a disc's SSIF copied out, a tsMuxeR remux, a 3D camcorder clip).
+func openDisc(_ path: String) throws -> (any ClipSource)? {
+    let isStream = [".m2ts", ".mts", ".ts", ".ssif"].contains { path.lowercased().hasSuffix($0) }
     if let url = URL(string: path), ["http", "https"].contains(url.scheme?.lowercased()) {
-        return BlurayDisc(fileSystem: try UDFFileSystem(image: HTTPByteSource(url: url, headers: options.headers)))
+        // Told apart by their first bytes: a server's stream URL has no
+        // extension, and a disc image opens with 32 kB of zeros.
+        let source = try HTTPByteSource(url: url, headers: options.headers)
+        if TransportStreamFile.looksLikeTransportStream(try source.read(at: 0, count: 1024)) {
+            return try stereoStream(source)
+        }
+        return BlurayDisc(fileSystem: try UDFFileSystem(image: source))
     }
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else { return nil }
     if isDirectory.boolValue {
         return BlurayDisc(fileSystem: DirectoryFileSystem(root: URL(fileURLWithPath: path)))
     }
+    if isStream { return try stereoStream(FileByteSource(url: URL(fileURLWithPath: path))) }
     guard path.lowercased().hasSuffix(".iso") else { return nil }
     return BlurayDisc(fileSystem: try UDFFileSystem(image: FileByteSource(url: URL(fileURLWithPath: path))))
+}
+
+/// A transport stream with an MVC dependent view, else nil (a 2D stream
+/// is a VIDEO, or a base clip of a pair).
+func stereoStream(_ source: ByteSource) throws -> TransportStreamFile? {
+    guard TransportStreamFile.looksLikeTransportStream(try source.read(at: 0, count: 1024)) else { return nil }
+    let file = try TransportStreamFile(source: source)
+    return file.isStereo ? file : nil
 }
 
 /// A local or remote file that is Matroska, read for its MVC track.
@@ -217,7 +238,16 @@ func info(_ o: Options) throws {
         }
         return
     }
-    guard o.positional.count == 1, let disc = try openDisc(o.positional[0]) else { usage() }
+    guard o.positional.count == 1, let opened = try openDisc(o.positional[0]) else { usage() }
+    if let file = opened as? TransportStreamFile {
+        let item = file.playlist.items[0]
+        print("transport stream (\(file.packetSize)-byte packets), \(clockTime(file.playlist.duration)), MVC 3D, base view 0x\(String(file.basePID, radix: 16)), dependent view 0x\(String(file.dependentPID ?? 0, radix: 16)), starts at \(String(format: "%.3f", Double(item.inPTS) / 90_000)) s")
+        for stream in item.audioStreams + item.subtitleStreams {
+            print("  \(stream.codecName) 0x\(String(stream.pid, radix: 16))\(stream.language.map { " " + $0 } ?? "")")
+        }
+        return
+    }
+    guard let disc = opened as? BlurayDisc else { usage() }
     let main = try disc.mainPlaylist()?.name
     for (name, playlist) in try disc.playlists() where playlist.duration >= 60 {
         let clips = playlist.items.map { $0.clip + ($0.dependentClip.map { "+" + $0 } ?? "") }
@@ -331,8 +361,11 @@ func decode(_ o: Options) throws {
                written, seconds, Double(written) / seconds, mono, irregular, source.summary()))
 }
 
-/// The playlist named by --playlist, else the feature.
-func chosenPlaylist(_ disc: BlurayDisc, _ o: Options) throws -> (name: String, playlist: BlurayPlaylist) {
+/// The playlist named by --playlist, else the feature; a lone transport
+/// stream's own.
+func chosenPlaylist(_ source: any ClipSource, _ o: Options) throws -> (name: String, playlist: BlurayPlaylist) {
+    if let file = source as? TransportStreamFile { return (TransportStreamFile.clipName, file.playlist) }
+    guard let disc = source as? BlurayDisc else { throw FormatError("not a disc") }
     let chosen = try o.playlist.map { wanted in try disc.playlists().first { $0.name == wanted } } ?? disc.mainPlaylist()
     guard let chosen else { throw FormatError("no such playlist") }
     return chosen
@@ -483,7 +516,7 @@ func audio(_ o: Options) async throws {
 /// vergence cat DISC PATH [--start BYTE] [--frames BYTES]: a file's bytes out
 /// of a disc (mainly for checking the image reader against a mounted copy).
 func cat(_ o: Options) throws {
-    guard o.positional.count == 2, let disc = try openDisc(o.positional[0]) else { usage() }
+    guard o.positional.count == 2, let disc = try openDisc(o.positional[0]) as? BlurayDisc else { usage() }
     let file = try disc.fileSystem.open(o.positional[1])
     var offset = Int64(o.start)
     let end = o.frames == Int.max ? file.size : min(file.size, offset + Int64(o.frames))

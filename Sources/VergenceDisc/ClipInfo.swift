@@ -19,9 +19,17 @@ public struct ClipInfo: Sendable, Equatable {
     public struct EntryPoint: Sendable, Equatable {
         /// 90 kHz, the PES clock. Bit 0 to 8 are always 0 (the EP_map's resolution).
         public var pts: Int64
-        /// Source packet number: the access unit starts at byte `spn * 192`.
+        /// Source packet number: the access unit starts at byte `spn * packetSize`.
         public var spn: UInt32
-        public var byteOffset: Int64 { Int64(spn) * 192 }
+        /// 192 on a disc; 188 for a plain transport stream (`TransportStreamFile`).
+        public var packetSize = 192
+        public var byteOffset: Int64 { Int64(spn) * Int64(packetSize) }
+
+        public init(pts: Int64, spn: UInt32, packetSize: Int = 192) {
+            self.pts = pts
+            self.spn = spn
+            self.packetSize = packetSize
+        }
     }
 
     /// Entry points per video PID, in PTS order.

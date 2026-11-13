@@ -200,10 +200,17 @@ func makeOne(_ input: URL, _ output: URL, _ o: Options) async throws -> Bool {
 func inspect(_ o: Options) async throws {
     guard o.positional.count == 1 else { usage("inspect takes one file") }
     let path = o.positional[0]
-    if let disc = try? openDisc(path), (try? disc.mainPlaylist()) != nil {
-        print("3D Blu-ray disc (decrypted)" )
-        try info(o)
-        return
+    if let opened = try? openDisc(path) {
+        if opened is TransportStreamFile {
+            print("3D Blu-ray video, both views in one transport stream")
+            try info(o)
+            return
+        }
+        if let disc = opened as? BlurayDisc, (try? disc.mainPlaylist()) != nil {
+            print("3D Blu-ray disc (decrypted)" )
+            try info(o)
+            return
+        }
     }
     let url = URL(fileURLWithPath: path)
     #if !canImport(AVFoundation) || os(tvOS)

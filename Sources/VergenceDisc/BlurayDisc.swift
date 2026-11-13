@@ -38,7 +38,21 @@ public final class DirectoryFileSystem: DiscFileSystem {
     }
 }
 
-public final class BlurayDisc {
+/// Where a playlist's clips come from: a disc (its STREAM files, entry
+/// points from the EP maps in CLIPINF), or a lone transport stream holding
+/// both views (`TransportStreamFile`: one clip, entry points found by
+/// searching it). The playlist readers take either.
+public protocol ClipSource: AnyObject {
+    func clip(_ name: String) throws -> ByteSource
+    /// The random access point on `pid` at or before `pts` (the clip's own
+    /// clock, 90 kHz), or nil when the clip can't seek (it plays from its
+    /// start). For a dependent-view PID, the entry at a base view's entry PTS.
+    func entryPoint(clip: String, pid: UInt16, atOrBefore pts: Int64) throws -> ClipInfo.EntryPoint?
+    /// The first random access point on `pid` after `pts`, or nil past the last.
+    func entryPoint(clip: String, pid: UInt16, after pts: Int64) throws -> ClipInfo.EntryPoint?
+}
+
+public final class BlurayDisc: ClipSource {
     public let fileSystem: DiscFileSystem
 
     public init(fileSystem: DiscFileSystem) {
@@ -84,22 +98,36 @@ public final class BlurayDisc {
 
     private var clipInfoCache: [String: ClipInfo?] = [:]
 
+    public func entryPoint(clip: String, pid: UInt16, atOrBefore pts: Int64) -> ClipInfo.EntryPoint? {
+        clipInfo(clip)?.entryPoint(pid: pid, atOrBefore: pts)
+    }
+
+    public func entryPoint(clip: String, pid: UInt16, after pts: Int64) -> ClipInfo.EntryPoint? {
+        clipInfo(clip)?.entryPoint(pid: pid, after: pts)
+    }
+}
+
+/// A byte range of a PlayItem's base clip, which carries the audio and
+/// subtitles along with the base view.
+public struct ClipSpan: Sendable, Equatable {
+    public var clip: String
+    public var start: Int64
+    /// Exclusive.
+    public var end: Int64
+    /// Playlist time of the entry point at `start` (or of the item's IN
+    /// time when the clip has no entry points), 90 kHz.
+    public var playlistTime: Int64
+}
+
+extension BlurayDisc {
+    public typealias ClipSpan = VergenceDisc.ClipSpan
+}
+
+extension ClipSource {
     /// Stereo access units of a playlist, in decode order, timestamps on the
     /// playlist's own timeline (0 = start of the first PlayItem).
     public func stereoReader(for playlist: BlurayPlaylist, stereo: Bool = true) -> PlaylistStereoReader {
         PlaylistStereoReader(disc: self, playlist: playlist, stereo: stereo && playlist.isStereo)
-    }
-
-    /// A byte range of a PlayItem's base clip, which carries the audio and
-    /// subtitles along with the base view.
-    public struct ClipSpan: Sendable, Equatable {
-        public var clip: String
-        public var start: Int64
-        /// Exclusive.
-        public var end: Int64
-        /// Playlist time of the entry point at `start` (or of the item's IN
-        /// time when the clip has no entry points), 90 kHz.
-        public var playlistTime: Int64
     }
 
     /// What to read, clip by clip, to get every stream of a playlist from
@@ -119,9 +147,8 @@ public final class BlurayDisc {
             let pid = item.videoPID ?? TransportStreamDemuxer.blurayBaseVideoPID
             let size = try clip(item.clip).size
             let clipPTS = item.inPTS + max(target - itemStart, 0)
-            let info = clipInfo(item.clip)
-            let entry = info?.entryPoint(pid: pid, atOrBefore: clipPTS)
-            let after = info?.entryPoint(pid: pid, after: item.outPTS)
+            let entry = try entryPoint(clip: item.clip, pid: pid, atOrBefore: clipPTS)
+            let after = try entryPoint(clip: item.clip, pid: pid, after: item.outPTS)
             spans.append(ClipSpan(
                 clip: item.clip,
                 start: entry?.byteOffset ?? 0,
@@ -133,7 +160,7 @@ public final class BlurayDisc {
 }
 
 public final class PlaylistStereoReader {
-    private let disc: BlurayDisc
+    private let disc: any ClipSource
     public let playlist: BlurayPlaylist
     private let stereo: Bool
     private var itemIndex = -1
@@ -169,7 +196,7 @@ public final class PlaylistStereoReader {
         }
     }
 
-    init(disc: BlurayDisc, playlist: BlurayPlaylist, stereo: Bool) {
+    init(disc: any ClipSource, playlist: BlurayPlaylist, stereo: Bool) {
         self.disc = disc
         self.playlist = playlist
         self.stereo = stereo
@@ -234,11 +261,11 @@ public final class PlaylistStereoReader {
             dependent: try dependentClip.map { try disc.clip($0) },
             basePID: basePID, dependentPID: dependentPID, sidePIDs: sidePIDs)
         current = reader
-        guard let entry = disc.clipInfo(item.clip)?.entryPoint(pid: basePID, atOrBefore: clipPTS) else {
+        guard let entry = try disc.entryPoint(clip: item.clip, pid: basePID, atOrBefore: clipPTS) else {
             return item.inPTS
         }
         // The dependent view's entry points sit at the base view's PTS.
-        let dependentEntry = dependentClip.flatMap { disc.clipInfo($0)?.entryPoint(pid: dependentPID, atOrBefore: entry.pts) }
+        let dependentEntry = try dependentClip.flatMap { try disc.entryPoint(clip: $0, pid: dependentPID, atOrBefore: entry.pts) }
         if entry.spn > 0 || (dependentEntry?.spn ?? 0) > 0 {
             reader.seek(baseOffset: entry.byteOffset, dependentOffset: dependentEntry?.byteOffset)
         }

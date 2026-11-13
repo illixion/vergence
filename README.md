@@ -21,7 +21,7 @@ It contains no AACS or BD+ code.
 | Module | What | Builds on |
 | --- | --- | --- |
 | `VergenceCore` | Stereo layouts (`PackedStereoLayout`) and telling them from a file name or picture (`StereoLayoutDetector`), spatial-video camera metadata and presets (`SpatialCameraMetadata`, `SpatialPreset`), bitrates (`SpatialBitrate`), depth-warp settings, and the depth maths behind stable 2D-to-3D: anchoring each frame's depth to the last (`DepthAlignmentSums`, `DepthScaleShiftTracker`), the soft-knee depth budget, cut detection, shot mapping, histogram percentiles. Analysis tracks (`AnalysisTrack`: flow, disparity and depth fields keyed by media time, made on one machine for another) and the producer's half of stereo Smooth Motion (`SharedFieldAnalysis`). Reading PyTorch checkpoints without Python (`TorchCheckpoint`) and finding a pulldown's repeated frames (`RepeatedFrames`). Foundation only, no dependencies. | Apple platforms, Linux (tested), Android arm64 (builds) |
-| `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, Matroska MVC tracks, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
+| `VergenceDisc` | UDF images, BDAV demux, playlists and clip info, Matroska MVC tracks, lone transport streams holding both views, MVC decoding (edge264), frame packing, PGS subtitles, AC-3 frame parsing. Foundation only. | Apple platforms, Linux (tested), Android arm64 (builds; `scripts/build-android.sh`), Windows (planned) |
 | `VergenceApple` | The Apple-framework half: spatial video making and inspection (`SpatialVideoMaker`, `SpatialVideoInspector`), realtime and offline 2D-to-3D (Core ML depth, the depth converter and its cache, model management, the stereo pump and Metal warp, stereo subtitles), decoder-loss recovery, `CVPixelBuffer` output, AC-3 decoding through AudioToolbox, Smooth Motion (frame interpolation, and `StereoFlowAnalyzer`: the flow and disparity models with Core ML), 2× upscaling with Real-ESRGAN's compact network built from its weights (`FrameUpscaler`, with `StereoDetailFusion` for a stereo pair). Re-exports `VergenceCore` and `VergenceDisc`. Builds empty elsewhere. | Apple platforms (iOS/tvOS/visionOS 26, macOS 14) |
 | `vergence` | The command line tool. | macOS, Linux (disc commands only, without PNG or audio output) |
 | `VergenceCommandLine` | The tool's option parsing and output names, apart from the executable so its tests can import them (not a product). Foundation only. | Apple platforms, Linux (tested) |
@@ -440,7 +440,16 @@ both views in every Block and an `mvcC` record in its CodecPrivate or a
 BlockAdditionMapping), local or over `http(s)`; `vergence info FILM.mkv` says
 whether a file has one. Checked on a 2:06:48 MakeMKV-made remux: stereo in
 every frame from the start, after a seek to an hour and through the end, 160 to
-190 fps on an M1 Mac mini, seeking by the file's Cues. `--packing sbs` for side by side,
+190 fps on an M1 Mac mini, seeking by the file's Cues. And so does a single
+transport stream holding both views (`.m2ts`/`.mts`/`.ts`/`.ssif`, local or `http(s)`,
+told apart by its first bytes): a disc's SSIF copied out (the two clips in
+extents, with a PMT each), a tsMuxeR M2TS made from the demuxed views (packets
+interleaved finely), a 3D camcorder clip. It is a DISC of one playlist
+(`TransportStreamFile`): the streams come from the PMT, and with no EP map,
+entry points are found by searching the file, an interpolation search on the
+base view's decode times and then a scan for the last I picture. A tsMuxeR
+M2TS and an SSIF-style file made from a minute of a 3D remux decode to frames
+bit-identical to the Matroska decode of the same cut, as fast. `--packing sbs` for side by side,
 `--seek SECONDS` to start part way in, `--start N --frames N` for a range of frames,
 `--output FILE`.
 
@@ -668,7 +677,13 @@ try decoder.decode { frame in
 `CVPixelBuffer`s inside that closure. Lower down, `PlaylistStereoReader` gives the stereo access units and `MVCDecoder` decodes any
 stream of them. A Matroska MVC file is the same with `StereoDecoder(reader: MatroskaStereoReader(source:))`,
 `MatroskaFile(source:readCues: false)` being the cheap check for an MVC track (`video?.isMVC`); its
-frames' `pts` are the file's own times in 90 kHz.
+frames' `pts` are the file's own times in 90 kHz. A transport stream holding both views is a
+`ClipSource` like a disc: `let file = try TransportStreamFile(source:)`, then
+`PlaylistDecoder(disc: file, playlist: file.playlist)`, `PlaylistAudioReader(disc: file, …)` and
+side PIDs as for a disc, on a timeline from its first picture (`file.playlist.items[0].inPTS`, often
+600 s). `TransportStreamFile.programStreams(in:)` on its first few hundred kilobytes is the cheap
+check (a stream of type 0x20), `reopened(on:)` puts it on a second reader without reading it again,
+and `carriesAC3Frames(pid:)` tells a TrueHD track with a disc's AC-3 core from one without.
 
 The other streams of a clip come from the same reads: set `PlaylistDecoder.sidePIDs`
 and `onSidePackets` hands over their PES, on the playlist timeline, as the video is
