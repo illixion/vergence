@@ -21,6 +21,21 @@ struct Pseudo3DSettingsTests {
         #expect(try decode(#"{"convergence": 0.8}"#).convergence == 0.8)
     }
 
+    /// The depth amount is new: blobs written before it decode to 1 (and so
+    /// stay unmodified), and a value outside the slider's range is brought
+    /// back into it rather than trusted.
+    @Test func depthAmountDecodesWithinItsRange() throws {
+        #expect(try decode(#"{"convergence": 1.0}"#).depthAmount == 1)
+        #expect(try !decode(#"{"convergence": 1.0}"#).isModified)
+        #expect(try decode(#"{"depthAmount": 1.25}"#).depthAmount == 1.25)
+        #expect(try decode(#"{"depthAmount": 1.25}"#).isModified)
+        #expect(try decode(#"{"depthAmount": 4}"#).depthAmount == Pseudo3DSettings.depthAmountRange.upperBound)
+        #expect(try decode(#"{"depthAmount": 0}"#).depthAmount == Pseudo3DSettings.depthAmountRange.lowerBound)
+        let settings = try decode(#"{"depthAmount": 1.4, "convergence": 0.9}"#)
+        let again = try JSONDecoder().decode(Pseudo3DSettings.self, from: JSONEncoder().encode(settings))
+        #expect(again == settings)
+    }
+
     /// Retired keys need no handling — keyed decoding ignores JSON keys with no
     /// matching case. `autoConvergence` was one such key.
     @Test func retiredKeysAreIgnored() throws {

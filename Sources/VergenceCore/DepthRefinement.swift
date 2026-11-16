@@ -76,6 +76,15 @@ public enum DepthRefinement {
     /// out of each shot (realtime refined depth; see `DepthGapCompressor`).
     /// On by default; a debug switch for comparing.
     nonisolated(unsafe) public static var compressesGaps = true
+    /// Hide the strip each eye lacks at one side of the picture by cropping
+    /// both eyes a little (the video mesh pass draws slightly enlarged),
+    /// instead of fading the depth to nothing over the outer 5 % of the
+    /// width. The fade bent the background up to the glass in a band down
+    /// each side, squeezed in one eye and stretched in the other by ±19 % at
+    /// the shipped strength and ±28 % at 1.5× (measured 2026-11-16), which is
+    /// past where the two eyes fuse without strain. On by default; a debug
+    /// switch for comparing. The disconnected-boundary prototype keeps the fade.
+    nonisolated(unsafe) public static var cropsPictureEdges = true
     /// Experimental discontinuity-separated mesh and explicit hole fill.
     /// Opt in for A/B testing; independent of the depth cleanup switches.
     nonisolated(unsafe) public static var separatesBoundaries = false

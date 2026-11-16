@@ -17,6 +17,28 @@ struct VideoStereoUniforms {
     var depthBudget: SIMD2<Float>
     var edgeFill: Float = 0
     var extendedRange: Float = 0
+    /// Share of the width, at each side, over which depth fades to nothing
+    /// (`pseudo3DEdgeFeather`); 0 = no fade (the pass is drawn enlarged instead).
+    var edgeFeather: Float = StereoEdge.featherWidth
+    var reserved: Float = 0
+}
+
+/// How the picture's sides are kept clean: each eye's image is shifted inward
+/// at one side by as much as the farthest content moves, leaving a strip with
+/// nothing to show.
+enum StereoEdge {
+    /// The fade's width, as the shaders always had it.
+    static let featherWidth: Float = 0.05
+
+    /// How much larger the mesh pass draws so that strip falls outside the
+    /// eye: the largest shift is `strength × max(convergence, 1 − convergence)`
+    /// of the width (the depth budget keeps depth in 0…1), times how far
+    /// beyond an eye's own position the viewer's offset can take it.
+    static func zoom(strength: Float, convergence: Float, viewerReach: Float) -> Float {
+        let shift = abs(strength) * max(convergence, 1 - convergence) * (1 + max(0, viewerReach))
+        let crop = min(max(shift, 0), 0.08)
+        return 1 / (1 - 2 * crop)
+    }
 }
 
 /// The occlusion-tested mesh pass shared by video and stills. Caller owns its
@@ -37,7 +59,7 @@ final class StereoMeshWarp {
     /// over its multisampled result without a round trip through memory.
     func encode(source: MTLTexture, depth: MTLTexture, destination: MTLTexture,
                 uniforms: VideoStereoUniforms, dense: Bool, eye: Int,
-                commandBuffer: MTLCommandBuffer,
+                commandBuffer: MTLCommandBuffer, zoom: Float = 1,
                 overlay: ((MTLRenderCommandEncoder) -> Void)? = nil) -> Bool {
         let samples = resources.msaaSampleCount
         func attachment(_ format: MTLPixelFormat, existing: MTLTexture?) -> MTLTexture? {
@@ -77,6 +99,14 @@ final class StereoMeshWarp {
         pass.depthAttachment.storeAction = .dontCare
         guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return false }
         var uniforms = uniforms
+        if zoom > 1 {
+            // The whole pass (the mesh and whatever `overlay` draws over it)
+            // enlarged about the centre; what falls outside the eye is cropped.
+            let w = Double(destination.width) * Double(zoom), h = Double(destination.height) * Double(zoom)
+            enc.setViewport(MTLViewport(originX: (Double(destination.width) - w) / 2,
+                                        originY: (Double(destination.height) - h) / 2,
+                                        width: w, height: h, znear: 0, zfar: 1))
+        }
         enc.setRenderPipelineState(resources.meshPipelineState)
         enc.setDepthStencilState(resources.meshDepthState)
         enc.setVertexBuffer(dense ? resources.denseGridPositions : resources.gridPositions, offset: 0, index: 0)

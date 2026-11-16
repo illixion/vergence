@@ -99,6 +99,17 @@ public final class StereoPump: @unchecked Sendable {
         /// see `Pseudo3DStereoEngine.setChromeOpen`). A packed pair can't be
         /// part-flat, so it shows one eye twice below a half.
         public var depthScale: Float = 1
+        /// Motion parallax: how far the viewer's head is to the right of where
+        /// the picture was made for, in half eye spacings (so the right eye
+        /// alone is at +1 and the left at -1). Each eye's image is drawn for
+        /// where that eye then is: content behind the glass follows the head,
+        /// as it would through a window. 0 = no parallax. The host limits it
+        /// to `viewerReach`.
+        public var viewerOffset: Float = 0
+        /// The largest `viewerOffset` the host will send while this picture
+        /// plays, which sets how much the edge crop has to hide. 0 when the
+        /// host sends none.
+        public var viewerReach: Float = 0
 
         var isFlat: Bool { depthScale < 0.5 }
 
@@ -109,7 +120,9 @@ public final class StereoPump: @unchecked Sendable {
             depthStrength: Float = 0.008,
             convergence: Float = 1.0,
             mirror: Bool = false,
-            depthScale: Float = 1
+            depthScale: Float = 1,
+            viewerOffset: Float = 0,
+            viewerReach: Float = 0
         ) {
             self.brightness = brightness
             self.contrast = contrast
@@ -118,6 +131,8 @@ public final class StereoPump: @unchecked Sendable {
             self.convergence = convergence
             self.mirror = mirror
             self.depthScale = depthScale
+            self.viewerOffset = viewerOffset
+            self.viewerReach = viewerReach
         }
     }
 
@@ -1099,6 +1114,9 @@ public final class StereoPump: @unchecked Sendable {
         StackHeadroom.check("StereoPump.drawEyes")
 
         var cfg = currentConfig()
+        // The crop follows the strength the picture is set to, not the one a
+        // ramp or an opening menu is passing through, so it doesn't breathe.
+        let cropStrength = cfg.depthStrength
         cfg.depthStrength *= max(0, min(1, cfg.depthScale))
         let fullDepthStrength = cfg.depthStrength
         if depthSource?.flattensWhenUnavailable == true {
@@ -1124,9 +1142,9 @@ public final class StereoPump: @unchecked Sendable {
             let layers = prepareLayers(source: srcTexture, depth: frameDepth, config: cfg,
                                        continuesBackground: directionalContinuation, commandBuffer: cmdBuf)
             encodeEye(into: leftTex, source: srcTexture, depth: frameDepth, eyeSign: 1.0, config: cfg,
-                      layers: layers, commandBuffer: cmdBuf)
+                      cropStrength: cropStrength, layers: layers, commandBuffer: cmdBuf)
             encodeEye(into: rightTex, source: srcTexture, depth: frameDepth, eyeSign: -1.0, config: cfg,
-                      layers: layers, commandBuffer: cmdBuf)
+                      cropStrength: cropStrength, layers: layers, commandBuffer: cmdBuf)
         }
         // The depth budget keeps depth inside [0, 1], so no warped pixel shifts further than
         // (1 - convergence) × strength; the margin in front of that keeps the
@@ -1360,10 +1378,18 @@ public final class StereoPump: @unchecked Sendable {
               let depth, !config.isFlat, let layeredWarp,
               layeredWarp.prepare(source: source, depth: depth, strength: config.depthStrength,
                                   convergence: config.convergence,
+                                  viewerReach: abs(Self.limitedViewerOffset(config)),
                                   continuesBackground: continuesBackground,
                                   commandBuffer: commandBuffer)
         else { return nil }
         return layeredWarp
+    }
+
+    /// The viewer's offset as drawn: never past the reach the crop was sized for.
+    private static func limitedViewerOffset(_ config: Config) -> Float {
+        let reach = max(0, config.viewerReach)
+        guard reach > 0, config.viewerOffset.isFinite else { return 0 }
+        return min(max(config.viewerOffset, -reach), reach)
     }
 
     private func encodeEye(
@@ -1372,16 +1398,21 @@ public final class StereoPump: @unchecked Sendable {
         depth: PumpFrameDepth?,
         eyeSign: Float,
         config: Config,
+        cropStrength: Float,
         layers: StereoLayeredWarp? = nil,
         commandBuffer: MTLCommandBuffer
     ) {
+        // Where this eye is, in half eye spacings from the middle of the two
+        // (+1 left, -1 right, as the shaders have it), once the head has moved.
+        let eyeFactor = eyeSign - Self.limitedViewerOffset(config)
+        let cropsEdges = DepthRefinement.cropsPictureEdges
         var uniforms = VideoStereoUniforms(
             brightness: config.brightness,
             contrast: config.contrast,
             saturation: config.saturation,
             depthStrength: config.depthStrength,
             convergence: config.convergence,
-            eyeSign: eyeSign,
+            eyeSign: eyeFactor,
             mirror: config.mirror ? 1.0 : 0.0,
             useDepth: depth != nil ? 1.0 : 0.0,
             depthUVScale: depth?.uvScale ?? SIMD2(1, 1),
@@ -1415,12 +1446,18 @@ public final class StereoPump: @unchecked Sendable {
         }
         if let depth {
             let meshWarp = drawingHDR ? (hdrMeshWarp ?? self.meshWarp) : self.meshWarp
+            uniforms.edgeFeather = cropsEdges ? 0 : StereoEdge.featherWidth
+            let zoom = cropsEdges
+                ? StereoEdge.zoom(strength: cropStrength, convergence: config.convergence,
+                                  viewerReach: max(0, config.viewerReach))
+                : 1
             _ = meshWarp.encode(source: source, depth: depth.texture, destination: dest,
                 uniforms: uniforms, dense: depthSource?.prefersDenseWarpGrid == true,
-                eye: eyeIndex, commandBuffer: commandBuffer,
+                eye: eyeIndex, commandBuffer: commandBuffer, zoom: zoom,
                 overlay: layers.map { layers in
                     { encoder in
-                        layers.encodePatch(into: encoder, eyeSign: eyeSign, mirror: config.mirror,
+                        layers.encodePatch(into: encoder, eyeSign: eyeFactor, mirror: config.mirror,
+                                           fadesEdges: !cropsEdges,
                                            brightness: config.brightness, contrast: config.contrast,
                                            saturation: config.saturation,
                                            extendedRange: uniforms.extendedRange > 0.5)

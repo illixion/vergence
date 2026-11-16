@@ -178,14 +178,17 @@ final class StereoLayeredWarp {
     /// Splits the frame into its layers, once for both eyes. False when there is nothing to do
     /// (the strongest disparity is a pixel or two) or a table couldn't be made; the mesh then
     /// draws alone.
+    /// `viewerReach` is how far past its own place an eye is drawn (motion parallax), in half
+    /// eye spacings: a layer then moves that much further.
     func prepare(source: MTLTexture, depth: PumpFrameDepth, strength: Float, convergence: Float,
+                 viewerReach: Float = 0,
                  continuesBackground: Bool = false, commandBuffer: MTLCommandBuffer) -> Bool {
         frame = nil
         guard source.width > 0, source.height > 0 else { return false }
         let width = min(source.width, Self.maxWidth)
         let height = max(1, Int((Double(source.height) * Double(width) / Double(source.width)).rounded()))
         let pixelsPerDepth = strength * Float(width)
-        let maxShift = pixelsPerDepth * max(convergence, 1 - convergence)
+        let maxShift = pixelsPerDepth * max(convergence, 1 - convergence) * (1 + max(0, viewerReach))
         guard maxShift.isFinite, maxShift >= Self.minimumShift,
               let layers = makeLayers(width: width, height: height) else { return false }
 
@@ -236,14 +239,16 @@ final class StereoLayeredWarp {
 
     /// Draws one eye's patch in the mesh pass's own encoder, after the mesh. Does nothing unless
     /// `prepare` has succeeded for this frame. `eyeSign` is the mesh's (+1 left, -1 right).
+    /// With motion parallax it is where the eye is, in the same units.
     func encodePatch(into encoder: MTLRenderCommandEncoder, eyeSign: Float, mirror: Bool,
+                     fadesEdges: Bool = true,
                      brightness: Float, contrast: Float, saturation: Float, extendedRange: Bool) {
         guard let layers, let frame else { return }
         // The layers are stored as the source is, and a mirrored picture reads it flipped, so the
         // same displacement runs the other way round in them.
         var uniforms = PatchUniforms(
             stereo: SIMD4(mirror ? -eyeSign : eyeSign, frame.convergence, frame.pixelsPerDepth, mirror ? 1 : 0),
-            sizes: SIMD4(Int32(layers.width), Int32(layers.height), Int32(frame.scanRadius), 0),
+            sizes: SIMD4(Int32(layers.width), Int32(layers.height), Int32(frame.scanRadius), fadesEdges ? 0 : 1),
             tone: SIMD4(brightness, contrast, saturation, extendedRange ? 1 : 0))
         encoder.setRenderPipelineState(patchPipeline)
         encoder.setDepthStencilState(patchDepthState)

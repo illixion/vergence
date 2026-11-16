@@ -67,7 +67,7 @@ struct LayeredBench {
     }
 
     func render(_ picture: LayeredPicture, strength: Float, convergence: Float = 1, mirror: Bool = false,
-                layers: Bool, dense: Bool = false,
+                layers: Bool, dense: Bool = false, viewerOffset: Float = 0, cropsEdges: Bool? = nil,
                 tone: SIMD3<Float> = SIMD3(0, 1, 1), directional: Bool = false) throws -> LayeredEyes {
         func texture(_ format: MTLPixelFormat, _ width: Int, _ height: Int,
                      usage: MTLTextureUsage) throws -> MTLTexture {
@@ -97,20 +97,28 @@ struct LayeredBench {
         guard let command = queue.makeCommandBuffer() else {
             throw LayeredBenchError(description: "no command buffer")
         }
+        // nil = the fade, as before the crop existed; true/false = no fade, with or without the
+        // enlargement that hides the strips (false shows them, to prove the crop is needed).
+        let zoom = cropsEdges == true
+            ? StereoEdge.zoom(strength: strength, convergence: convergence, viewerReach: abs(viewerOffset)) : 1
         let split = layers && layered.prepare(source: source, depth: frameDepth, strength: strength,
-                                              convergence: convergence, continuesBackground: directional, commandBuffer: command)
+                                              convergence: convergence, viewerReach: abs(viewerOffset),
+                                              continuesBackground: directional, commandBuffer: command)
         for (eye, sign) in [(0, Float(1)), (1, Float(-1))] {
+            let sign = sign - viewerOffset
             let uniforms = VideoStereoUniforms(
                 brightness: tone.x, contrast: tone.y, saturation: tone.z, depthStrength: strength,
                 convergence: convergence, eyeSign: sign, mirror: mirror ? 1 : 0, useDepth: 1,
                 depthUVScale: picture.uvScale, depthUVOffset: picture.uvOffset,
                 depthValueScale: picture.valueScale, depthValueBias: picture.valueBias,
-                depthBudget: picture.budget.knees)
+                depthBudget: picture.budget.knees,
+                edgeFeather: cropsEdges == nil ? StereoEdge.featherWidth : 0)
             let drawn = mesh.encode(
                 source: source, depth: depthTexture, destination: targets[eye], uniforms: uniforms,
-                dense: dense, eye: eye, commandBuffer: command,
+                dense: dense, eye: eye, commandBuffer: command, zoom: zoom,
                 overlay: split ? { encoder in
-                    layered.encodePatch(into: encoder, eyeSign: sign, mirror: mirror, brightness: tone.x,
+                    layered.encodePatch(into: encoder, eyeSign: sign, mirror: mirror,
+                                        fadesEdges: cropsEdges == nil, brightness: tone.x,
                                         contrast: tone.y, saturation: tone.z, extendedRange: false)
                 } : nil)
             if !drawn { throw LayeredBenchError(description: "mesh pass \(eye) failed") }

@@ -49,6 +49,16 @@ public struct Pseudo3DSettings: Codable, Hashable, Sendable {
     /// of the window frame. The prior 0.45 put mid-depth on the glass and
     /// pushed over half of every frame out through the window.
     public var convergence: Double = 1.0
+    /// How much depth the picture gets, as a multiple of the shipped strength
+    /// (`depthStrength`'s default, which the engine still pins). 1 is what
+    /// every picture had before this existed. Above 1 the subject and the
+    /// background move further apart, and so does everything that comes with
+    /// it: the strip of background each eye uncovers beside a near outline
+    /// grows faster than the strength (measured on captured frames,
+    /// 2026-11-16: about twice the stretched area at 1.5), which is why the
+    /// range stops at 1.5 until the outline renderer is good at more.
+    public var depthAmount: Double = 1.0
+    public static let depthAmountRange: ClosedRange<Double> = 0.5...1.5
     /// The default this replaced. Normalized away on decode (see `init(from:)`).
     public static let legacyConvergenceDefault = 0.45
 
@@ -63,7 +73,7 @@ public struct Pseudo3DSettings: Codable, Hashable, Sendable {
 
 extension Pseudo3DSettings {
     private enum CodingKeys: String, CodingKey {
-        case depthStrength, convergence
+        case depthStrength, convergence, depthAmount
     }
 
     /// Hand-written so previously persisted JSON (UserDefaults global settings,
@@ -90,5 +100,9 @@ extension Pseudo3DSettings {
         convergence = decodedConvergence == Self.legacyConvergenceDefault
             ? defaults.convergence
             : decodedConvergence
+        let amount = try container.decodeIfPresent(Double.self, forKey: .depthAmount) ?? defaults.depthAmount
+        depthAmount = amount.isFinite
+            ? min(max(amount, Self.depthAmountRange.lowerBound), Self.depthAmountRange.upperBound)
+            : defaults.depthAmount
     }
 }

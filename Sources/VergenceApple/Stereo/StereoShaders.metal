@@ -96,6 +96,10 @@ struct VideoStereoUniforms {
     // them (mesh warp only), 0 = stretch the image across them as before.
     float edgeFill;
     float extendedRange;
+    // Share of the width, at each side, over which depth fades to nothing;
+    // 0 = no fade (the host draws the pass enlarged and crops instead).
+    float edgeFeather;
+    float reserved;
 };
 
 // The depth budget: shot-space depth (unbounded once anchored) → 0…1, near
@@ -118,10 +122,11 @@ static inline float pseudo3DDepthBudget(float y, float2 knees) {
 // per-eye-different strips along the borders — both read as binocular rivalry
 // and get markedly worse at higher depth strengths. Applied in display space
 // (pre-mirror), symmetric so the flip doesn't matter.
-static inline float pseudo3DEdgeFeather(float x) {
-    const float feather = 0.05;
+static inline float pseudo3DEdgeFeather(float x, float feather) {
+    if (feather <= 0.0) { return 1.0; }
     return smoothstep(0.0, feather, x) * (1.0 - smoothstep(1.0 - feather, 1.0, x));
 }
+static inline float pseudo3DEdgeFeather(float x) { return pseudo3DEdgeFeather(x, 0.05); }
 
 static inline float pseudo3DHeuristicDepth(texture2d<float> tex, sampler s, float2 uv) {
     float2 px = float2(1.0) / float2(tex.get_width(0), tex.get_height(0));
@@ -162,7 +167,7 @@ fragment float4 videoPseudo3DEyeFragmentShader(
     // minus. (The previous `+` gave uncrossed disparity, pushing near objects
     // behind = inverted/weak depth that won't fuse.)
     float disparity = (depth - u.convergence) * u.depthStrength
-                      * pseudo3DEdgeFeather(in.texCoord.x);
+                      * pseudo3DEdgeFeather(in.texCoord.x, u.edgeFeather);
     float2 warpedUV = float2(uv.x - u.eyeSign * disparity, uv.y);
 
     float4 color = tex.sample(texSampler, warpedUV);
@@ -246,7 +251,7 @@ static inline float meshDisparity(float2 grid, constant VideoStereoUniforms &u, 
     const float2 duv = uv * u.depthUVScale + u.depthUVOffset;
     const float depth = pseudo3DDepthBudget(depthTex.sample(s, duv, level(0)).r
                                             * u.depthValueScale + u.depthValueBias, u.depthBudget);
-    return (depth - u.convergence) * u.depthStrength * pseudo3DEdgeFeather(grid.x);
+    return (depth - u.convergence) * u.depthStrength * pseudo3DEdgeFeather(grid.x, u.edgeFeather);
 }
 
 vertex MeshVertexOut videoStereoMeshVertex(
@@ -268,7 +273,7 @@ vertex MeshVertexOut videoStereoMeshVertex(
     float depth = pseudo3DDepthBudget(depthTex.sample(depthSampler, duv, level(0)).r
                                       * u.depthValueScale + u.depthValueBias, u.depthBudget);
     float disparity = (depth - u.convergence) * u.depthStrength
-                      * pseudo3DEdgeFeather(grid.x);
+                      * pseudo3DEdgeFeather(grid.x, u.edgeFeather);
 
     float ndcX = grid.x * 2.0 - 1.0 + u.eyeSign * disparity * 2.0;
     float ndcY = 1.0 - grid.y * 2.0;
@@ -880,7 +885,7 @@ kernel void layerCompose(
 
 struct LayerPatchUniforms {
     float4 stereo;  // eye sign (already mirror-adjusted), convergence, pixels per unit depth, mirror
-    int4   sizes;   // picture width/height, scan radius (px)
+    int4   sizes;   // picture width/height, scan radius (px), 1 = no edge fade
     float4 tone;    // brightness, contrast, saturation, extended range
 };
 
@@ -944,7 +949,7 @@ fragment float4 layeredPatchFragment(
     for (int i = first; i <= first + 2 * radius + 1; ++i) {
         const int column = clamp(i, 0, u.sizes.x - 1);
         const float2 z = layerZ.read(uint2(uint(column), uint(row))).xy;
-        const float feather = pseudo3DEdgeFeather((float(column) + 0.5) / width);
+        const float feather = pseudo3DEdgeFeather((float(column) + 0.5) / width, u.sizes.w != 0 ? 0.0 : 0.05);
         const float2 dest = float(i) + u.stereo.x * u.stereo.z * (z - u.stereo.y) * feather;
         if (i > first) {
             frontHit = layerHit(target, previousDest.x, previousZ.x, dest.x, z.x, float(i - 1), frontHit);
