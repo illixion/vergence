@@ -214,9 +214,17 @@ public final class StereoPump: @unchecked Sendable {
     /// heuristic warp only, e.g. a restored window whose model vanished).
     private let depthSource: PumpDepthSource?
     /// Set for a video that already carries both eyes: crop instead of warp.
+    /// Whether a pump crops or warps is fixed; which way it crops is not
+    /// (`setPackedLayout`).
     private let packedLayout: PackedStereoLayout?
-    /// Pump-queue only: the packed frame size last checked against the tag.
+    /// A layout set while playing (arrangement, half/full, eye order), so a
+    /// viewer sees a change on the next frame instead of a rebuilt player.
+    private let layoutLock = NSLock()
+    private var replacedLayout: PackedStereoLayout?
+    /// Pump-queue only: the packed frame size last checked against the tag,
+    /// and the layout it was checked for.
     private var checkedPackedSize: CGSize?
+    private var checkedLayout: PackedStereoLayout?
     private var correctedLayout: PackedStereoLayout?
     private var lastReportedSize: CGSize?
     /// Pump-queue only: the colour signal last reported (`onFrameSignal`).
@@ -1483,9 +1491,11 @@ public final class StereoPump: @unchecked Sendable {
     /// shape (see `correctingResolution`); re-checked only when the size
     /// changes.
     private func packedLayout(forFrame size: CGSize) -> PackedStereoLayout? {
-        guard let packedLayout else { return nil }
-        if checkedPackedSize != size {
+        guard let initial = packedLayout else { return nil }
+        let packedLayout = layoutLock.withLock { replacedLayout } ?? initial
+        if checkedPackedSize != size || checkedLayout != packedLayout {
             checkedPackedSize = size
+            checkedLayout = packedLayout
             let corrected = packedLayout.correctingResolution(forPacked: size)
             correctedLayout = corrected
             if corrected != packedLayout {
@@ -1497,6 +1507,13 @@ public final class StereoPump: @unchecked Sendable {
             }
         }
         return correctedLayout
+    }
+
+    /// Crops the frames as `layout` packs them from the next frame on. Only
+    /// for a pump made with a packed layout; a warping pump ignores it.
+    public func setPackedLayout(_ layout: PackedStereoLayout) {
+        guard packedLayout != nil else { return }
+        layoutLock.withLock { replacedLayout = layout }
     }
 
     /// One eye of a packed stereo frame: a crop of the source, stretched to
