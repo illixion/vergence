@@ -51,11 +51,10 @@ html, body {
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
 
 .logo {
-  width: 22px;
-  height: 14px;
-  background:
-    radial-gradient(circle at 7px 7px, var(--left) 6px, transparent 6.5px),
-    radial-gradient(circle at 15px 7px, var(--accent) 6px, transparent 6.5px);
+  width: 20px;
+  height: 17px;
+  background: linear-gradient(112deg, var(--left) 0 48%, var(--accent) 49% 100%);
+  clip-path: polygon(0 0, 30% 0, 50% 63%, 71% 0, 100% 0, 59% 100%, 43% 100%);
 }
 
 .tabs { display: flex; gap: 2px; flex: 1; }
